@@ -1,0 +1,10 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="dev.phoenixdb.phoenixdb">
+    <!--
+      PhoenixDB is a pure native library reached through dart:ffi. It needs no
+      permissions: the database file lives in the app's own sandbox directory,
+      which the caller supplies. No components are declared because there is
+      no Java/Kotlin code to register - the .so files under jniLibs are simply
+      packaged into the host APK.
+    -->
+</manifest>

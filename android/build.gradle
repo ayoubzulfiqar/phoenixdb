@@ -1,0 +1,57 @@
+// PhoenixDB — Android plugin build.
+//
+// This module compiles no code. The Rust engine is cross-compiled ahead of
+// time (see build.sh --android) and checked in under src/main/jniLibs/<abi>/,
+// so consumers do not need the NDK installed. The Android Gradle Plugin picks
+// those .so files up automatically and packages them into the host APK/AAB.
+
+group = "dev.phoenixdb.phoenixdb"
+version = "0.1.0"
+
+buildscript {
+    repositories {
+        google()
+        mavenCentral()
+    }
+
+    dependencies {
+        classpath("com.android.tools.build:gradle:9.0.1")
+    }
+}
+
+rootProject.allprojects {
+    repositories {
+        google()
+        mavenCentral()
+    }
+}
+
+apply plugin: "com.android.library"
+
+android {
+    namespace = "dev.phoenixdb.phoenixdb"
+
+    // Bumping the plugin compileSdk version requires all clients of this plugin
+    // to bump the version in their app.
+    compileSdk = 36
+
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
+    }
+
+    defaultConfig {
+        // The prebuilt libraries are linked against Android API 21, so the
+        // module must not advertise support below that. Flutter itself
+        // requires 24, which is the effective floor for consumers.
+        minSdk = 24
+    }
+
+    // Package the .so files uncompressed so the dynamic loader can mmap them
+    // straight out of the APK rather than extracting to disk first.
+    packagingOptions {
+        jniLibs {
+            useLegacyPackaging = false
+        }
+    }
+}
