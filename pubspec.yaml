@@ -1,12 +1,11 @@
 name: phoenixdb
 description: >-
-  ACID-compliant embedded key/value database engine with a B+Tree index, MVCC
-  transactions and a write-ahead log, implemented in Rust and exposed to Dart
-  and Flutter through a zero-overhead dart:ffi layer.
+  ACID-compliant embedded key-value database for Dart and Flutter. B+Tree index,
+  MVCC transactions and a write-ahead log, written in Rust with dart:ffi.
 version: 0.1.0
-repository: https://github.com/phoenixdb/phoenixdb
-issue_tracker: https://github.com/phoenixdb/phoenixdb/issues
-documentation: https://github.com/phoenixdb/phoenixdb#readme
+repository: https://github.com/ayoubzulfiqar/phoenixdb
+issue_tracker: https://github.com/ayoubzulfiqar/phoenixdb/issues
+documentation: https://github.com/ayoubzulfiqar/phoenixdb#readme
 
 topics:
   - database
