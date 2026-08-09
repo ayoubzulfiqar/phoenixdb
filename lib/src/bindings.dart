@@ -186,20 +186,55 @@ String get defaultLibraryName {
   return 'libphoenixdb.so';
 }
 
+/// Rust target triple matching the current platform and CPU architecture.
+///
+/// Used to locate per-target binaries under `native/<triple>/`, which is where
+/// `build.sh --all` installs cross-compiled libraries.
+String? get currentTargetTriple {
+  // `Abi.current()` reports the architecture Dart itself was built for, which
+  // is the architecture the native library must match.
+  final abi = Abi.current().toString();
+  const map = <String, String>{
+    'linux_x64': 'x86_64-unknown-linux-gnu',
+    'linux_arm64': 'aarch64-unknown-linux-gnu',
+    'macos_x64': 'x86_64-apple-darwin',
+    'macos_arm64': 'aarch64-apple-darwin',
+    'windows_x64': 'x86_64-pc-windows-gnu',
+  };
+  return map[abi];
+}
+
 /// Candidate paths searched when no explicit path is supplied.
+///
+/// Ordered cheapest-and-most-specific first: the per-target directory beats the
+/// flat one, so a multi-platform checkout picks the right architecture instead
+/// of a stale host build.
 List<String> _searchPaths(String name) {
   final script = Platform.script.toFilePath();
   final root = script.isEmpty ? Directory.current.path : File(script).parent.path;
+  final cwd = Directory.current.path;
+  final triple = currentTargetTriple;
+
   return <String>[
+    if (triple != null) ...[
+      'native/$triple/$name',
+      '$cwd/native/$triple/$name',
+      '$root/native/$triple/$name',
+      '$root/../native/$triple/$name',
+    ],
     name, // system loader path
     'native/$name',
-    '${Directory.current.path}/native/$name',
+    '$cwd/native/$name',
     '$root/native/$name',
     '$root/../native/$name',
     'rust/target/release/$name',
     'rust/target/debug/$name',
-    '${Directory.current.path}/rust/target/release/$name',
-    '${Directory.current.path}/rust/target/debug/$name',
+    '$cwd/rust/target/release/$name',
+    '$cwd/rust/target/debug/$name',
+    if (triple != null) ...[
+      'rust/target/$triple/release/$name',
+      '$cwd/rust/target/$triple/release/$name',
+    ],
   ];
 }
 

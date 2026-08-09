@@ -54,6 +54,7 @@ downward from byte 4096.
 ```bash
 ./build.sh              # release build, installs into native/
 ./build.sh --debug
+./build.sh --all        # every supported platform (needs cargo-zigbuild)
 ./build.sh --target aarch64-apple-darwin
 ```
 
@@ -62,12 +63,46 @@ downward from byte 4096.
 .\build.ps1 -Target x86_64-pc-windows-msvc
 ```
 
-Cross-compilation honours the standard `CC` / `AR` variables:
+### Cross-compilation
+
+Cross builds need a linker that emits the target's object format. The most
+portable option is [`cargo-zigbuild`](https://github.com/rust-cross/cargo-zigbuild),
+which uses Zig's bundled clang and needs no Xcode installation for macOS:
+
+```bash
+cargo install cargo-zigbuild
+winget install zig.zig     # or: brew install zig / apt install zig
+
+rustup target add x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu \
+                  x86_64-apple-darwin aarch64-apple-darwin
+./build.sh --all
+```
+
+`build.sh` detects `cargo-zigbuild` and uses it automatically for any target
+that is not the host. Without it, the script falls back to plain `cargo` and
+honours the standard `CC` / `AR` variables:
 
 ```bash
 CC=aarch64-linux-gnu-gcc AR=aarch64-linux-gnu-ar \
   ./build.sh --target aarch64-unknown-linux-gnu
 ```
+
+### Prebuilt binaries
+
+Cross-compiled libraries are installed into `native/<triple>/`, and the Dart
+loader prefers the directory matching the running architecture before falling
+back to the flat `native/` layout:
+
+| Target triple | Artifact | Format |
+| --- | --- | --- |
+| `x86_64-unknown-linux-gnu` | `libphoenixdb.so` | ELF 64-bit x86-64 |
+| `aarch64-unknown-linux-gnu` | `libphoenixdb.so` | ELF 64-bit ARM aarch64 |
+| `x86_64-apple-darwin` | `libphoenixdb.dylib` | Mach-O 64-bit x86_64 |
+| `aarch64-apple-darwin` | `libphoenixdb.dylib` | Mach-O 64-bit arm64 |
+| `x86_64-pc-windows-gnu` | `phoenixdb.dll` | PE32+ x86-64 |
+
+All five export the same 19-function C ABI. Binaries are build output and are
+not tracked in git — run `./build.sh --all` to regenerate them.
 
 The C header is regenerated into `native/include/phoenixdb.h` on every build.
 
