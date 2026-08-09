@@ -20,7 +20,7 @@ pages, implemented in Rust and exposed to Dart through a zero-overhead FFI
 layer.
                        DESC
   s.homepage         = 'https://github.com/phoenixdb/phoenixdb'
-  s.license          = { :type => 'MIT OR Apache-2.0', :file => '../LICENSE' }
+  s.license          = { :type => 'BSD-3-Clause', :file => '../LICENSE' }
   s.author           = { 'PhoenixDB Authors' => 'phoenixdb@example.com' }
   s.source           = { :path => '.' }
 

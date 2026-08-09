@@ -252,4 +252,4 @@ cargo +nightly fuzz run fuzz_ffi   -- -max_total_time=60   # hostile FFI inputs
 
 ## License
 
-MIT OR Apache-2.0
+BSD-3-Clause
