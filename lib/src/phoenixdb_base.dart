@@ -43,7 +43,7 @@ class PhoenixException implements Exception {
 class KeyNotFoundException extends PhoenixException {
   /// Creates a not-found error for [key].
   KeyNotFoundException(Uint8List key)
-      : super(PhoenixStatus.notFound, 'key not found: ${_preview(key)}');
+    : super(PhoenixStatus.notFound, 'key not found: ${_preview(key)}');
 
   static String _preview(Uint8List key) {
     final shown = key.length <= 32 ? key : key.sublist(0, 32);
@@ -100,7 +100,9 @@ class PhoenixDatabase implements Finalizable {
       final handle = outHandle.value;
       if (handle == nullptr) {
         throw const PhoenixException(
-            PhoenixStatus.error, 'open returned a null handle');
+          PhoenixStatus.error,
+          'open returned a null handle',
+        );
       }
       final finalizer = NativeFinalizer(bindings.closePtr.cast());
       return PhoenixDatabase._(bindings, _HandleOwner(handle), finalizer);
@@ -125,12 +127,17 @@ class PhoenixDatabase implements Finalizable {
   void _ensureOpen() {
     if (_closed) {
       throw const PhoenixException(
-          PhoenixStatus.invalidArgument, 'database is closed');
+        PhoenixStatus.invalidArgument,
+        'database is closed',
+      );
     }
   }
 
   static PhoenixException _errorFor(
-      PhoenixBindings b, int status, String context) {
+    PhoenixBindings b,
+    int status,
+    String context,
+  ) {
     final ptr = b.lastError();
     var detail = 'native call failed';
     if (ptr != nullptr) {
@@ -186,9 +193,21 @@ class PhoenixDatabase implements Finalizable {
     final valuePtr = _copyToNative(value);
     try {
       final status = txnId == null
-          ? _b.putAuto(_owner.pointer, keyPtr, key.length, valuePtr, value.length)
+          ? _b.putAuto(
+              _owner.pointer,
+              keyPtr,
+              key.length,
+              valuePtr,
+              value.length,
+            )
           : _b.insert(
-              _owner.pointer, txnId, keyPtr, key.length, valuePtr, value.length);
+              _owner.pointer,
+              txnId,
+              keyPtr,
+              key.length,
+              valuePtr,
+              value.length,
+            );
       if (status != PhoenixStatus.ok) _throw(status, 'insert');
     } finally {
       calloc.free(keyPtr);
@@ -202,7 +221,13 @@ class PhoenixDatabase implements Finalizable {
     final keyPtr = _copyToNative(key);
     final out = calloc<PhoenixBuffer>();
     try {
-      final status = _b.get(_owner.pointer, txnId ?? 0, keyPtr, key.length, out);
+      final status = _b.get(
+        _owner.pointer,
+        txnId ?? 0,
+        keyPtr,
+        key.length,
+        out,
+      );
       if (status == PhoenixStatus.notFound) return null;
       if (status != PhoenixStatus.ok) _throw(status, 'get');
       return _takeBuffer(out);

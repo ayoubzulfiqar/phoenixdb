@@ -72,91 +72,170 @@ final class PhoenixBuffer extends Struct {
 // ---------------------------------------------------------------------------
 
 /// Native signature for `OpenNative`.
-typedef OpenNative = Int32 Function(
-    Pointer<Utf8> path, Size cachePages, Pointer<Pointer<PhoenixDB>> outHandle);
+typedef OpenNative =
+    Int32 Function(
+      Pointer<Utf8> path,
+      Size cachePages,
+      Pointer<Pointer<PhoenixDB>> outHandle,
+    );
+
 /// Dart signature for `OpenDart`.
-typedef OpenDart = int Function(
-    Pointer<Utf8> path, int cachePages, Pointer<Pointer<PhoenixDB>> outHandle);
+typedef OpenDart =
+    int Function(
+      Pointer<Utf8> path,
+      int cachePages,
+      Pointer<Pointer<PhoenixDB>> outHandle,
+    );
 
 /// Native signature for `CloseNative`.
 typedef CloseNative = Int32 Function(Pointer<PhoenixDB> handle);
+
 /// Dart signature for `CloseDart`.
 typedef CloseDart = int Function(Pointer<PhoenixDB> handle);
 
 /// Native signature for `BeginTxnNative`.
-typedef BeginTxnNative = Int32 Function(
-    Pointer<PhoenixDB> handle, Int32 readOnly, Pointer<Uint64> outTxn);
+typedef BeginTxnNative =
+    Int32 Function(
+      Pointer<PhoenixDB> handle,
+      Int32 readOnly,
+      Pointer<Uint64> outTxn,
+    );
+
 /// Dart signature for `BeginTxnDart`.
-typedef BeginTxnDart = int Function(
-    Pointer<PhoenixDB> handle, int readOnly, Pointer<Uint64> outTxn);
+typedef BeginTxnDart =
+    int Function(
+      Pointer<PhoenixDB> handle,
+      int readOnly,
+      Pointer<Uint64> outTxn,
+    );
 
 /// Native signature for `TxnOpNative`.
 typedef TxnOpNative = Int32 Function(Pointer<PhoenixDB> handle, Uint64 txnId);
+
 /// Dart signature for `TxnOpDart`.
 typedef TxnOpDart = int Function(Pointer<PhoenixDB> handle, int txnId);
 
 /// Native signature for `InsertNative`.
-typedef InsertNative = Int32 Function(Pointer<PhoenixDB> handle, Uint64 txnId,
-    Pointer<Uint8> key, Size keyLen, Pointer<Uint8> value, Size valueLen);
+typedef InsertNative =
+    Int32 Function(
+      Pointer<PhoenixDB> handle,
+      Uint64 txnId,
+      Pointer<Uint8> key,
+      Size keyLen,
+      Pointer<Uint8> value,
+      Size valueLen,
+    );
+
 /// Dart signature for `InsertDart`.
-typedef InsertDart = int Function(Pointer<PhoenixDB> handle, int txnId,
-    Pointer<Uint8> key, int keyLen, Pointer<Uint8> value, int valueLen);
+typedef InsertDart =
+    int Function(
+      Pointer<PhoenixDB> handle,
+      int txnId,
+      Pointer<Uint8> key,
+      int keyLen,
+      Pointer<Uint8> value,
+      int valueLen,
+    );
 
 /// Native signature for `PutAutoNative`.
-typedef PutAutoNative = Int32 Function(Pointer<PhoenixDB> handle,
-    Pointer<Uint8> key, Size keyLen, Pointer<Uint8> value, Size valueLen);
+typedef PutAutoNative =
+    Int32 Function(
+      Pointer<PhoenixDB> handle,
+      Pointer<Uint8> key,
+      Size keyLen,
+      Pointer<Uint8> value,
+      Size valueLen,
+    );
+
 /// Dart signature for `PutAutoDart`.
-typedef PutAutoDart = int Function(Pointer<PhoenixDB> handle,
-    Pointer<Uint8> key, int keyLen, Pointer<Uint8> value, int valueLen);
+typedef PutAutoDart =
+    int Function(
+      Pointer<PhoenixDB> handle,
+      Pointer<Uint8> key,
+      int keyLen,
+      Pointer<Uint8> value,
+      int valueLen,
+    );
 
 /// Native signature for `GetNative`.
-typedef GetNative = Int32 Function(Pointer<PhoenixDB> handle, Uint64 txnId,
-    Pointer<Uint8> key, Size keyLen, Pointer<PhoenixBuffer> out);
+typedef GetNative =
+    Int32 Function(
+      Pointer<PhoenixDB> handle,
+      Uint64 txnId,
+      Pointer<Uint8> key,
+      Size keyLen,
+      Pointer<PhoenixBuffer> out,
+    );
+
 /// Dart signature for `GetDart`.
-typedef GetDart = int Function(Pointer<PhoenixDB> handle, int txnId,
-    Pointer<Uint8> key, int keyLen, Pointer<PhoenixBuffer> out);
+typedef GetDart =
+    int Function(
+      Pointer<PhoenixDB> handle,
+      int txnId,
+      Pointer<Uint8> key,
+      int keyLen,
+      Pointer<PhoenixBuffer> out,
+    );
 
 /// Native signature for `DeleteNative`.
-typedef DeleteNative = Int32 Function(
-    Pointer<PhoenixDB> handle, Uint64 txnId, Pointer<Uint8> key, Size keyLen);
+typedef DeleteNative =
+    Int32 Function(
+      Pointer<PhoenixDB> handle,
+      Uint64 txnId,
+      Pointer<Uint8> key,
+      Size keyLen,
+    );
+
 /// Dart signature for `DeleteDart`.
-typedef DeleteDart = int Function(
-    Pointer<PhoenixDB> handle, int txnId, Pointer<Uint8> key, int keyLen);
+typedef DeleteDart =
+    int Function(
+      Pointer<PhoenixDB> handle,
+      int txnId,
+      Pointer<Uint8> key,
+      int keyLen,
+    );
 
 /// Native signature for `BufferFreeNative`.
 typedef BufferFreeNative = Void Function(Pointer<PhoenixBuffer> buf);
+
 /// Dart signature for `BufferFreeDart`.
 typedef BufferFreeDart = void Function(Pointer<PhoenixBuffer> buf);
 
 /// Native signature for `StringFreeNative`.
 typedef StringFreeNative = Void Function(Pointer<Utf8> s);
+
 /// Dart signature for `StringFreeDart`.
 typedef StringFreeDart = void Function(Pointer<Utf8> s);
 
 /// Native signature for `LastErrorNative`.
 typedef LastErrorNative = Pointer<Utf8> Function();
+
 /// Dart signature for `LastErrorDart`.
 typedef LastErrorDart = Pointer<Utf8> Function();
 
 /// Native signature for `MaintenanceNative`.
 typedef MaintenanceNative = Int32 Function(Pointer<PhoenixDB> handle);
+
 /// Dart signature for `MaintenanceDart`.
 typedef MaintenanceDart = int Function(Pointer<PhoenixDB> handle);
 
 /// Native signature for `CountNative`.
-typedef CountNative = Int32 Function(
-    Pointer<PhoenixDB> handle, Pointer<Uint64> outLen);
+typedef CountNative =
+    Int32 Function(Pointer<PhoenixDB> handle, Pointer<Uint64> outLen);
+
 /// Dart signature for `CountDart`.
-typedef CountDart = int Function(
-    Pointer<PhoenixDB> handle, Pointer<Uint64> outLen);
+typedef CountDart =
+    int Function(Pointer<PhoenixDB> handle, Pointer<Uint64> outLen);
 
 /// Native signature for `AbiVersionNative`.
 typedef AbiVersionNative = Uint32 Function();
+
 /// Dart signature for `AbiVersionDart`.
 typedef AbiVersionDart = int Function();
 
 /// Native signature for `LimitNative`.
 typedef LimitNative = Size Function();
+
 /// Dart signature for `LimitDart`.
 typedef LimitDart = int Function();
 
@@ -220,7 +299,9 @@ List<String> _searchPaths(String name) {
   if (Platform.isIOS) return const <String>[];
 
   final script = Platform.script.toFilePath();
-  final root = script.isEmpty ? Directory.current.path : File(script).parent.path;
+  final root = script.isEmpty
+      ? Directory.current.path
+      : File(script).parent.path;
   final cwd = Directory.current.path;
   final triple = currentTargetTriple;
 
@@ -320,43 +401,59 @@ class PhoenixBindings {
   final Pointer<NativeFunction<CloseNative>> closePtr;
 
   PhoenixBindings._(this.library)
-      : open = library.lookupFunction<OpenNative, OpenDart>('phoenix_open'),
-        close = library.lookupFunction<CloseNative, CloseDart>('phoenix_close'),
-        beginTxn = library
-            .lookupFunction<BeginTxnNative, BeginTxnDart>('phoenix_begin_txn'),
-        commitTxn =
-            library.lookupFunction<TxnOpNative, TxnOpDart>('phoenix_commit_txn'),
-        rollbackTxn = library
-            .lookupFunction<TxnOpNative, TxnOpDart>('phoenix_rollback_txn'),
-        insert =
-            library.lookupFunction<InsertNative, InsertDart>('phoenix_insert'),
-        putAuto = library
-            .lookupFunction<PutAutoNative, PutAutoDart>('phoenix_put_auto'),
-        get = library.lookupFunction<GetNative, GetDart>('phoenix_get'),
-        delete =
-            library.lookupFunction<DeleteNative, DeleteDart>('phoenix_delete'),
-        bufferFree = library.lookupFunction<BufferFreeNative, BufferFreeDart>(
-            'phoenix_buffer_free'),
-        stringFree = library.lookupFunction<StringFreeNative, StringFreeDart>(
-            'phoenix_string_free'),
-        lastError = library
-            .lookupFunction<LastErrorNative, LastErrorDart>('phoenix_last_error'),
-        checkpoint = library
-            .lookupFunction<MaintenanceNative, MaintenanceDart>('phoenix_checkpoint'),
-        flush = library
-            .lookupFunction<MaintenanceNative, MaintenanceDart>('phoenix_flush'),
-        verify = library
-            .lookupFunction<MaintenanceNative, MaintenanceDart>('phoenix_verify'),
-        count = library.lookupFunction<CountNative, CountDart>('phoenix_count'),
-        abiVersion = library
-            .lookupFunction<AbiVersionNative, AbiVersionDart>('phoenix_abi_version'),
-        maxKeyLen =
-            library.lookupFunction<LimitNative, LimitDart>('phoenix_max_key_len'),
-        maxValueLen =
-            library.lookupFunction<LimitNative, LimitDart>('phoenix_max_value_len'),
-        bufferFreePtr =
-            library.lookup<NativeFunction<BufferFreeNative>>('phoenix_buffer_free'),
-        closePtr = library.lookup<NativeFunction<CloseNative>>('phoenix_close');
+    : open = library.lookupFunction<OpenNative, OpenDart>('phoenix_open'),
+      close = library.lookupFunction<CloseNative, CloseDart>('phoenix_close'),
+      beginTxn = library.lookupFunction<BeginTxnNative, BeginTxnDart>(
+        'phoenix_begin_txn',
+      ),
+      commitTxn = library.lookupFunction<TxnOpNative, TxnOpDart>(
+        'phoenix_commit_txn',
+      ),
+      rollbackTxn = library.lookupFunction<TxnOpNative, TxnOpDart>(
+        'phoenix_rollback_txn',
+      ),
+      insert = library.lookupFunction<InsertNative, InsertDart>(
+        'phoenix_insert',
+      ),
+      putAuto = library.lookupFunction<PutAutoNative, PutAutoDart>(
+        'phoenix_put_auto',
+      ),
+      get = library.lookupFunction<GetNative, GetDart>('phoenix_get'),
+      delete = library.lookupFunction<DeleteNative, DeleteDart>(
+        'phoenix_delete',
+      ),
+      bufferFree = library.lookupFunction<BufferFreeNative, BufferFreeDart>(
+        'phoenix_buffer_free',
+      ),
+      stringFree = library.lookupFunction<StringFreeNative, StringFreeDart>(
+        'phoenix_string_free',
+      ),
+      lastError = library.lookupFunction<LastErrorNative, LastErrorDart>(
+        'phoenix_last_error',
+      ),
+      checkpoint = library.lookupFunction<MaintenanceNative, MaintenanceDart>(
+        'phoenix_checkpoint',
+      ),
+      flush = library.lookupFunction<MaintenanceNative, MaintenanceDart>(
+        'phoenix_flush',
+      ),
+      verify = library.lookupFunction<MaintenanceNative, MaintenanceDart>(
+        'phoenix_verify',
+      ),
+      count = library.lookupFunction<CountNative, CountDart>('phoenix_count'),
+      abiVersion = library.lookupFunction<AbiVersionNative, AbiVersionDart>(
+        'phoenix_abi_version',
+      ),
+      maxKeyLen = library.lookupFunction<LimitNative, LimitDart>(
+        'phoenix_max_key_len',
+      ),
+      maxValueLen = library.lookupFunction<LimitNative, LimitDart>(
+        'phoenix_max_value_len',
+      ),
+      bufferFreePtr = library.lookup<NativeFunction<BufferFreeNative>>(
+        'phoenix_buffer_free',
+      ),
+      closePtr = library.lookup<NativeFunction<CloseNative>>('phoenix_close');
 
   /// Loads the native library, searching well-known locations.
   ///

@@ -12,7 +12,19 @@ import 'dart:typed_data';
 import 'phoenixdb_base.dart';
 
 /// Operations the worker understands.
-enum _Op { insert, get, delete, count, checkpoint, flush, verify, begin, commit, rollback, close }
+enum _Op {
+  insert,
+  get,
+  delete,
+  count,
+  checkpoint,
+  flush,
+  verify,
+  begin,
+  commit,
+  rollback,
+  close,
+}
 
 /// A request sent to the worker isolate.
 class _Request {
@@ -23,8 +35,14 @@ class _Request {
   final int? txnId;
   final bool readOnly;
 
-  const _Request(this.id, this.op,
-      {this.key, this.value, this.txnId, this.readOnly = false});
+  const _Request(
+    this.id,
+    this.op, {
+    this.key,
+    this.value,
+    this.txnId,
+    this.readOnly = false,
+  });
 }
 
 /// A response returned by the worker isolate.
@@ -72,37 +90,37 @@ void _workerMain(_Boot boot) {
     try {
       final Object? result = switch (request.op) {
         _Op.insert => () {
-            db.insert(request.key!, request.value!, txnId: request.txnId);
-            return null;
-          }(),
+          db.insert(request.key!, request.value!, txnId: request.txnId);
+          return null;
+        }(),
         _Op.get => db.get(request.key!, txnId: request.txnId),
         _Op.delete => db.delete(request.key!, txnId: request.txnId),
         _Op.count => db.count(),
         _Op.checkpoint => () {
-            db.checkpoint();
-            return null;
-          }(),
+          db.checkpoint();
+          return null;
+        }(),
         _Op.flush => () {
-            db.flush();
-            return null;
-          }(),
+          db.flush();
+          return null;
+        }(),
         _Op.verify => () {
-            db.verify();
-            return null;
-          }(),
+          db.verify();
+          return null;
+        }(),
         _Op.begin => db.beginTransaction(readOnly: request.readOnly),
         _Op.commit => () {
-            db.commit(request.txnId!);
-            return null;
-          }(),
+          db.commit(request.txnId!);
+          return null;
+        }(),
         _Op.rollback => () {
-            db.rollback(request.txnId!);
-            return null;
-          }(),
+          db.rollback(request.txnId!);
+          return null;
+        }(),
         _Op.close => () {
-            db.close();
-            return null;
-          }(),
+          db.close();
+          return null;
+        }(),
       };
       reply.send(_Response(request.id, result: result));
       if (request.op == _Op.close) {
@@ -199,8 +217,7 @@ class AsyncPhoenixDB {
 
   /// Reads [key], returning `null` when it does not exist.
   Future<Uint8List?> get(Uint8List key, {int? txnId}) async =>
-      await _send(_Request(_id, _Op.get, key: key, txnId: txnId))
-          as Uint8List?;
+      await _send(_Request(_id, _Op.get, key: key, txnId: txnId)) as Uint8List?;
 
   /// Deletes [key], returning `false` when it did not exist.
   Future<bool> delete(Uint8List key, {int? txnId}) async =>
@@ -264,7 +281,10 @@ class AsyncPhoenixDB {
       for (final completer in _pending.values) {
         if (!completer.isCompleted) {
           completer.completeError(
-            const PhoenixException(-1, 'database closed while a call was in flight'),
+            const PhoenixException(
+              -1,
+              'database closed while a call was in flight',
+            ),
           );
         }
       }

@@ -89,8 +89,7 @@ void main() {
 
   test('concurrent futures are all served', () async {
     final writes = <Future<void>>[
-      for (var i = 0; i < 40; i++)
-        db.insert(utf8Key('c$i'), utf8Value('v$i')),
+      for (var i = 0; i < 40; i++) db.insert(utf8Key('c$i'), utf8Value('v$i')),
     ];
     await Future.wait(writes);
     expect(await db.count(), 40);
@@ -111,8 +110,10 @@ void main() {
 
   test('checkpoint and verify succeed', () async {
     for (var i = 0; i < 100; i++) {
-      await db.insert(utf8Key('k${i.toString().padLeft(4, '0')}'),
-          utf8Value('value$i'));
+      await db.insert(
+        utf8Key('k${i.toString().padLeft(4, '0')}'),
+        utf8Value('value$i'),
+      );
     }
     await db.checkpoint();
     await db.verify();

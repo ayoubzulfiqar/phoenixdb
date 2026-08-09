@@ -49,8 +49,10 @@ void main() {
     }, skip: skipReason);
 
     test('getOrThrow throws KeyNotFoundException', () {
-      expect(() => db.getOrThrow(utf8Key('nope')),
-          throwsA(isA<KeyNotFoundException>()));
+      expect(
+        () => db.getOrThrow(utf8Key('nope')),
+        throwsA(isA<KeyNotFoundException>()),
+      );
     }, skip: skipReason);
 
     test('overwrite replaces the value', () {
@@ -192,8 +194,10 @@ void main() {
 
     test('verify passes after heavy churn', () {
       for (var i = 0; i < 400; i++) {
-        db.insert(utf8Key('key${i.toString().padLeft(5, '0')}'),
-            utf8Value('value$i'));
+        db.insert(
+          utf8Key('key${i.toString().padLeft(5, '0')}'),
+          utf8Value('value$i'),
+        );
       }
       for (var i = 0; i < 400; i += 3) {
         db.delete(utf8Key('key${i.toString().padLeft(5, '0')}'));
