@@ -32,6 +32,23 @@ native/*/
 !native/include/
 !native/include/**
 
+# --- Flutter plugin platform artifacts --------------------------------------
+# Android .so files ARE tracked: they are prebuilt and shipped in the package
+# so `flutter pub get` needs no NDK on the consumer's machine.
+# Apple archives are built on the developer's Mac at app-build time.
+ios/libphoenixdb.a
+macos/libphoenixdb.a
+ios/Flutter/
+macos/Flutter/
+.flutter-plugins
+.flutter-plugins-dependencies
+**/Pods/
+**/*.xcworkspace/xcuserdata/
+**/.symlinks/
+android/.gradle/
+android/local.properties
+android/build/
+
 # --- IDE / editor -----------------------------------------------------------
 .idea/
 *.iml

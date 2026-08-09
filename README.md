@@ -49,6 +49,62 @@ exposed to Dart/Flutter through a zero-overhead `dart:ffi` layer.
 A slot directory grows upward from byte 32 while variable-length cells grow
 downward from byte 4096.
 
+## Installation
+
+```bash
+dart pub add phoenixdb        # Dart CLI / server
+flutter pub add phoenixdb     # Flutter app
+```
+
+Or add it to `pubspec.yaml`:
+
+```yaml
+dependencies:
+  phoenixdb: ^0.1.0
+```
+
+### How the native library is delivered
+
+PhoenixDB is an FFI plugin, so the engine ships as a native artifact rather
+than Dart source. What happens per platform:
+
+| Platform | Delivery | Built when |
+| --- | --- | --- |
+| Android | Prebuilt `.so` in `android/src/main/jniLibs/<abi>/`, packaged into your APK/AAB | Shipped prebuilt |
+| iOS | Static archive compiled by `rust/build-apple.sh`, linked into the app binary | `flutter build ios` |
+| macOS | Universal static archive (arm64 + x86_64) | `flutter build macos` |
+| Linux | `cargo build` driven by CMake, bundled next to the executable | `flutter build linux` |
+| Windows | `cargo build` driven by CMake, DLL bundled with the app | `flutter build windows` |
+
+Android ships prebuilt because the NDK cross-compiles cleanly from any host.
+Apple platforms build from source at app-build time because linking requires
+an Xcode SDK and code signing that only exist on the developer's Mac.
+
+**Flutter apps need no extra setup** — the platform folders are wired up
+automatically. Building for iOS/macOS/Linux/Windows additionally requires a
+Rust toolchain on the build machine:
+
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+```
+
+### Plain Dart (non-Flutter)
+
+There is no app bundle to carry the library, so build it once and leave it
+where the loader can find it:
+
+```bash
+git clone https://github.com/phoenixdb/phoenixdb && cd phoenixdb
+./build.sh                    # installs into native/
+```
+
+The loader searches `native/<target-triple>/`, then `native/`, then
+`rust/target/{release,debug}/`. You can also point at it explicitly:
+
+```dart
+final db = PhoenixDatabase.open('data.pdb', libraryPath: '/opt/lib/libphoenixdb.so');
+```
+
 ## Building
 
 ```bash

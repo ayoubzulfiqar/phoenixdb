@@ -55,6 +55,22 @@ Initial release.
   the UI thread.
 - Automatic native-library discovery with an ABI-version check on load.
 
+**Packaging**
+- Installable with `dart pub add phoenixdb` and `flutter pub add phoenixdb`.
+- Declared as a Flutter FFI plugin (`ffiPlugin: true`) for Android, iOS, macOS,
+  Linux and Windows, so no method-channel registrant code is generated.
+- Android: prebuilt `.so` for `arm64-v8a`, `armeabi-v7a`, `x86_64` and `x86`
+  shipped in `android/src/main/jniLibs/`, packaged into the host APK/AAB with
+  no NDK required by the consumer (minSdk 21).
+- iOS and macOS: CocoaPods podspecs that compile a static archive during the
+  Xcode build via `rust/build-apple.sh`; the archive is `-force_load`ed so the
+  `phoenix_*` symbols survive dead-stripping.
+- Linux and Windows: CMake integration that runs `cargo build` and bundles the
+  resulting shared library with the app.
+- Platform-aware library loading: bare-name `dlopen` on Android,
+  `DynamicLibrary.process()` on iOS (statically linked), and a per-target-triple
+  filesystem search on desktop.
+
 **Tooling**
 - `build.sh` and `build.ps1` with cross-compilation support via `CC`/`AR`.
 - `libfuzzer` harnesses for the B+Tree, page parsing and the FFI surface.

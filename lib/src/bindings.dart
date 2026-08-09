@@ -210,6 +210,15 @@ String? get currentTargetTriple {
 /// flat one, so a multi-platform checkout picks the right architecture instead
 /// of a stale host build.
 List<String> _searchPaths(String name) {
+  // On mobile the library ships inside the app and there is no useful
+  // filesystem to search:
+  //   * Android - the .so from jniLibs/<abi>/ is already on the linker path,
+  //     so it must be opened by bare name.
+  //   * iOS - the Rust code is statically linked into the app executable, so
+  //     the process itself provides the symbols; see [PhoenixBindings.load].
+  if (Platform.isAndroid) return <String>[name];
+  if (Platform.isIOS) return const <String>[];
+
   final script = Platform.script.toFilePath();
   final root = script.isEmpty ? Directory.current.path : File(script).parent.path;
   final cwd = Directory.current.path;
@@ -356,6 +365,21 @@ class PhoenixBindings {
   /// match [kExpectedAbiVersion].
   factory PhoenixBindings.load({String? path}) {
     final name = path ?? defaultLibraryName;
+
+    // iOS links the Rust archive statically into the app executable, so there
+    // is no separate library file to open; the symbols live in the process.
+    if (path == null && Platform.isIOS) {
+      final bindings = PhoenixBindings._(DynamicLibrary.process());
+      final version = bindings.abiVersion();
+      if (version != kExpectedAbiVersion) {
+        throw PhoenixLoadException(
+          'ABI mismatch: native reports $version, package expects '
+          '$kExpectedAbiVersion. Rebuild the native library.',
+        );
+      }
+      return bindings;
+    }
+
     final attempts = path != null ? <String>[path] : _searchPaths(name);
     final failures = <String>[];
 

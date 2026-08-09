@@ -2,10 +2,11 @@ name: phoenixdb
 description: >-
   ACID-compliant embedded key/value database engine with a B+Tree index, MVCC
   transactions and a write-ahead log, implemented in Rust and exposed to Dart
-  through a zero-overhead dart:ffi layer.
+  and Flutter through a zero-overhead dart:ffi layer.
 version: 0.1.0
 repository: https://github.com/phoenixdb/phoenixdb
 issue_tracker: https://github.com/phoenixdb/phoenixdb/issues
+documentation: https://github.com/phoenixdb/phoenixdb#readme
 
 topics:
   - database
@@ -14,12 +15,36 @@ topics:
   - storage
   - acid
 
+# Dart-only consumers (`dart pub add phoenixdb`) get the same package; the
+# loader in lib/src/bindings.dart finds the native library on disk. Flutter
+# consumers additionally get the platform folders below, which bundle or build
+# the native library as part of the app.
 environment:
   sdk: ^3.12.2
+  flutter: ">=3.10.0"
 
 dependencies:
   ffi: ^2.1.0
+  # `flutter` is intentionally NOT a dependency: this package works under plain
+  # Dart too. The plugin platforms below are only consulted by the Flutter tool.
 
 dev_dependencies:
   lints: ^6.0.0
   test: ^1.25.6
+
+flutter:
+  plugin:
+    platforms:
+      # ffiPlugin: true marks these as FFI-only implementations, so the Flutter
+      # tool bundles the native artifacts without generating method-channel
+      # registrant code.
+      android:
+        ffiPlugin: true
+      ios:
+        ffiPlugin: true
+      macos:
+        ffiPlugin: true
+      linux:
+        ffiPlugin: true
+      windows:
+        ffiPlugin: true
