@@ -7,8 +7,19 @@
 #   ./build.sh                      # release build for the host
 #   ./build.sh --debug              # debug build
 #   ./build.sh --target <triple>    # cross-compile
-#   ./build.sh --all                # every supported target
+#   ./build.sh --all                # every supported desktop target
+#   ./build.sh --android            # all four Android ABIs -> jniLibs/
 #   ./build.sh --zig                # force the zig cross-linker
+#
+# Android:
+#   Needs the NDK. The script looks at ANDROID_NDK_HOME, then NDK_HOME, then
+#   the newest NDK under $ANDROID_HOME/ndk. Output goes straight into
+#   android/src/main/jniLibs/<abi>/ so Gradle packages it into the host APK.
+#   Override the API level with ANDROID_API (default 21).
+#
+# Apple (iOS/macOS):
+#   Use rust/build-apple.sh, which must run on macOS with Xcode installed.
+#   The podspecs invoke it automatically during `flutter build`.
 #
 # Cross-compilation:
 #   Cross builds need a linker for the target platform. The most reliable
@@ -35,6 +46,7 @@ PROFILE="release"
 PROFILE_FLAG="--release"
 TARGETS=()
 BUILD_ALL=0
+BUILD_ANDROID=0
 FORCE_ZIG=0
 
 while [[ $# -gt 0 ]]; do
@@ -50,6 +62,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --all)
       BUILD_ALL=1
+      shift
+      ;;
+    --android)
+      BUILD_ANDROID=1
       shift
       ;;
     --zig)
@@ -143,6 +159,76 @@ build_one() {
   cp -f "$src" "$dest_dir/$lib_name"
   echo "   installed -> $dest_dir/$lib_name"
 }
+
+# Builds every Android ABI with the NDK's clang wrappers and installs the
+# results into android/src/main/jniLibs/<abi>/, the layout Gradle packages
+# into the host APK.
+build_android() {
+  local ndk="${ANDROID_NDK_HOME:-${NDK_HOME:-}}"
+  if [[ -z "$ndk" ]]; then
+    # Fall back to the newest NDK under the default SDK location.
+    local sdk="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-$HOME/AppData/Local/Android/Sdk}}"
+    [[ -d "$sdk/ndk" ]] && ndk="$(find "$sdk/ndk" -maxdepth 1 -mindepth 1 -type d | sort -V | tail -1)"
+  fi
+  if [[ -z "$ndk" || ! -d "$ndk" ]]; then
+    echo "!! Android NDK not found. Set ANDROID_NDK_HOME." >&2
+    return 1
+  fi
+  echo ">> using NDK: $ndk"
+
+  # Pick the prebuilt toolchain matching this host.
+  local hosttag
+  case "$(uname -s)" in
+    Darwin)               hosttag="darwin-x86_64" ;;
+    MINGW*|MSYS*|CYGWIN*) hosttag="windows-x86_64" ;;
+    *)                    hosttag="linux-x86_64" ;;
+  esac
+  local ndkbin="$ndk/toolchains/llvm/prebuilt/$hosttag/bin"
+  [[ -d "$ndkbin" ]] || { echo "!! NDK toolchain missing: $ndkbin" >&2; return 1; }
+
+  # Rust needs a native path for the linker; MSYS-style paths are mangled.
+  local ndkbin_native="$ndkbin"
+  local ext=""
+  if [[ "$hosttag" == "windows-x86_64" ]]; then
+    ndkbin_native="$(cygpath -w "$ndkbin" 2>/dev/null || echo "$ndkbin")"
+    ext=".cmd"
+  fi
+
+  # triple : jniLibs ABI dir : NDK clang wrapper prefix
+  local specs=(
+    "aarch64-linux-android:arm64-v8a:aarch64-linux-android${ANDROID_API:-21}"
+    "armv7-linux-androideabi:armeabi-v7a:armv7a-linux-androideabi${ANDROID_API:-21}"
+    "x86_64-linux-android:x86_64:x86_64-linux-android${ANDROID_API:-21}"
+    "i686-linux-android:x86:i686-linux-android${ANDROID_API:-21}"
+  )
+
+  local spec triple abi prefix var
+  for spec in "${specs[@]}"; do
+    IFS=: read -r triple abi prefix <<<"$spec"
+    rustup target add "$triple" >/dev/null 2>&1 || true
+
+    # cargo reads CARGO_TARGET_<TRIPLE>_LINKER, upper-cased with dashes as _.
+    var="CARGO_TARGET_$(tr '[:lower:]-' '[:upper:]_' <<<"$triple")_LINKER"
+    export "$var=$ndkbin_native/$prefix-clang$ext"
+
+    echo ">> building for $triple ($PROFILE) -> $abi"
+    local args=(build --lib --target "$triple")
+    [[ -n "$PROFILE_FLAG" ]] && args+=("$PROFILE_FLAG")
+    ( cd "$RUST_DIR" && cargo "${args[@]}" )
+
+    local src="$RUST_DIR/target/$triple/$PROFILE/libphoenixdb.so"
+    [[ -f "$src" ]] || { echo "!! missing $src" >&2; return 1; }
+    mkdir -p "$SCRIPT_DIR/android/src/main/jniLibs/$abi"
+    cp -f "$src" "$SCRIPT_DIR/android/src/main/jniLibs/$abi/"
+    echo "   installed -> android/src/main/jniLibs/$abi/libphoenixdb.so"
+  done
+}
+
+if [[ $BUILD_ANDROID -eq 1 ]]; then
+  build_android
+  echo ">> done"
+  exit 0
+fi
 
 if [[ ${#TARGETS[@]} -eq 0 ]]; then
   build_one ""

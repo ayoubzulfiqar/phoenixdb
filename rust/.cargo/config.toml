@@ -1,0 +1,22 @@
+# Cargo configuration for cross-compilation.
+#
+# Android: the NDK ships per-API-level clang wrappers that already know the
+# sysroot, so they are used directly as the linker. Set ANDROID_NDK_HOME (or
+# NDK_HOME) and run build.sh --android; the script exports the linker
+# variables below dynamically because the NDK path is machine-specific.
+#
+# Everything else (Linux, macOS) is handled by cargo-zigbuild, which supplies
+# its own linker and needs no configuration here.
+
+[target.aarch64-linux-android]
+# Overridden at build time via CARGO_TARGET_*_LINKER when the NDK is detected.
+rustflags = ["-C", "target-feature=+neon"]
+
+[target.armv7-linux-androideabi]
+rustflags = []
+
+[target.x86_64-linux-android]
+rustflags = []
+
+[target.i686-linux-android]
+rustflags = []
