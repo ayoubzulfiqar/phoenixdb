@@ -1,0 +1,44 @@
+# --- Dart -------------------------------------------------------------------
+# https://dart.dev/tools/private-files
+.dart_tool/
+.packages
+build/
+doc/api/
+
+# Avoid committing pubspec.lock for library packages; see
+# https://dart.dev/tools/pub/private-files#pubspec-lock.
+pubspec.lock
+
+# --- Rust -------------------------------------------------------------------
+rust/target/
+rust/fuzz/target/
+rust/fuzz/corpus/
+rust/fuzz/artifacts/
+rust/fuzz/coverage/
+**/*.rs.bk
+
+# --- Compiled native libraries ----------------------------------------------
+# Built by build.sh / build.ps1 into native/. The generated C header
+# (native/include/phoenixdb.h) IS tracked: it documents the stable ABI.
+native/*.so
+native/*.dylib
+native/*.dll
+native/*.a
+native/*.lib
+native/*.pdb
+# Per-target cross-compilation output directories (native/<triple>/…)
+native/*/
+# …but keep the generated C header, which documents the stable ABI.
+!native/include/
+!native/include/**
+
+# --- IDE / editor -----------------------------------------------------------
+.idea/
+*.iml
+.vscode/
+*.swp
+.DS_Store
+
+# --- Database files produced by examples and tests --------------------------
+*.pdb.wal
+example/*.pdb
