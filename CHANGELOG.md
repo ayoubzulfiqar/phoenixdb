@@ -75,3 +75,8 @@ Initial release.
 - `build.sh` and `build.ps1` with cross-compilation support via `CC`/`AR`.
 - `libfuzzer` harnesses for the B+Tree, page parsing and the FFI surface.
 - 86 Rust tests and 33 Dart tests; `dart analyze --fatal-infos` clean.
+- Scores 160/160 on pub.dev's package analysis (`pana`).
+
+### License
+
+Released under the BSD 3-Clause License.
