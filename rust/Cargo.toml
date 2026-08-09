@@ -1,0 +1,48 @@
+[package]
+name = "phoenixdb"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+authors = ["PhoenixDB Authors"]
+license = "MIT OR Apache-2.0"
+description = "ACID-compliant embedded key/value engine (B+Tree + MVCC + WAL) with a C ABI"
+repository = "https://github.com/phoenixdb/phoenixdb"
+readme = "README.md"
+publish = false
+
+[lib]
+name = "phoenixdb"
+# cdylib -> Dart FFI, staticlib -> static embedding, rlib -> integration tests + fuzz targets
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+bincode = "1.3"
+crc32fast = "1.4"
+libc = "0.2"
+parking_lot = "0.12"
+lru = "0.12"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Memory",
+    "Win32_Storage_FileSystem",
+] }
+
+[build-dependencies]
+cbindgen = "0.27"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "unwind" # required: FFI boundary catches panics, never unwinds into Dart
+strip = "debuginfo"
+
+[profile.bench]
+lto = true
