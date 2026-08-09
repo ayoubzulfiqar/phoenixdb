@@ -1,0 +1,44 @@
+[package]
+name = "phoenixdb-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+tempfile = "3"
+
+[dependencies.phoenixdb]
+path = ".."
+
+# Prevent this crate from being picked up by the parent workspace.
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "fuzz_btree"
+path = "fuzz_targets/fuzz_btree.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_page"
+path = "fuzz_targets/fuzz_page.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_ffi"
+path = "fuzz_targets/fuzz_ffi.rs"
+test = false
+doc = false
+bench = false
