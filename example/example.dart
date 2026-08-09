@@ -16,7 +16,9 @@ Future<void> main() async {
   db.insert(utf8Key('language'), utf8Value('Dart'));
   db.insert(utf8Key('engine'), utf8Value('Rust'));
 
-  stdout.writeln('language = ${utf8Decode(db.getOrThrow(utf8Key('language')))}');
+  stdout.writeln(
+    'language = ${utf8Decode(db.getOrThrow(utf8Key('language')))}',
+  );
   stdout.writeln('keys = ${db.count()}');
 
   // A transaction that commits.
@@ -30,8 +32,10 @@ Future<void> main() async {
   final txn = db.beginTransaction();
   db.insert(utf8Key('discarded'), utf8Value('nope'), txnId: txn);
   db.rollback(txn);
-  stdout.writeln('rolled back, discarded present: '
-      '${db.contains(utf8Key('discarded'))}');
+  stdout.writeln(
+    'rolled back, discarded present: '
+    '${db.contains(utf8Key('discarded'))}',
+  );
 
   db.delete(utf8Key('a'));
   db.checkpoint();
