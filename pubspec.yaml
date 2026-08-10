@@ -20,13 +20,21 @@ topics:
 # consumers additionally get the platform folders below, which bundle or build
 # the native library as part of the app.
 #
-# There is deliberately no `flutter:` constraint here. Declaring one makes the
-# whole package require the Flutter SDK, so `dart pub get` fails with
-# "Because phoenixdb requires the Flutter SDK, version solving failed" — even
-# though nothing under lib/ imports package:flutter. Flutter support comes
-# from the `flutter: plugin:` section below, which plain Dart ignores.
+# The `flutter:` bound must be present but LOOSE. Two opposing constraints:
+#
+#   * omit it entirely and pub rejects the package — `flutter.plugin.platforms`
+#     below is only understood by Flutter >=1.10.0, so pub demands a bound that
+#     excludes 1.9.x;
+#   * make it tight (e.g. ">=3.10.0") and `dart pub get` fails for plain Dart
+#     consumers with "Because phoenixdb requires the Flutter SDK, version
+#     solving failed", even though nothing under lib/ imports package:flutter.
+#
+# ">=1.10.0" satisfies the plugin-platforms rule while staying permissive. The
+# real floor is enforced by `sdk: ^3.12.2`: any Flutter shipping a Dart 3.12
+# SDK is far newer than 1.10.
 environment:
   sdk: ^3.12.2
+  flutter: ">=1.10.0"
 
 dependencies:
   ffi: ^2.1.0

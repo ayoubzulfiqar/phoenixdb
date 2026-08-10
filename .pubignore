@@ -26,3 +26,8 @@ pubspec.lock
 # CI-only: these drive the build pipeline, never the installed package.
 .github/
 tool/
+
+# Where the release workflow downloads per-target binaries before staging them
+# into native/ and android/. Publishing runs in that same checkout, so without
+# this the archive carries every library twice — once staged, once raw.
+artifacts/

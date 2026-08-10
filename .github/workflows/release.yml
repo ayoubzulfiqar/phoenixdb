@@ -107,7 +107,22 @@ jobs:
       - name: stage binaries
         run: tool/stage_artifacts.sh artifacts
 
-      # The release blocker this whole pipeline exists to prevent.
+      # Staging overwrites the committed Android .so files with freshly built
+      # ones, which leaves the checkout dirty and makes pub warn about
+      # publishing from an unclean tree. The rebuilt binaries are exactly what
+      # we intend to ship, so record them rather than leave the tree modified.
+      - name: commit the rebuilt binaries
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git diff --quiet -- native android; then
+            echo "binaries unchanged"
+          else
+            git add native android
+            git commit -m "chore(release): rebuild native binaries for ${GITHUB_REF_NAME:-release}"
+            echo "recorded rebuilt binaries"
+          fi
+
       - name: no stale binaries
         run: tool/check_abi.sh --shipped
 
