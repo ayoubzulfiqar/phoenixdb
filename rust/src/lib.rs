@@ -56,12 +56,14 @@ pub mod security;
 #[cfg(feature = "sql")]
 pub mod sql;
 pub mod txn;
+pub mod vector;
 pub mod wal;
 
 pub use btree::{BTree, FillFactor};
 pub use error::{Error, PhoenixStatus, Result};
 pub use page::{MetaData, PAGE_SIZE};
 pub use txn::{TxnState, Write};
+pub use vector::{Metric, VectorEngine, VectorMatch, VectorOptions};
 
 use pager::Pager;
 use parking_lot::RwLock;

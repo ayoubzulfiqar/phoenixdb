@@ -1,11 +1,11 @@
 [package]
 name = "phoenixdb"
-version = "2.0.0"
+version = "2.1.0"
 edition = "2024"
 rust-version = "1.85"
 authors = ["PhoenixDB Authors"]
 license = "BSD-3-Clause"
-description = "ACID-compliant embedded key/value engine (hybrid LSM + B+Tree, MVCC, WAL) with a C ABI"
+description = "ACID-compliant embedded key/value engine (hybrid LSM + B+Tree, MVCC, WAL) with HNSW vector search and a C ABI"
 repository = "https://github.com/phoenixdb/phoenixdb"
 readme = "README.md"
 publish = false
@@ -60,6 +60,16 @@ lru = "0.12"
 #     RustCrypto implementation of the same AES-256-GCM AEAD.
 #   * `sqlparser` pulls in `stacker`, which also needs a C compiler, so the SQL
 #     layer uses a hand-written recursive-descent parser instead.
+#   * `hnsw_rs` (the obvious vector-index dependency) pulls in `anndists`,
+#     `mmap-rs`, `rayon`, `env_logger`, `jiff` and ~100 more transitive crates,
+#     several of which do not cross-compile cleanly to every Android and iOS
+#     target this package ships to. The HNSW graph is a few hundred lines, so
+#     `src/vector/hnsw.rs` implements it directly: no new dependencies, the
+#     same `bincode` snapshot format as the rest of the engine, and full
+#     control over the SIMD distance kernels. `rayon` is likewise omitted —
+#     an embedded index on a phone should not spawn a thread pool the host app
+#     did not ask for, and the `RwLock` already allows concurrent searches from
+#     the caller's own isolates or threads.
 aes-gcm = { version = "0.10", optional = true, default-features = false, features = [
     "aes",
     "alloc",
