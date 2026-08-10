@@ -15,6 +15,18 @@
 
 use crate::error::{Error, Result};
 
+pub mod audit;
+pub mod rbac;
+
+#[cfg(feature = "encryption")]
+pub mod encryption;
+
+pub use audit::{AuditLog, AuditRecord, Outcome};
+pub use rbac::{AccessControl, Permission, Principal, Role};
+
+#[cfg(feature = "encryption")]
+pub use encryption::{EncryptionKey, PageCipher};
+
 /// Maximum key length accepted at the FFI boundary (1 MiB).
 ///
 /// Note: the *storage engine* imposes a much smaller structural limit
@@ -123,7 +135,9 @@ pub unsafe fn slice_from_parts<'a>(ptr: *const u8, len: usize, max: usize) -> Re
         return Err(Error::invalid("null pointer with non-zero length"));
     }
     if (ptr as usize).checked_add(len).is_none() {
-        return Err(Error::invalid("pointer + length overflows the address space"));
+        return Err(Error::invalid(
+            "pointer + length overflows the address space",
+        ));
     }
     // SAFETY: non-null, non-wrapping, length-checked; validity is the caller's
     // documented obligation.
