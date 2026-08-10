@@ -27,6 +27,12 @@ pubspec.lock
 .github/
 tool/
 
+# Branding. The README references the banner by raw.githubusercontent.com URL
+# so it renders identically on GitHub and pub.dev, which means the bytes have
+# no reason to sit in every consumer's pub cache. Shipping them would roughly
+# double the archive (4 MB -> 8 MB) for an image nothing in lib/ ever reads.
+assets/
+
 # Where the release workflow downloads per-target binaries before staging them
 # into native/ and android/. Publishing runs in that same checkout, so without
 # this the archive carries every library twice — once staged, once raw.

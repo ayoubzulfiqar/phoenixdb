@@ -1,11 +1,23 @@
-# PhoenixDB
+<p align="center">
+  <img src="https://raw.githubusercontent.com/ayoubzulfiqar/phoenixdb/main/assets/phoenixdb-banner.png"
+       alt="PhoenixDB" width="640">
+</p>
 
-An ACID-compliant embedded database engine written in **Rust** and exposed to
-Dart/Flutter through a zero-overhead `dart:ffi` layer. Use it as a key/value
-store, as typed preferences, or through a small SQL front end.
+<h1 align="center">PhoenixDB</h1>
 
-[![Rust](https://img.shields.io/badge/rust-2024%20edition-orange)](rust/Cargo.toml)
-[![Dart](https://img.shields.io/badge/dart-%5E3.12-blue)](pubspec.yaml)
+<p align="center">
+  An ACID-compliant embedded database engine written in <b>Rust</b> and exposed
+  to Dart/Flutter through a zero-overhead <code>dart:ffi</code> layer. Use it as
+  a key/value store, as typed preferences, for vector similarity search, or
+  through a small SQL front end.
+</p>
+
+<p align="center">
+  <a href="https://pub.dev/packages/phoenixdb"><img src="https://img.shields.io/pub/v/phoenixdb" alt="pub package"></a>
+  <a href="rust/Cargo.toml"><img src="https://img.shields.io/badge/rust-2024%20edition-orange" alt="Rust"></a>
+  <a href="pubspec.yaml"><img src="https://img.shields.io/badge/dart-%5E3.12-blue" alt="Dart"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-BSD--3--Clause-green" alt="License"></a>
+</p>
 
 ## Features
 
