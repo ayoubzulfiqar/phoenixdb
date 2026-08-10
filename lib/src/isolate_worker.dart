@@ -10,6 +10,7 @@ import 'dart:isolate';
 import 'dart:typed_data';
 
 import 'phoenixdb_base.dart';
+import 'sql_result.dart';
 
 /// Operations the worker understands.
 enum _Op {
@@ -23,6 +24,7 @@ enum _Op {
   begin,
   commit,
   rollback,
+  query,
   close,
 }
 
@@ -34,6 +36,7 @@ class _Request {
   final Uint8List? value;
   final int? txnId;
   final bool readOnly;
+  final String? sql;
 
   const _Request(
     this.id,
@@ -42,6 +45,7 @@ class _Request {
     this.value,
     this.txnId,
     this.readOnly = false,
+    this.sql,
   });
 }
 
@@ -117,6 +121,10 @@ void _workerMain(_Boot boot) {
           db.rollback(request.txnId!);
           return null;
         }(),
+        // The result crosses the isolate boundary as JSON: SqlResult is not
+        // a transferable type, and re-parsing on the far side is cheap next
+        // to the query itself.
+        _Op.query => db.query(request.sql!).toJsonString(),
         _Op.close => () {
           db.close();
           return null;
@@ -225,6 +233,20 @@ class AsyncPhoenixDB {
 
   /// Number of visible keys.
   Future<int> count() async => await _send(_Request(_id, _Op.count)) as int;
+
+  /// Runs a SQL statement on the worker isolate.
+  ///
+  /// The parse and execution happen off the calling isolate, so a slow query
+  /// never blocks a Flutter UI frame.
+  ///
+  /// ```dart
+  /// await db.query('CREATE TABLE users (id INTEGER, name TEXT)');
+  /// final r = await db.query('SELECT name FROM users WHERE id = 1');
+  /// print(r.scalar); // alice
+  /// ```
+  Future<SqlResult> query(String sql) async => SqlResult.fromJson(
+    await _send(_Request(_id, _Op.query, sql: sql)) as String,
+  );
 
   /// Merges pending versions, flushes, and truncates the WAL.
   Future<void> checkpoint() => _send(_Request(_id, _Op.checkpoint));

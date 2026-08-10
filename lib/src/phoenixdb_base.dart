@@ -11,6 +11,7 @@ import 'dart:typed_data';
 import 'package:ffi/ffi.dart';
 
 import 'bindings.dart';
+import 'sql_result.dart';
 
 /// Thrown when a native call fails.
 ///
@@ -331,6 +332,49 @@ class PhoenixDatabase implements Finalizable {
       }
     }
   }
+
+  /// Runs a SQL statement and returns its result.
+  ///
+  /// Requires a native library built with the `sql` feature; check
+  /// [supportsSql] first when targeting a lean embedded build.
+  ///
+  /// ```dart
+  /// db.query('CREATE TABLE users (id INTEGER, name TEXT)');
+  /// db.query("INSERT INTO users VALUES (1, 'alice')");
+  /// final r = db.query('SELECT name FROM users WHERE id = 1');
+  /// print(r.rows.first.first); // alice
+  /// ```
+  ///
+  /// The heavy work happens in Rust; this call is synchronous, so prefer
+  /// [PhoenixDatabaseAsync.query] on a UI isolate.
+  SqlResult query(String sql) {
+    _ensureOpen();
+    final sqlPtr = sql.toNativeUtf8();
+    final outPtr = calloc<Pointer<Utf8>>();
+    try {
+      final status = _b.sqlQuery(_owner.pointer, sqlPtr, outPtr);
+      if (status != PhoenixStatus.ok) _throw(status, 'query');
+      final json = outPtr.value;
+      if (json == nullptr) {
+        throw const PhoenixException(
+          PhoenixStatus.error,
+          'query returned no result document',
+        );
+      }
+      try {
+        return SqlResult.fromJson(json.toDartString());
+      } finally {
+        // The native side owns the buffer until we hand it back.
+        _b.stringFree(json);
+      }
+    } finally {
+      calloc.free(sqlPtr);
+      calloc.free(outPtr);
+    }
+  }
+
+  /// Whether the loaded native library was built with the SQL layer.
+  bool get supportsSql => _b.hasSql() != 0;
 
   /// Checkpoints and closes the database.
   ///

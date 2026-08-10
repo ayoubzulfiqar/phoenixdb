@@ -42,6 +42,10 @@ export 'src/bindings.dart'
 export 'src/isolate_worker.dart' show AsyncPhoenixDB;
 export 'src/phoenixdb_base.dart'
     show PhoenixDatabase, PhoenixException, KeyNotFoundException;
+export 'src/prefs.dart' show PhoenixPrefs;
+export 'src/prefs_codec.dart'
+    show PrefType, PrefCodec, PhoenixTypeMismatch, PhoenixDecodeException;
+export 'src/sql_result.dart' show SqlResult;
 
 /// Encodes [s] as UTF-8 bytes for use as a key.
 Uint8List utf8Key(String s) => Uint8List.fromList(utf8.encode(s));
