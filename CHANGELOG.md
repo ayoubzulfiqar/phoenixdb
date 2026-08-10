@@ -5,6 +5,63 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 2.1.0 - 2026-08-10
+
+Embedded vector search: approximate k-NN over `f32` embeddings, so a
+local-first app can do semantic retrieval with no server and no second
+database.
+
+### Breaking
+
+- **Native ABI raised from 2 to 3.** The change is additive (every v2 entry
+  point keeps its signature) but the Dart loader enforces an *exact* match, so
+  a v2 native library and this package will not load together. Both are
+  rebuilt and shipped in this release; anyone building the library themselves
+  must rebuild it.
+
+### Added
+
+- **HNSW vector index.** `PhoenixVectorDB` (sync) and `AsyncPhoenixVectorDB`
+  (worker isolate) expose `insert`, `search`, `get`, `remove`, `save`,
+  `flush`, `compact` and `stats`.
+  - Metrics: cosine, Euclidean (L2) and dot product, selected at index
+    creation and fixed thereafter.
+  - `VectorQuery` carries the query vector, `k`, and an optional `efSearch`
+    beam width; `VectorMatch` carries the id, the metric distance, and a
+    "higher is better" score.
+  - Vectors up to 65 536 dimensions; ids up to 128 bytes; `k` up to 4096.
+- **SIMD distance kernels.** Runtime-dispatched AVX2+FMA on x86_64, NEON on
+  AArch64, and a portable auto-vectorised fallback everywhere else.
+  `PhoenixVectorDB.kernel` reports which one this CPU selected.
+- **Durable, memory-mapped vector storage.** A fixed-stride append-only file
+  with a per-record CRC32, read zero-copy through the existing `mmap` layer.
+  The HNSW graph is snapshotted separately with `bincode`, written atomically
+  via a temporary file and a rename.
+- **Crash and corruption recovery.** A torn tail record is ignored, a corrupt
+  or stale graph snapshot is rebuilt from the vectors (which are the source of
+  truth), and reopening an index with the wrong dimensionality or metric is
+  refused rather than silently reinterpreted.
+- Nine new C entry points (`phoenix_vector_*`) plus `phoenix_free_string_array`
+  and `phoenix_has_vector`, all with the same null-check, length-check and
+  `catch_unwind` guarantees as the existing surface.
+- `.github/workflows/build_native.yml`: a SIMD-aware build matrix covering
+  Linux, macOS, Windows, Android, iOS, and cross-compilation-only targets.
+
+### Notes
+
+- **`+avx2` is deliberately not passed in `RUSTFLAGS`.** This package ships
+  prebuilt binaries, and a crate-wide AVX2 build would `SIGILL` on pre-2013
+  x86_64 CPUs — on a user's machine, not in CI. AVX2 is instead enabled
+  per-function and selected by `is_x86_feature_detected!`. `+neon` *is* passed
+  on AArch64, where NEON is part of the base architecture and therefore always
+  safe.
+- **No new dependencies.** `hnsw_rs` would have pulled in roughly 100
+  transitive crates (`anndists`, `mmap-rs`, `rayon`, `env_logger`, `jiff`),
+  several of which do not cross-compile cleanly to every mobile target, so the
+  graph is implemented directly in `rust/src/vector/hnsw.rs`.
+- Indexes with fewer than 512 live vectors are searched exhaustively, so small
+  collections return exact rather than approximate results.
+
 ## 2.0.0 - 2026-08-09
 
 Multi-modal storage: a hybrid LSM layer, a SQL front end, encryption at rest,
