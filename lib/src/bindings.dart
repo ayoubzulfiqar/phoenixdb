@@ -8,6 +8,7 @@ library;
 
 import 'dart:ffi';
 import 'dart:io';
+import 'dart:isolate';
 
 import 'package:ffi/ffi.dart';
 
@@ -239,12 +240,39 @@ typedef LimitNative = Size Function();
 /// Dart signature for `LimitDart`.
 typedef LimitDart = int Function();
 
+/// Native signature for `phoenix_sql_query`.
+typedef SqlQueryNative =
+    Int32 Function(
+      Pointer<PhoenixDB> handle,
+      Pointer<Utf8> sql,
+      Pointer<Pointer<Utf8>> outJson,
+    );
+
+/// Dart signature for `phoenix_sql_query`.
+typedef SqlQueryDart =
+    int Function(
+      Pointer<PhoenixDB> handle,
+      Pointer<Utf8> sql,
+      Pointer<Pointer<Utf8>> outJson,
+    );
+
+/// Native signature for `phoenix_has_sql`.
+typedef HasSqlNative = Int32 Function();
+
+/// Dart signature for `phoenix_has_sql`.
+typedef HasSqlDart = int Function();
+
 // ---------------------------------------------------------------------------
 // Library loading
 // ---------------------------------------------------------------------------
 
 /// ABI version this Dart package was written against.
-const int kExpectedAbiVersion = 1;
+///
+/// Bumped to 2 in PhoenixDB 2.0, which adds `phoenix_sql_query` and
+/// `phoenix_has_sql`. The change is additive — every v1 entry point keeps its
+/// signature — but the version guard is exact so a stale native library is
+/// reported at load time rather than as a missing-symbol crash later.
+const int kExpectedAbiVersion = 2;
 
 /// Thrown when the native library cannot be located or is incompatible.
 class PhoenixLoadException implements Exception {
@@ -265,22 +293,122 @@ String get defaultLibraryName {
   return 'libphoenixdb.so';
 }
 
-/// Rust target triple matching the current platform and CPU architecture.
+/// Rust target triples matching the current Dart ABI, most-preferred first.
 ///
 /// Used to locate per-target binaries under `native/<triple>/`, which is where
-/// `build.sh --all` installs cross-compiled libraries.
-String? get currentTargetTriple {
+/// `build.sh --all` and the CI release workflow install them.
+///
+/// Windows yields two candidates: CI builds the shipped library with the MSVC
+/// toolchain, while a local `build.sh` on an MSYS/mingw host produces a `-gnu`
+/// build. Both are ABI-compatible for a pure C interface, so either will do —
+/// searching both is what lets a locally built library work alongside a
+/// published one.
+List<String> get currentTargetTriples {
   // `Abi.current()` reports the architecture Dart itself was built for, which
   // is the architecture the native library must match.
   final abi = Abi.current().toString();
-  const map = <String, String>{
-    'linux_x64': 'x86_64-unknown-linux-gnu',
-    'linux_arm64': 'aarch64-unknown-linux-gnu',
-    'macos_x64': 'x86_64-apple-darwin',
-    'macos_arm64': 'aarch64-apple-darwin',
-    'windows_x64': 'x86_64-pc-windows-gnu',
+  const map = <String, List<String>>{
+    'linux_x64': ['x86_64-unknown-linux-gnu'],
+    'linux_arm64': ['aarch64-unknown-linux-gnu'],
+    'macos_x64': ['x86_64-apple-darwin'],
+    'macos_arm64': ['aarch64-apple-darwin'],
+    'windows_x64': ['x86_64-pc-windows-msvc', 'x86_64-pc-windows-gnu'],
+    'windows_arm64': ['aarch64-pc-windows-msvc'],
   };
-  return map[abi];
+  return map[abi] ?? const <String>[];
+}
+
+/// The single most-preferred triple for the current ABI, or `null`.
+///
+/// Retained for callers that only need one name; prefer
+/// [currentTargetTriples], which also covers the MSVC/gnu split on Windows.
+String? get currentTargetTriple =>
+    currentTargetTriples.isEmpty ? null : currentTargetTriples.first;
+
+/// Directory of the installed `phoenixdb` package, or `null` when unavailable.
+///
+/// This is what makes the package work as an ordinary dependency. A consumer
+/// running `dart pub get` gets the native library inside the package (in the
+/// pub cache, or at a `path:` dependency's location) — never in their own
+/// working directory — so resolving the package root is the only reliable way
+/// to find it.
+///
+/// Two strategies, because neither works everywhere:
+///
+///  1. [Isolate.resolvePackageUriSync] — correct under `dart run` and
+///     `dart test`, but returns `null` in the `flutter test` runner, which
+///     serves `package:` URIs from its own in-memory resolver.
+///  2. Reading `.dart_tool/package_config.json` — covers the Flutter test
+///     runner and any other host that leaves the file on disk.
+///
+/// Returns `null` in Flutter release builds, where the library is bundled with
+/// the app and found on the loader path instead.
+String? _packageRootDir() => _resolveViaIsolate() ?? _resolveViaPackageConfig();
+
+/// Strategy 1: ask the Dart runtime to resolve our own `package:` URI.
+String? _resolveViaIsolate() {
+  try {
+    final uri = Isolate.resolvePackageUriSync(
+      Uri.parse('package:phoenixdb/phoenixdb.dart'),
+    );
+    if (uri == null || !uri.isScheme('file')) return null;
+    // .../<package>/lib/phoenixdb.dart -> .../<package>
+    final dir = File(uri.toFilePath()).parent.parent;
+    return dir.existsSync() ? dir.path : null;
+  } on UnsupportedError {
+    return null; // no package resolution in this runtime
+  } catch (_) {
+    return null;
+  }
+}
+
+/// Strategy 2: read `package_config.json`, walking up from the current
+/// directory.
+///
+/// The Flutter test runner intercepts `package:` resolution, so strategy 1
+/// fails there even though the file is present on disk.
+String? _resolveViaPackageConfig() {
+  try {
+    var dir = Directory.current;
+    // A handful of levels is plenty: the file sits at the project root, and
+    // tests run from the project root or one directory below it.
+    for (var i = 0; i < 6; i++) {
+      final file = File('${dir.path}/.dart_tool/package_config.json');
+      if (file.existsSync()) {
+        final root = _packageRootFromConfig(file);
+        if (root != null) return root;
+      }
+      final parent = dir.parent;
+      if (parent.path == dir.path) break; // reached the filesystem root
+      dir = parent;
+    }
+  } catch (_) {
+    // Fall through: the remaining search paths still apply.
+  }
+  return null;
+}
+
+/// Extracts phoenixdb's root directory from a `package_config.json` file.
+String? _packageRootFromConfig(File file) {
+  // Matched by hand rather than parsed: tolerates an unexpected shape without
+  // throwing, and the entry is a flat object so a brace-free match is exact.
+  final entry = RegExp(
+    r'\{[^{}]*"name"\s*:\s*"phoenixdb"[^{}]*\}',
+  ).firstMatch(file.readAsStringSync())?.group(0);
+  if (entry == null) return null;
+
+  final rootUri = RegExp(
+    r'"rootUri"\s*:\s*"([^"]+)"',
+  ).firstMatch(entry)?.group(1);
+  if (rootUri == null) return null;
+
+  // rootUri is relative to the .dart_tool directory unless it is absolute.
+  final base = Uri.file('${file.parent.path}/', windows: Platform.isWindows);
+  final resolved = base.resolve(rootUri);
+  if (!resolved.isScheme('file')) return null;
+
+  final dir = Directory(resolved.toFilePath());
+  return dir.existsSync() ? dir.path : null;
 }
 
 /// Candidate paths searched when no explicit path is supplied.
@@ -303,27 +431,49 @@ List<String> _searchPaths(String name) {
       ? Directory.current.path
       : File(script).parent.path;
   final cwd = Directory.current.path;
-  final triple = currentTargetTriple;
+  final triples = currentTargetTriples;
+  // Where this package is actually installed. For an ordinary consumer this
+  // is the only location that holds the shipped binaries.
+  final pkg = _packageRootDir();
 
   return <String>[
-    if (triple != null) ...[
-      'native/$triple/$name',
-      '$cwd/native/$triple/$name',
-      '$root/native/$triple/$name',
-      '$root/../native/$triple/$name',
+    // 1. Inside the installed package: correct for `dart pub get` consumers,
+    //    whether the dependency came from the pub cache or a `path:` entry.
+    if (pkg != null) ...[
+      for (final t in triples) '$pkg/native/$t/$name',
+      '$pkg/native/$name',
     ],
-    name, // system loader path
+
+    // 2. Relative to the current directory and the running script: covers
+    //    development inside this repo and apps that vendor the library.
+    for (final t in triples) ...[
+      'native/$t/$name',
+      '$cwd/native/$t/$name',
+      '$root/native/$t/$name',
+      '$root/../native/$t/$name',
+    ],
+
+    // 3. The system loader path (LD_LIBRARY_PATH, PATH, DYLD_*, rpath).
+    name,
+
+    // 4. Flat native/ directory, for single-platform checkouts.
     'native/$name',
     '$cwd/native/$name',
     '$root/native/$name',
     '$root/../native/$name',
+
+    // 5. Cargo output, so a fresh `cargo build` works without an install step.
+    if (pkg != null) ...[
+      '$pkg/rust/target/release/$name',
+      '$pkg/rust/target/debug/$name',
+    ],
     'rust/target/release/$name',
     'rust/target/debug/$name',
     '$cwd/rust/target/release/$name',
     '$cwd/rust/target/debug/$name',
-    if (triple != null) ...[
-      'rust/target/$triple/release/$name',
-      '$cwd/rust/target/$triple/release/$name',
+    for (final t in triples) ...[
+      'rust/target/$t/release/$name',
+      '$cwd/rust/target/$t/release/$name',
     ],
   ];
 }
@@ -388,6 +538,12 @@ class PhoenixBindings {
   /// Native ABI version.
   final AbiVersionDart abiVersion;
 
+  /// Executes one SQL statement, yielding a JSON result document.
+  final SqlQueryDart sqlQuery;
+
+  /// Whether the native build includes the SQL layer.
+  final HasSqlDart hasSql;
+
   /// Maximum key length accepted by the native layer.
   final LimitDart maxKeyLen;
 
@@ -443,6 +599,12 @@ class PhoenixBindings {
       count = library.lookupFunction<CountNative, CountDart>('phoenix_count'),
       abiVersion = library.lookupFunction<AbiVersionNative, AbiVersionDart>(
         'phoenix_abi_version',
+      ),
+      sqlQuery = library.lookupFunction<SqlQueryNative, SqlQueryDart>(
+        'phoenix_sql_query',
+      ),
+      hasSql = library.lookupFunction<HasSqlNative, HasSqlDart>(
+        'phoenix_has_sql',
       ),
       maxKeyLen = library.lookupFunction<LimitNative, LimitDart>(
         'phoenix_max_key_len',
