@@ -39,7 +39,20 @@ jobs:
         with:
           workspaces: rust
 
-      - uses: dart-lang/setup-dart@v1
+      # Flutter, not standalone Dart. This package declares
+      # `flutter.plugin.platforms`, which pub only accepts alongside a
+      # `flutter:` bound in `environment:` — and that bound makes the package
+      # require the Flutter SDK, so standalone `dart pub get` refuses it with
+      # "Because phoenixdb requires the Flutter SDK, version solving failed".
+      #
+      # The two requirements are mutually exclusive: dropping the bound fixes
+      # `dart pub get` but makes `pub publish` reject the package outright.
+      # Keeping the bound is correct for a plugin, so CI uses `flutter pub`
+      # throughout. Flutter bundles a Dart SDK, so `dart analyze` and
+      # `dart test` still work once resolution has happened through Flutter.
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
 
       - name: rustfmt
         working-directory: rust
@@ -81,32 +94,32 @@ jobs:
           esac
           cp "rust/target/release/$name" "native/$triple/$name"
 
-      - name: dart pub get
-        run: dart pub get
+      - name: flutter pub get
+        run: flutter pub get
 
-      # Regression guard: the package must resolve under the *standalone* Dart
-      # SDK. A `flutter:` constraint in pubspec's `environment:` makes the whole
-      # package require the Flutter SDK, and `dart pub get` then fails with
-      # "Because phoenixdb requires the Flutter SDK, version solving failed" —
-      # even though nothing under lib/ imports package:flutter. This is easy to
-      # miss locally, because Flutter ships its own `dart` binary that resolves
-      # such a package happily.
-      - name: package does not require the Flutter SDK
+      # The bound must stay: `flutter.plugin.platforms` above is only valid
+      # alongside it, and pub refuses to publish the package without one. This
+      # guard is the inverse of the earlier (wrong) one, which asserted the
+      # bound must be absent — that fixed `dart pub get` and broke publishing.
+      - name: plugin declares a flutter SDK bound
         shell: bash
         run: |
-          if grep -qE '^\s+flutter:\s*"' pubspec.yaml; then
-            echo '::error::pubspec environment: declares a flutter constraint;'
-            echo '::error::this breaks dart pub get for plain Dart consumers.'
+          if ! grep -qE '^\s+flutter:\s*"' pubspec.yaml; then
+            echo '::error::pubspec environment: has no flutter bound, but'
+            echo '::error::flutter.plugin.platforms requires one to publish.'
             exit 1
           fi
+          # lib/ must still be Flutter-free: the bound is a packaging
+          # requirement, not a licence to import package:flutter into a
+          # library that plain Dart programs also use.
           for pkg in $(grep -rho "package:[a-z_]*" lib | sort -u); do
             case "$pkg" in
               package:flutter*)
-                echo "::error::lib/ imports $pkg — the package is no longer pure Dart"
+                echo "::error::lib/ imports $pkg — the library must stay pure Dart"
                 exit 1 ;;
             esac
           done
-          echo "pure Dart: resolves without the Flutter SDK"
+          echo "flutter bound present; lib/ is pure Dart"
 
       - name: dart analyze
         run: dart analyze
@@ -244,7 +257,11 @@ jobs:
     needs: [test, native-desktop, native-android]
     steps:
       - uses: actions/checkout@v4
-      - uses: dart-lang/setup-dart@v1
+      # Flutter, not standalone Dart — see the note on the `test` job: the
+      # plugin's `flutter:` bound makes `dart pub` refuse the package.
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
 
       - uses: actions/download-artifact@v4
         with:
@@ -256,6 +273,6 @@ jobs:
       - name: every shipped binary carries the v2 ABI
         run: tool/check_abi.sh --shipped
 
-      - run: dart pub get
+      - run: flutter pub get
       - name: publish dry-run
-        run: dart pub publish --dry-run
+        run: flutter pub publish --dry-run

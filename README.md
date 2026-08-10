@@ -120,8 +120,7 @@ used directly and no Rust toolchain is required — see
 ## Installation
 
 ```bash
-dart pub add phoenixdb        # Dart CLI / server
-flutter pub add phoenixdb     # Flutter app
+flutter pub add phoenixdb
 ```
 
 Or add it to `pubspec.yaml`:
@@ -130,6 +129,20 @@ Or add it to `pubspec.yaml`:
 dependencies:
   phoenixdb: ^2.0.0
 ```
+
+> **Use `flutter pub`, not `dart pub`.** PhoenixDB is a Flutter FFI plugin, so
+> its pubspec declares `flutter.plugin.platforms`. pub only accepts that key
+> alongside a `flutter:` SDK bound, and that bound makes standalone `dart pub`
+> refuse the package:
+>
+> ```
+> Because phoenixdb requires the Flutter SDK, version solving failed.
+> ```
+>
+> This is a packaging rule, not a code dependency — nothing under `lib/`
+> imports `package:flutter`. Flutter bundles a Dart SDK, so a pure Dart CLI or
+> server works fine: resolve with `flutter pub get`, then run it with `dart run`
+> as usual.
 
 ### How the native library is delivered
 

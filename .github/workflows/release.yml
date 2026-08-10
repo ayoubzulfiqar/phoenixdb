@@ -98,7 +98,11 @@ jobs:
       id-token: write
     steps:
       - uses: actions/checkout@v4
-      - uses: dart-lang/setup-dart@v1
+      # Flutter, not standalone Dart: the plugin's `flutter:` bound (required
+      # by flutter.plugin.platforms) makes `dart pub` refuse the package.
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
 
       - uses: actions/download-artifact@v4
         with:
@@ -138,14 +142,14 @@ jobs:
           fi
           echo "version $pub"
 
-      - run: dart pub get
+      - run: flutter pub get
       - run: dart analyze
       - run: dart test
 
       - name: publish (dry run)
         if: github.event_name == 'workflow_dispatch' && inputs.dry_run
-        run: dart pub publish --dry-run
+        run: flutter pub publish --dry-run
 
       - name: publish
         if: startsWith(github.ref, 'refs/tags/v')
-        run: dart pub publish --force
+        run: flutter pub publish --force
