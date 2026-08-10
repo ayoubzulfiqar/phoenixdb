@@ -1,8 +1,13 @@
 name: phoenixdb
+# pub.dev scores this: it must be 60-180 characters, or "Provide a valid
+# pubspec.yaml" fails and costs 10 pub points. 2.0.0 shipped at 201 and lost
+# them. Count before editing:
+#   python -c "import yaml;print(len(yaml.safe_load(open('pubspec.yaml'))['description']))"
+# The CI `pubspec description length` step enforces this on every push.
 description: >-
-  ACID-compliant embedded database for Dart and Flutter. B+Tree storage with
-  MVCC transactions, a write-ahead log, and HNSW vector search, written in Rust
-  with dart:ffi. Optional SQL and a shared_preferences-style typed API.
+  ACID-compliant embedded database for Dart and Flutter, written in Rust with
+  dart:ffi. B+Tree storage, MVCC transactions, a write-ahead log, HNSW vector
+  search and optional SQL.
 version: 2.1.0
 repository: https://github.com/ayoubzulfiqar/phoenixdb
 issue_tracker: https://github.com/ayoubzulfiqar/phoenixdb/issues

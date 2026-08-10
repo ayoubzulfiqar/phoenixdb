@@ -107,6 +107,37 @@ jobs:
       - name: flutter pub get
         run: flutter pub get
 
+      # pub.dev awards 10 points for "Provide a valid pubspec.yaml", and pana
+      # fails that whole check if `description` is outside 50-180 characters.
+      # 2.0.0 shipped at 201 and scored 150/160 for exactly this reason — a
+      # silent, purely cosmetic mistake that no test or analyzer catches,
+      # because it is a *packaging* rule rather than a code one. The bound
+      # comes straight from pana's template.dart (`description.length > 180`).
+      #
+      # Implemented in awk rather than a YAML parser so it needs no dependency
+      # on any runner. `description: >-` folds its indented continuation lines
+      # into one space-joined string, which is what pana measures after
+      # trimming, so the folding is reproduced here: collect the indented
+      # block, join with single spaces, collapse runs of whitespace, trim.
+      - name: pubspec description length
+        shell: bash
+        run: |
+          desc="$(awk '
+            /^description:/ { collecting = 1; next }
+            collecting && /^[a-zA-Z_]/ { collecting = 0 }
+            collecting { print }
+          ' pubspec.yaml | tr -s ' \t\n' ' ')"
+          desc="$(echo "$desc" | sed 's/^ *//; s/ *$//')"
+          n=${#desc}
+          echo "description is $n characters:"
+          echo "  $desc"
+          if [ "$n" -lt 50 ] || [ "$n" -gt 180 ]; then
+            echo "::error::pubspec description is $n chars; pana requires 50-180"
+            echo "::error::or pub.dev deducts 10 points from the package score."
+            exit 1
+          fi
+          echo "within pana's 50-180 range"
+
       # The bound must stay: `flutter.plugin.platforms` above is only valid
       # alongside it, and pub refuses to publish the package without one. This
       # guard is the inverse of the earlier (wrong) one, which asserted the
