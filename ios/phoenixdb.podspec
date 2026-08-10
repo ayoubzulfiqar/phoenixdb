@@ -12,14 +12,14 @@
 #
 Pod::Spec.new do |s|
   s.name             = 'phoenixdb'
-  s.version          = '0.1.0'
-  s.summary          = 'ACID-compliant embedded key/value engine (Rust + dart:ffi).'
+  s.version          = '2.0.0'
+  s.summary          = 'ACID-compliant embedded database engine (Rust + dart:ffi).'
   s.description      = <<-DESC
-B+Tree index, MVCC snapshot isolation, write-ahead log and CRC32-checksummed
-pages, implemented in Rust and exposed to Dart through a zero-overhead FFI
-layer.
+B+Tree storage with MVCC snapshot isolation, write-ahead log and
+CRC32-checksummed pages, implemented in Rust and exposed to Dart through a
+zero-overhead FFI layer. Includes an optional SQL front end.
                        DESC
-  s.homepage         = 'https://github.com/phoenixdb/phoenixdb'
+  s.homepage         = 'https://github.com/ayoubzulfiqar/phoenixdb'
   s.license          = { :type => 'BSD-3-Clause', :file => '../LICENSE' }
   s.author           = { 'PhoenixDB Authors' => 'phoenixdb@example.com' }
   s.source           = { :path => '.' }

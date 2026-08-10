@@ -1,8 +1,9 @@
 name: phoenixdb
 description: >-
-  ACID-compliant embedded key-value database for Dart and Flutter. B+Tree index,
+  ACID-compliant embedded database for Dart and Flutter. B+Tree storage with
   MVCC transactions and a write-ahead log, written in Rust with dart:ffi.
-version: 0.1.0
+  Optional SQL and a shared_preferences-style typed API.
+version: 2.0.0
 repository: https://github.com/ayoubzulfiqar/phoenixdb
 issue_tracker: https://github.com/ayoubzulfiqar/phoenixdb/issues
 documentation: https://github.com/ayoubzulfiqar/phoenixdb#readme
@@ -12,7 +13,7 @@ topics:
   - key-value
   - ffi
   - storage
-  - acid
+  - sql
 
 # Dart-only consumers (`dart pub add phoenixdb`) get the same package; the
 # loader in lib/src/bindings.dart finds the native library on disk. Flutter
