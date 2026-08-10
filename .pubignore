@@ -1,0 +1,28 @@
+# Files kept in the repository but not shipped to pub.dev.
+#
+# IMPORTANT: `.pubignore` *replaces* `.gitignore` for packaging — pub stops
+# consulting `.gitignore` entirely once this file exists, so every build
+# artifact must be repeated here or it lands in the archive. Omitting
+# `rust/target/` once packaged 2.6 GB of Rust build output.
+#
+# Keep the published archive to: Dart sources, Rust sources (so consumers can
+# rebuild the native library), prebuilt binaries, and docs.
+
+# Rust build output. `rust/fuzz/` covers its own target/, corpus/ and
+# artifacts/ subdirectories.
+rust/target/
+rust/fuzz/
+
+# Dart tooling and lockfile.
+.dart_tool/
+.packages
+pubspec.lock
+
+# Editor and IDE state.
+.idea/
+.vscode/
+*.iml
+
+# CI-only: these drive the build pipeline, never the installed package.
+.github/
+tool/
