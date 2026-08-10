@@ -77,9 +77,7 @@ impl Mmap {
         }
         #[cfg(windows)]
         {
-            use windows_sys::Win32::System::Memory::{
-                MapViewOfFile, FILE_MAP_READ, PAGE_READONLY,
-            };
+            use windows_sys::Win32::System::Memory::{FILE_MAP_READ, MapViewOfFile, PAGE_READONLY};
             let high = (len >> 32) as u32;
             let low = (len & 0xFFFF_FFFF) as u32;
             // SAFETY: handle comes from a live `File`; sizes are split correctly.
@@ -157,7 +155,7 @@ impl Drop for Mmap {
         #[cfg(windows)]
         {
             use windows_sys::Win32::Foundation::CloseHandle;
-            use windows_sys::Win32::System::Memory::{UnmapViewOfFile, MEMORY_MAPPED_VIEW_ADDRESS};
+            use windows_sys::Win32::System::Memory::{MEMORY_MAPPED_VIEW_ADDRESS, UnmapViewOfFile};
             // SAFETY: address came from `MapViewOfFile`; handle from `CreateFileMappingW`.
             unsafe {
                 UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {

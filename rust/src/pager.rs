@@ -11,7 +11,7 @@
 
 use crate::error::{Error, Result};
 use crate::mmap::Mmap;
-use crate::page::{MetaData, Page, PageType, PAGE_SIZE, SENTINEL};
+use crate::page::{MetaData, PAGE_SIZE, Page, PageType, SENTINEL};
 use lru::LruCache;
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
@@ -49,9 +49,8 @@ impl Pager {
             .truncate(false)
             .open(path)?;
         let len = file.metadata()?.len();
-        let capacity = NonZeroUsize::new(cache_pages.max(16)).unwrap_or(
-            NonZeroUsize::new(16).expect("16 is non-zero"),
-        );
+        let capacity = NonZeroUsize::new(cache_pages.max(16))
+            .unwrap_or(NonZeroUsize::new(16).expect("16 is non-zero"));
 
         let mut pager = Pager {
             path: path.to_path_buf(),
@@ -383,7 +382,11 @@ mod tests {
         }
         // Flip a bit inside page 2's body.
         {
-            let mut f = OpenOptions::new().read(true).write(true).open(&path).unwrap();
+            let mut f = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
+                .unwrap();
             f.seek(SeekFrom::Start(2 * PAGE_SIZE as u64 + 100)).unwrap();
             let mut b = [0u8; 1];
             f.read_exact(&mut b).unwrap();

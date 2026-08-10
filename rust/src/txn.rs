@@ -369,7 +369,8 @@ mod tests {
     fn own_writes_are_visible_to_the_writer() {
         let mut vs = VersionStore::new(1, 1);
         let t = vs.begin(false);
-        vs.stage(t, b"k".to_vec(), Write::Put(b"v".to_vec())).unwrap();
+        vs.stage(t, b"k".to_vec(), Write::Put(b"v".to_vec()))
+            .unwrap();
         assert_eq!(vs.read(t, b"k").unwrap(), Some(Some(b"v".to_vec())));
     }
 
@@ -401,8 +402,10 @@ mod tests {
         let mut vs = VersionStore::new(1, 1);
         let a = vs.begin(false);
         let b = vs.begin(false);
-        vs.stage(a, b"k".to_vec(), Write::Put(b"a".to_vec())).unwrap();
-        vs.stage(b, b"k".to_vec(), Write::Put(b"b".to_vec())).unwrap();
+        vs.stage(a, b"k".to_vec(), Write::Put(b"a".to_vec()))
+            .unwrap();
+        vs.stage(b, b"k".to_vec(), Write::Put(b"b".to_vec()))
+            .unwrap();
         vs.commit(a).unwrap();
         assert!(matches!(vs.commit(b), Err(Error::Conflict)));
     }
@@ -411,7 +414,8 @@ mod tests {
     fn rollback_discards_writes() {
         let mut vs = VersionStore::new(1, 1);
         let t = vs.begin(false);
-        vs.stage(t, b"k".to_vec(), Write::Put(b"v".to_vec())).unwrap();
+        vs.stage(t, b"k".to_vec(), Write::Put(b"v".to_vec()))
+            .unwrap();
         vs.rollback(t).unwrap();
         assert!(matches!(vs.get(t), Err(Error::TxnNotFound(_))));
         let t2 = vs.begin(true);
@@ -422,13 +426,18 @@ mod tests {
     fn tombstones_hide_older_versions() {
         let mut vs = VersionStore::new(1, 1);
         let a = vs.begin(false);
-        vs.stage(a, b"k".to_vec(), Write::Put(b"v".to_vec())).unwrap();
+        vs.stage(a, b"k".to_vec(), Write::Put(b"v".to_vec()))
+            .unwrap();
         vs.commit(a).unwrap();
         let b = vs.begin(false);
         vs.stage(b, b"k".to_vec(), Write::Delete).unwrap();
         vs.commit(b).unwrap();
         let r = vs.begin(true);
-        assert_eq!(vs.read(r, b"k").unwrap(), Some(None), "expected a tombstone");
+        assert_eq!(
+            vs.read(r, b"k").unwrap(),
+            Some(None),
+            "expected a tombstone"
+        );
     }
 
     #[test]
@@ -451,13 +460,18 @@ mod tests {
     fn watermark_tracks_the_oldest_live_snapshot() {
         let mut vs = VersionStore::new(1, 1);
         let a = vs.begin(false);
-        vs.stage(a, b"k".to_vec(), Write::Put(b"1".to_vec())).unwrap();
+        vs.stage(a, b"k".to_vec(), Write::Put(b"1".to_vec()))
+            .unwrap();
         vs.commit(a).unwrap();
         let old = vs.begin(true);
         let b = vs.begin(false);
-        vs.stage(b, b"k".to_vec(), Write::Put(b"2".to_vec())).unwrap();
+        vs.stage(b, b"k".to_vec(), Write::Put(b"2".to_vec()))
+            .unwrap();
         vs.commit(b).unwrap();
-        assert!(vs.merge_watermark() <= 1, "old reader must pin the watermark");
+        assert!(
+            vs.merge_watermark() <= 1,
+            "old reader must pin the watermark"
+        );
         vs.rollback(old).unwrap();
         assert_eq!(vs.merge_watermark(), vs.current_ts());
     }
@@ -471,8 +485,10 @@ mod tests {
 
         let mut vs = VersionStore::new(1, 1);
         let t = vs.begin(false);
-        vs.stage(t, b"a".to_vec(), Write::Put(b"1".to_vec())).unwrap();
-        vs.stage(t, b"b".to_vec(), Write::Put(b"2".to_vec())).unwrap();
+        vs.stage(t, b"a".to_vec(), Write::Put(b"1".to_vec()))
+            .unwrap();
+        vs.stage(t, b"b".to_vec(), Write::Put(b"2".to_vec()))
+            .unwrap();
         vs.commit(t).unwrap();
 
         let wm = vs.merge_watermark();

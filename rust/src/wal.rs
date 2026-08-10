@@ -166,7 +166,8 @@ impl Wal {
             )));
         }
         let crc = crc32fast::hash(&payload);
-        self.writer.write_all(&(payload.len() as u32).to_le_bytes())?;
+        self.writer
+            .write_all(&(payload.len() as u32).to_le_bytes())?;
         self.writer.write_all(&crc.to_le_bytes())?;
         self.writer.write_all(&payload)?;
         self.bytes_written += 8 + payload.len() as u64;
@@ -404,7 +405,11 @@ mod tests {
             f.sync_all().unwrap();
         }
         let rec = Wal::recover(&path).unwrap();
-        assert_eq!(rec.committed.len(), 1, "committed txn must survive a torn tail");
+        assert_eq!(
+            rec.committed.len(),
+            1,
+            "committed txn must survive a torn tail"
+        );
         assert_eq!(rec.truncated_bytes, 10);
     }
 
@@ -419,7 +424,11 @@ mod tests {
         }
         // Corrupt the payload of the first frame.
         {
-            let mut f = OpenOptions::new().read(true).write(true).open(&path).unwrap();
+            let mut f = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
+                .unwrap();
             f.seek(SeekFrom::Start(9)).unwrap();
             f.write_all(&[0xFF]).unwrap();
             f.sync_all().unwrap();

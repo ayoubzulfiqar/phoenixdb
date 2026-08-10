@@ -148,7 +148,8 @@ fn page_corruption_is_detected_not_returned() {
     {
         let db = Database::open(&path, Options::default()).unwrap();
         for i in 0..200u32 {
-            db.put_auto(format!("k{i:04}").as_bytes(), b"payload").unwrap();
+            db.put_auto(format!("k{i:04}").as_bytes(), b"payload")
+                .unwrap();
         }
         db.checkpoint().unwrap();
     }
@@ -184,8 +185,11 @@ fn large_dataset_round_trip() {
     let (_d, db) = temp_db();
     const N: u32 = 5_000;
     for i in 0..N {
-        db.put_auto(format!("key-{i:07}").as_bytes(), format!("value-{i}").as_bytes())
-            .unwrap();
+        db.put_auto(
+            format!("key-{i:07}").as_bytes(),
+            format!("value-{i}").as_bytes(),
+        )
+        .unwrap();
     }
     db.checkpoint().unwrap();
     db.verify().unwrap();

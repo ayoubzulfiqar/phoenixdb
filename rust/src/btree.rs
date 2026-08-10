@@ -15,7 +15,7 @@
 
 use crate::error::{Error, Result};
 use crate::page::{
-    LeafCell, Page, PageType, MAX_INLINE_VALUE, MAX_KEY_SIZE, SENTINEL, USABLE_SPACE,
+    LeafCell, MAX_INLINE_VALUE, MAX_KEY_SIZE, Page, PageType, SENTINEL, USABLE_SPACE,
 };
 use crate::pager::Pager;
 
@@ -583,7 +583,10 @@ mod tests {
     #[test]
     fn empty_key_is_rejected() {
         let (_d, mut p, t) = setup();
-        assert!(matches!(t.insert(&mut p, b"", b"v"), Err(Error::InvalidArgument(_))));
+        assert!(matches!(
+            t.insert(&mut p, b"", b"v"),
+            Err(Error::InvalidArgument(_))
+        ));
     }
 
     #[test]
@@ -623,14 +626,16 @@ mod tests {
     fn delete_then_reinsert_across_splits() {
         let (_d, mut p, t) = setup();
         for i in 0..600u32 {
-            t.insert(&mut p, format!("k{i:05}").as_bytes(), b"v").unwrap();
+            t.insert(&mut p, format!("k{i:05}").as_bytes(), b"v")
+                .unwrap();
         }
         for i in (0..600u32).step_by(2) {
             t.delete(&mut p, format!("k{i:05}").as_bytes()).unwrap();
         }
         assert_eq!(t.len(&mut p).unwrap(), 300);
         for i in (0..600u32).step_by(2) {
-            t.insert(&mut p, format!("k{i:05}").as_bytes(), b"w").unwrap();
+            t.insert(&mut p, format!("k{i:05}").as_bytes(), b"w")
+                .unwrap();
         }
         assert_eq!(t.len(&mut p).unwrap(), 600);
         t.verify(&mut p).unwrap();

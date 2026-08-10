@@ -439,7 +439,9 @@ impl Page {
     pub fn remove_cell_at(&mut self, index: usize) -> Result<()> {
         let n = self.num_keys() as usize;
         if index >= n {
-            return Err(Error::invalid(format!("slot index {index} >= num_keys {n}")));
+            return Err(Error::invalid(format!(
+                "slot index {index} >= num_keys {n}"
+            )));
         }
         let dir = PAGE_HEADER_SIZE;
         let from = dir + (index + 1) * SLOT_SIZE;
@@ -693,7 +695,8 @@ impl Page {
         if !crate::security::ct_eq_u64(magic, MetaData::MAGIC) {
             return Err(Error::corrupt("bad magic: not a PhoenixDB file"));
         }
-        let page_size = u32::from_le_bytes(b[12..16].try_into().map_err(|_| Error::corrupt("meta"))?);
+        let page_size =
+            u32::from_le_bytes(b[12..16].try_into().map_err(|_| Error::corrupt("meta"))?);
         if page_size as usize != PAGE_SIZE {
             return Err(Error::corrupt(format!(
                 "file was created with page size {page_size}, this build uses {PAGE_SIZE}"
@@ -702,10 +705,16 @@ impl Page {
         Ok(MetaData {
             version: u32::from_le_bytes(b[8..12].try_into().map_err(|_| Error::corrupt("meta"))?),
             root: u32::from_le_bytes(b[16..20].try_into().map_err(|_| Error::corrupt("meta"))?),
-            free_list: u32::from_le_bytes(b[20..24].try_into().map_err(|_| Error::corrupt("meta"))?),
-            page_count: u32::from_le_bytes(b[24..28].try_into().map_err(|_| Error::corrupt("meta"))?),
+            free_list: u32::from_le_bytes(
+                b[20..24].try_into().map_err(|_| Error::corrupt("meta"))?,
+            ),
+            page_count: u32::from_le_bytes(
+                b[24..28].try_into().map_err(|_| Error::corrupt("meta"))?,
+            ),
             tree_ts: u64::from_le_bytes(b[28..36].try_into().map_err(|_| Error::corrupt("meta"))?),
-            next_txn_id: u64::from_le_bytes(b[36..44].try_into().map_err(|_| Error::corrupt("meta"))?),
+            next_txn_id: u64::from_le_bytes(
+                b[36..44].try_into().map_err(|_| Error::corrupt("meta"))?,
+            ),
             last_lsn: u64::from_le_bytes(b[44..52].try_into().map_err(|_| Error::corrupt("meta"))?),
         })
     }
@@ -862,7 +871,10 @@ mod tests {
                 Err(e) => panic!("unexpected {e:?}"),
             }
         }
-        assert!(inserted >= 3, "expected at least 3 x 1KiB cells, got {inserted}");
+        assert!(
+            inserted >= 3,
+            "expected at least 3 x 1KiB cells, got {inserted}"
+        );
     }
 
     #[test]
