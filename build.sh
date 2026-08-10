@@ -123,7 +123,10 @@ mkdir -p "$NATIVE_DIR"
 build_one() {
   local target="${1:-}"
   local subcmd="build"
-  local args=(--lib)
+  # `sql` is required, not optional: `phoenix_sql_query` and `phoenix_has_sql`
+  # are part of ABI v2, and the Dart loader rejects a library reporting a
+  # different version.
+  local args=(--lib --features sql)
   [[ -n "$PROFILE_FLAG" ]] && args+=("$PROFILE_FLAG")
 
   local out_dir lib_name
@@ -211,8 +214,8 @@ build_android() {
     var="CARGO_TARGET_$(tr '[:lower:]-' '[:upper:]_' <<<"$triple")_LINKER"
     export "$var=$ndkbin_native/$prefix-clang$ext"
 
-    echo ">> building for $triple ($PROFILE) -> $abi"
-    local args=(build --lib --target "$triple")
+    echo ">> building for $triple ($PROFILE, features: sql) -> $abi"
+    local args=(build --lib --features sql --target "$triple")
     [[ -n "$PROFILE_FLAG" ]] && args+=("$PROFILE_FLAG")
     ( cd "$RUST_DIR" && cargo "${args[@]}" )
 

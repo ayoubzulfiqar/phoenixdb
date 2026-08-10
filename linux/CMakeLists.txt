@@ -19,13 +19,28 @@ else()
   set(CARGO_OUT_DIR "release")
 endif()
 
+# Fail early: without this, a missing toolchain surfaces as an opaque
+# "Error 1" from the custom command below, with no mention of Rust.
+find_program(CARGO_EXECUTABLE cargo)
+if(NOT CARGO_EXECUTABLE)
+  message(FATAL_ERROR
+    "phoenixdb: `cargo` was not found on PATH.\n"
+    "The Linux plugin builds its native library from Rust source.\n"
+    "Install the Rust toolchain from https://rustup.rs and reopen your shell.")
+endif()
+
 set(PHOENIX_LIB "${RUST_DIR}/target/${CARGO_OUT_DIR}/libphoenixdb.so")
+
+# `sql` is required, not optional: `phoenix_sql_query` and `phoenix_has_sql`
+# are part of ABI v2, and the Dart loader rejects a library reporting a
+# different version. Building without it produces a library the app cannot load.
+set(PHOENIX_FEATURES "--features" "sql")
 
 add_custom_command(
   OUTPUT ${PHOENIX_LIB}
-  COMMAND cargo build --lib ${CARGO_PROFILE_FLAG}
+  COMMAND cargo build --lib ${CARGO_PROFILE_FLAG} ${PHOENIX_FEATURES}
   WORKING_DIRECTORY ${RUST_DIR}
-  COMMENT "Building PhoenixDB Rust library (${CARGO_OUT_DIR})"
+  COMMENT "Building PhoenixDB Rust library (${CARGO_OUT_DIR}, features: sql)"
   VERBATIM
 )
 add_custom_target(phoenixdb_rust ALL DEPENDS ${PHOENIX_LIB})

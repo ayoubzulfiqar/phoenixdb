@@ -47,7 +47,10 @@ New-Item -ItemType Directory -Force -Path $NativeDir | Out-Null
 
 $cargoArgs = @()
 if ($Toolchain -ne '') { $cargoArgs += "+$Toolchain" }
-$cargoArgs += @('build', '--lib') + $ProfileFlag
+# `sql` is required, not optional: phoenix_sql_query and phoenix_has_sql are
+# part of ABI v2, and the Dart loader rejects a library reporting a different
+# version.
+$cargoArgs += @('build', '--lib', '--features', 'sql') + $ProfileFlag
 
 if ($Target -ne '') {
     $cargoArgs += @('--target', $Target)

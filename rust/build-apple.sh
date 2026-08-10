@@ -33,8 +33,11 @@ export PATH="$HOME/.cargo/bin:$PATH"
 build_target() {
   local triple="$1"
   rustup target add "$triple" >/dev/null 2>&1 || true
-  echo ">> building $triple"
-  ( cd "$SCRIPT_DIR" && cargo build --lib --release --target "$triple" )
+  echo ">> building $triple (features: sql)"
+  # `sql` is required, not optional: `phoenix_sql_query` and `phoenix_has_sql`
+  # are part of ABI v2, and the Dart loader rejects a library reporting a
+  # different version.
+  ( cd "$SCRIPT_DIR" && cargo build --lib --release --features sql --target "$triple" )
   echo "$SCRIPT_DIR/target/$triple/release/libphoenixdb.a"
 }
 
