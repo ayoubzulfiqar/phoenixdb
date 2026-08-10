@@ -27,11 +27,25 @@
 /// await db.close();
 /// ```
 ///
+/// ## Vector search
+///
+/// PhoenixDB also ships an embedded k-NN index (HNSW over memory-mapped `f32`
+/// vectors) for local-first semantic search:
+///
+/// ```dart
+/// final index = await AsyncPhoenixVectorDB.open('vectors.pvec', dimensions: 384);
+/// await index.insert('doc-1', embedding);
+/// final hits = await index.search(VectorQuery(query, k: 5));
+/// print(hits.first.id);
+/// await index.close();
+/// ```
+///
 /// ## Limits
 ///
 /// Keys are capped at 1 MiB and values at 10 MiB by the FFI layer; the B+Tree
 /// additionally caps keys at 1 KiB so a node always holds at least two entries.
-/// Values larger than 1 KiB spill onto overflow pages transparently.
+/// Values larger than 1 KiB spill onto overflow pages transparently. Vectors
+/// are capped at 65 536 dimensions and their ids at 128 bytes.
 library;
 
 import 'dart:convert';
@@ -40,12 +54,16 @@ import 'dart:typed_data';
 export 'src/bindings.dart'
     show PhoenixStatus, PhoenixLoadException, kExpectedAbiVersion;
 export 'src/isolate_worker.dart' show AsyncPhoenixDB;
+export 'src/native/vector_bindings.dart' show VectorMetric;
+export 'src/phoenix_vector_db.dart'
+    show PhoenixVectorDB, VectorMatch, VectorQuery, VectorStats;
 export 'src/phoenixdb_base.dart'
     show PhoenixDatabase, PhoenixException, KeyNotFoundException;
 export 'src/prefs.dart' show PhoenixPrefs;
 export 'src/prefs_codec.dart'
     show PrefType, PrefCodec, PhoenixTypeMismatch, PhoenixDecodeException;
 export 'src/sql_result.dart' show SqlResult;
+export 'src/vector_isolate.dart' show AsyncPhoenixVectorDB;
 
 /// Encodes [s] as UTF-8 bytes for use as a key.
 Uint8List utf8Key(String s) => Uint8List.fromList(utf8.encode(s));

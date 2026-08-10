@@ -268,11 +268,11 @@ typedef HasSqlDart = int Function();
 
 /// ABI version this Dart package was written against.
 ///
-/// Bumped to 2 in PhoenixDB 2.0, which adds `phoenix_sql_query` and
-/// `phoenix_has_sql`. The change is additive — every v1 entry point keeps its
-/// signature — but the version guard is exact so a stale native library is
-/// reported at load time rather than as a missing-symbol crash later.
-const int kExpectedAbiVersion = 2;
+/// Bumped to 3 in PhoenixDB 2.1, which adds the `phoenix_vector_*` k-NN
+/// surface. The change is additive — every v2 entry point keeps its signature
+/// — but the version guard is exact, so a stale native library is reported at
+/// load time rather than as a missing-symbol crash on the first search.
+const int kExpectedAbiVersion = 3;
 
 /// Thrown when the native library cannot be located or is incompatible.
 class PhoenixLoadException implements Exception {
