@@ -77,6 +77,16 @@ jobs:
         working-directory: rust
         run: cargo test --features full
 
+      # Called out separately from the suites above so a vector regression is
+      # legible in the job list rather than buried in 400 passing tests. The
+      # SIMD kernels are the part most likely to break silently on a new
+      # runner image.
+      - name: test (vector engine + SIMD kernels)
+        working-directory: rust
+        run: |
+          cargo test --lib "vector::" -- --nocapture
+          cargo test --test vector_ffi_safety
+
       - name: build native library for Dart tests
         working-directory: rust
         run: cargo build --release --lib --features sql
@@ -180,15 +190,15 @@ jobs:
             >> ~/.cargo/config.toml
 
       # `sql` is enabled in shipped binaries: `phoenix_sql_query` and
-      # `phoenix_has_sql` are part of ABI v2, and omitting them would make the
+      # `phoenix_has_sql` are part of ABI v3, and omitting them would make the
       # loader reject the library.
       - name: build
         working-directory: rust
         run: cargo build --release --lib --features sql --target ${{ matrix.triple }}
 
-      # A binary missing the v2 symbols would fail at load time on a user's
+      # A binary missing the v3 symbols would fail at load time on a user's
       # machine. Catching it here is the entire point of this job.
-      - name: verify ABI v2 surface is present
+      - name: verify ABI v3 surface is present
         shell: bash
         run: tool/check_abi.sh "rust/target/${{ matrix.triple }}/release/${{ matrix.name }}"
 
@@ -226,6 +236,12 @@ jobs:
       - name: install cargo-ndk
         run: cargo install cargo-ndk --locked
 
+      # No RUSTFLAGS here, deliberately. This job is a compile smoke test, and
+      # a single `cargo ndk` call cannot vary RUSTFLAGS per ABI (it is
+      # process-wide), so asking for `+neon` would wrongly apply it to
+      # armeabi-v7a too. The *shipped* binaries are built by release.yml, which
+      # splits arm64-v8a into its own NEON-enabled step; build_native.yml gives
+      # each ABI its own matrix row for the same reason.
       - name: build all four ABIs
         working-directory: rust
         env:
@@ -236,7 +252,7 @@ jobs:
             -o ../android/src/main/jniLibs \
             build --release --lib --features sql
 
-      - name: verify ABI v2 surface in every ABI
+      - name: verify ABI v3 surface in every ABI
         run: |
           tool/check_abi.sh \
             android/src/main/jniLibs/{arm64-v8a,armeabi-v7a,x86_64,x86}/libphoenixdb.so
@@ -270,7 +286,7 @@ jobs:
       - name: stage binaries into the package layout
         run: tool/stage_artifacts.sh artifacts
 
-      - name: every shipped binary carries the v2 ABI
+      - name: every shipped binary carries the v3 ABI
         run: tool/check_abi.sh --shipped
 
       - run: flutter pub get

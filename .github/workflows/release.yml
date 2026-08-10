@@ -30,9 +30,9 @@ jobs:
       matrix:
         include:
           - { os: ubuntu-latest,  triple: x86_64-unknown-linux-gnu,  name: libphoenixdb.so }
-          - { os: ubuntu-latest,  triple: aarch64-unknown-linux-gnu, name: libphoenixdb.so,   cross: true }
+          - { os: ubuntu-latest,  triple: aarch64-unknown-linux-gnu, name: libphoenixdb.so,   cross: true, neon: true }
           - { os: macos-latest,   triple: x86_64-apple-darwin,       name: libphoenixdb.dylib }
-          - { os: macos-latest,   triple: aarch64-apple-darwin,      name: libphoenixdb.dylib }
+          - { os: macos-latest,   triple: aarch64-apple-darwin,      name: libphoenixdb.dylib, neon: true }
           - { os: windows-latest, triple: x86_64-pc-windows-msvc,    name: phoenixdb.dll }
     steps:
       - uses: actions/checkout@v4
@@ -49,8 +49,16 @@ jobs:
           printf '[target.aarch64-unknown-linux-gnu]\nlinker = "aarch64-linux-gnu-gcc"\n' \
             >> ~/.cargo/config.toml
 
+      # SIMD policy, identical to build_native.yml — see that file's header for
+      # the full reasoning. In short: `+neon` is safe to bake in because NEON
+      # is baseline on AArch64, while `+avx2` is deliberately NOT baked in,
+      # because a published binary compiled for AVX2 would SIGILL on pre-2013
+      # x86 CPUs. The x86 AVX2 kernels are selected at runtime instead.
       - name: build
         working-directory: rust
+        shell: bash
+        env:
+          RUSTFLAGS: ${{ matrix.neon && '-C target-feature=+neon' || '' }}
         run: cargo build --release --lib --features sql --target ${{ matrix.triple }}
 
       - name: verify ABI surface
@@ -76,13 +84,34 @@ jobs:
         with:
           ndk-version: r26d
       - run: cargo install cargo-ndk --locked
-      - name: build all four ABIs
+
+      # Split by ABI rather than one `cargo ndk -t ... -t ...` invocation,
+      # because RUSTFLAGS is process-wide: a single call cannot give arm64-v8a
+      # `+neon` while leaving armeabi-v7a without it. NEON is mandatory on
+      # AArch64 but *optional* on ARMv7 and genuinely absent from some shipped
+      # devices, so baking it into the 32-bit build would SIGILL there.
+      - name: build arm64-v8a (NEON)
+        working-directory: rust
+        env:
+          ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
+          RUSTFLAGS: -C target-feature=+neon
+        run: |
+          cargo ndk -t arm64-v8a -o ../android/src/main/jniLibs \
+            build --release --lib --features sql
+
+      - name: build armeabi-v7a, x86_64 and x86 (no NEON)
         working-directory: rust
         env:
           ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
         run: |
-          cargo ndk -t arm64-v8a -t armeabi-v7a -t x86_64 -t x86 \
+          cargo ndk -t armeabi-v7a -t x86_64 -t x86 \
             -o ../android/src/main/jniLibs build --release --lib --features sql
+
+      - name: verify the ABI surface in every ABI
+        run: |
+          tool/check_abi.sh \
+            android/src/main/jniLibs/{arm64-v8a,armeabi-v7a,x86_64,x86}/libphoenixdb.so
+
       - uses: actions/upload-artifact@v4
         with:
           name: native-android

@@ -1,0 +1,337 @@
+name: Build native (SIMD matrix)
+
+# Builds every shipped binary with the right SIMD configuration for its
+# architecture, and proves the vector engine is present and correct in each.
+#
+# ---------------------------------------------------------------------------
+# The SIMD rule, and why it is asymmetric
+# ---------------------------------------------------------------------------
+#
+# ARM64 (aarch64-*, arm64-v8a) — `+neon` is passed in RUSTFLAGS. NEON is
+#   mandatory in the AArch64 base architecture, so every CPU that can run the
+#   binary can run NEON instructions. The flag is documentation plus a nudge to
+#   the auto-vectoriser; it can never produce an illegal instruction.
+#
+# x86_64 — `+avx2` is deliberately NOT passed. PhoenixDB ships prebuilt
+#   binaries inside the published package, and AVX2 is a Haswell-era (2013)
+#   feature: a `-C target-feature=+avx2` build SIGILLs on any older CPU, and on
+#   a user's machine rather than in CI. The AVX2 kernels in
+#   `rust/src/vector/distance.rs` are therefore per-function
+#   `#[target_feature(enable = "avx2,fma")]`, dispatched at runtime through
+#   `is_x86_feature_detected!`. That gives full AVX2 throughput on capable
+#   hardware and a correct portable fallback everywhere else.
+#
+#   `PHOENIXDB_X86_BASELINE` exists for a caller who controls their fleet and
+#   wants the whole crate compiled for a newer baseline. It defaults to empty
+#   and must never be set for a published artifact.
+#
+# armv7 (armeabi-v7a) — NEON is *optional* on ARMv7 and absent from some
+#   Android devices still in the field, so no NEON flag is passed. The portable
+#   kernel is used there.
+#
+# i686 / x86 — SSE2 only, which is already the target baseline.
+#
+# ---------------------------------------------------------------------------
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'rust/**'
+      - '.github/workflows/build_native.yml'
+      - 'tool/**'
+  pull_request:
+    paths:
+      - 'rust/**'
+      - '.github/workflows/build_native.yml'
+      - 'tool/**'
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  # Left empty on purpose: see the header. Setting it makes the binary
+  # unpublishable.
+  PHOENIXDB_X86_BASELINE: ''
+
+jobs:
+  # --------------------------------------------------------------------------
+  # Correctness first. The SIMD kernels have three implementations that must
+  # agree, and only a native run on each architecture proves it.
+  # --------------------------------------------------------------------------
+  kernels:
+    name: SIMD kernels (${{ matrix.arch }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # macos-14 is Apple Silicon, so this is a real NEON run rather than
+          # a cross-compile we cannot execute.
+          - { os: macos-14, arch: aarch64, expect: 'neon' }
+          - { os: ubuntu-latest, arch: x86_64, expect: 'avx2+fma' }
+          - { os: windows-latest, arch: x86_64, expect: 'avx2+fma' }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+          key: kernels-${{ matrix.arch }}
+
+      - name: vector unit tests
+        working-directory: rust
+        run: cargo test --lib "vector::" -- --nocapture
+
+      - name: vector FFI safety tests
+        working-directory: rust
+        run: cargo test --test vector_ffi_safety
+
+      # A silent fallback to the portable kernel on a CPU that supports AVX2 or
+      # NEON is a performance regression no test would otherwise catch.
+      - name: the expected kernel is selected
+        working-directory: rust
+        shell: bash
+        run: |
+          mkdir -p examples
+          cat > examples/kernel.rs <<'EOF'
+          fn main() { println!("{}", phoenixdb::VectorEngine::kernel()); }
+          EOF
+          selected="$(cargo run --release --example kernel 2>/dev/null | tail -1)"
+          echo "selected kernel: $selected"
+          case "$selected" in
+            "${{ matrix.expect }}") echo "ok" ;;
+            portable)
+              # GitHub's x86 runners all have AVX2; a portable result means
+              # runtime detection is broken, not that the CPU is old.
+              echo "::error::fell back to the portable kernel on ${{ matrix.arch }}"
+              exit 1 ;;
+            *)
+              echo "::error::expected ${{ matrix.expect }}, got $selected"
+              exit 1 ;;
+          esac
+
+  # --------------------------------------------------------------------------
+  # Desktop binaries, built on their native runners.
+  # --------------------------------------------------------------------------
+  desktop:
+    name: ${{ matrix.triple }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, triple: x86_64-unknown-linux-gnu, name: libphoenixdb.so }
+          - { os: ubuntu-latest, triple: aarch64-unknown-linux-gnu, name: libphoenixdb.so, cross: true, neon: true }
+          - { os: macos-13, triple: x86_64-apple-darwin, name: libphoenixdb.dylib }
+          - { os: macos-14, triple: aarch64-apple-darwin, name: libphoenixdb.dylib, neon: true }
+          - { os: windows-latest, triple: x86_64-pc-windows-msvc, name: phoenixdb.dll }
+          - { os: windows-latest, triple: aarch64-pc-windows-msvc, name: phoenixdb.dll, neon: true, no_test: true }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.triple }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+          key: ${{ matrix.triple }}
+
+      - name: install cross linker (aarch64 linux)
+        if: matrix.cross
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+          mkdir -p ~/.cargo
+          printf '[target.aarch64-unknown-linux-gnu]\nlinker = "aarch64-linux-gnu-gcc"\n' \
+            >> ~/.cargo/config.toml
+
+      # The one place SIMD flags are chosen. Keeping it in a single step means
+      # the ARM64/x86_64 asymmetry is stated once, not per-target.
+      - name: resolve RUSTFLAGS
+        id: flags
+        shell: bash
+        run: |
+          flags=""
+          if [ "${{ matrix.neon }}" = "true" ]; then
+            # Safe unconditionally: NEON is baseline on AArch64.
+            flags="-C target-feature=+neon"
+          elif [ -n "${PHOENIXDB_X86_BASELINE}" ]; then
+            # Opt-in only, for a private build targeting known hardware.
+            flags="-C target-feature=${PHOENIXDB_X86_BASELINE}"
+          fi
+          echo "value=$flags" >> "$GITHUB_OUTPUT"
+          echo "RUSTFLAGS for ${{ matrix.triple }}: '${flags:-<none, runtime dispatch>}'"
+
+      - name: build
+        working-directory: rust
+        shell: bash
+        env:
+          RUSTFLAGS: ${{ steps.flags.outputs.value }}
+        run: cargo build --release --lib --features sql --target ${{ matrix.triple }}
+
+      # Run the suite wherever the runner can execute the target it just built.
+      - name: test
+        if: ${{ !matrix.cross && !matrix.no_test }}
+        working-directory: rust
+        shell: bash
+        env:
+          RUSTFLAGS: ${{ steps.flags.outputs.value }}
+        run: cargo test --features sql --target ${{ matrix.triple }}
+
+      - name: verify the ABI surface
+        shell: bash
+        run: tool/check_abi.sh "rust/target/${{ matrix.triple }}/release/${{ matrix.name }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-${{ matrix.triple }}
+          path: rust/target/${{ matrix.triple }}/release/${{ matrix.name }}
+          if-no-files-found: error
+
+  # --------------------------------------------------------------------------
+  # Android: four ABIs. arm64-v8a gets NEON; armeabi-v7a deliberately does not,
+  # because NEON is optional on ARMv7 and missing on some shipped devices.
+  # --------------------------------------------------------------------------
+  android:
+    name: android (${{ matrix.abi }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { abi: arm64-v8a, triple: aarch64-linux-android, neon: true }
+          - { abi: armeabi-v7a, triple: armv7-linux-androideabi }
+          - { abi: x86_64, triple: x86_64-linux-android }
+          - { abi: x86, triple: i686-linux-android }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.triple }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+          key: android-${{ matrix.abi }}
+      - uses: nttld/setup-ndk@v1
+        id: ndk
+        with:
+          ndk-version: r26d
+      - run: cargo install cargo-ndk --locked
+
+      - name: build
+        working-directory: rust
+        env:
+          ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
+          # Same rule as the desktop matrix: NEON only where it is guaranteed.
+          RUSTFLAGS: ${{ matrix.neon && '-C target-feature=+neon' || '' }}
+        run: |
+          cargo ndk -t ${{ matrix.abi }} -o ../android/src/main/jniLibs \
+            build --release --lib --features sql
+
+      - name: verify the ABI surface
+        run: tool/check_abi.sh "android/src/main/jniLibs/${{ matrix.abi }}/libphoenixdb.so"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-android-${{ matrix.abi }}
+          path: android/src/main/jniLibs/${{ matrix.abi }}/
+          if-no-files-found: error
+
+  # --------------------------------------------------------------------------
+  # iOS: a static archive linked into the app, plus a simulator slice.
+  # arm64 is the only device architecture Apple still ships, so NEON is
+  # unconditional here.
+  # --------------------------------------------------------------------------
+  ios:
+    name: ios (${{ matrix.triple }})
+    runs-on: macos-14
+    strategy:
+      fail-fast: false
+      matrix:
+        triple: [aarch64-apple-ios, aarch64-apple-ios-sim]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.triple }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+          key: ${{ matrix.triple }}
+
+      - name: build static archive
+        working-directory: rust
+        env:
+          RUSTFLAGS: -C target-feature=+neon
+        run: cargo build --release --lib --features sql --target ${{ matrix.triple }}
+
+      - name: verify the ABI surface
+        run: tool/check_abi.sh "rust/target/${{ matrix.triple }}/release/libphoenixdb.a"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-${{ matrix.triple }}
+          path: rust/target/${{ matrix.triple }}/release/libphoenixdb.a
+          if-no-files-found: error
+
+  # --------------------------------------------------------------------------
+  # Cross-compilation guard. Every target must still *compile* with the SIMD
+  # flags it will ship with, even where no runner can execute the result — a
+  # `#[cfg(target_arch)]` mistake in the kernels shows up here and nowhere else.
+  # --------------------------------------------------------------------------
+  cross-check:
+    name: cross-check ${{ matrix.triple }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { triple: aarch64-unknown-linux-musl, neon: true }
+          - { triple: armv7-unknown-linux-gnueabihf }
+          - { triple: riscv64gc-unknown-linux-gnu }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.triple }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+          key: cross-${{ matrix.triple }}
+
+      - name: check
+        working-directory: rust
+        env:
+          RUSTFLAGS: ${{ matrix.neon && '-C target-feature=+neon' || '' }}
+          # cbindgen needs a host build of the dependency graph; the header is
+          # generated by the desktop jobs instead.
+          PHOENIXDB_SKIP_CBINDGEN: '1'
+        run: cargo check --lib --features sql --target ${{ matrix.triple }}
+
+  # --------------------------------------------------------------------------
+  # Lint and format, over both feature configurations.
+  # --------------------------------------------------------------------------
+  lint:
+    name: fmt + clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+          key: lint
+
+      - name: rustfmt
+        working-directory: rust
+        run: cargo fmt --all -- --check
+
+      - name: clippy (default / lean)
+        working-directory: rust
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: clippy (full)
+        working-directory: rust
+        run: cargo clippy --all-targets --features full -- -D warnings

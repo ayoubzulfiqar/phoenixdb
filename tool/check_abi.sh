@@ -13,8 +13,21 @@
 #   tool/check_abi.sh --shipped     check everything in the package layout
 set -euo pipefail
 
-# Symbols that must be present in an ABI v2 library.
-REQUIRED=(phoenix_open phoenix_sql_query phoenix_has_sql)
+# Symbols that must be present in an ABI v3 library.
+#
+# One per surface, deliberately: `phoenix_open` is the v1 core,
+# `phoenix_sql_query`/`phoenix_has_sql` are v2, and the vector entries are v3.
+# A library missing any of them is stale for a different reason, and naming all
+# four makes the failure message say which.
+REQUIRED=(
+  phoenix_open
+  phoenix_sql_query
+  phoenix_has_sql
+  phoenix_vector_init
+  phoenix_vector_search
+  phoenix_free_string_array
+  phoenix_has_vector
+)
 
 if [[ "${1:-}" == "--shipped" ]]; then
   mapfile -t files < <(find native android -type f \

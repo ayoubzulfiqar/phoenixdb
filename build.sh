@@ -124,8 +124,9 @@ build_one() {
   local target="${1:-}"
   local subcmd="build"
   # `sql` is required, not optional: `phoenix_sql_query` and `phoenix_has_sql`
-  # are part of ABI v2, and the Dart loader rejects a library reporting a
-  # different version.
+  # are part of ABI v3, and the Dart loader rejects a library reporting a
+  # different version. The vector engine (`phoenix_vector_*`, also v3) needs no
+  # flag: it has no optional dependencies and is always compiled in.
   local args=(--lib --features sql)
   [[ -n "$PROFILE_FLAG" ]] && args+=("$PROFILE_FLAG")
 
