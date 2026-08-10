@@ -5,6 +5,135 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 2.0.0 - 2026-08-09
+
+Multi-modal storage: a hybrid LSM layer, a SQL front end, encryption at rest,
+RBAC, audit logging, and metrics — all behind feature flags so the embedded
+core stays small.
+
+### Breaking
+
+- **Native ABI raised from 1 to 2.** The change is additive (every v1 entry
+  point keeps its signature) but the Dart loader enforces an *exact* match, so
+  a v1 native library and this package will not load together. Both are
+  rebuilt and shipped in this release; anyone building the library themselves
+  must rebuild it.
+
+### Added
+
+**LSM storage layer (`lsm`) — library only, see Known limitations**
+
+- MemTable, SSTable (block-based, with a Bloom filter per table), leveled
+  compaction, and a compaction scheduler prioritised by write amplification.
+- A crash-safe, CRC-framed **durable manifest** recording which SSTables are
+  live at which level. A torn tail from a power loss is truncated rather than
+  treated as corruption; the layout, level placement, tombstones, and
+  checkpoint sequence number all survive a restart. Unreferenced `.sst` files
+  are reclaimed on open; a *referenced* table that fails its checksum is a hard
+  error rather than silent data loss.
+- The manifest log is snapshotted once it grows past a threshold, so startup
+  replay does not slow down without bound.
+
+**SQL front end (`sql`, opt-in)**
+
+- Hand-written lexer, recursive-descent parser, and executor supporting
+  `CREATE TABLE`, `DROP TABLE`, `INSERT`, `SELECT` (projection, `WHERE`,
+  `AND`/`OR`, `ORDER BY`, `LIMIT`), `UPDATE`, and `DELETE`, plus
+  `IF NOT EXISTS` / `IF EXISTS`.
+- SQL semantics where they matter: `NULL` is never equal to anything under an
+  ordinary comparison, `ORDER BY` is applied before `LIMIT`, integers and
+  floats compare numerically, and mismatched types yield no rows rather than an
+  arbitrary ordering.
+- Mutations are transactional — a multi-row `INSERT` either lands completely or
+  not at all.
+- Reachable from Dart as `db.query(...)` (synchronous) and
+  `AsyncPhoenixDB.query(...)` (on the worker isolate, so a slow query cannot
+  block a Flutter frame). Results arrive as a typed `SqlResult` with
+  `scalar`, `firstOrNull`, `cell()`, and `asMaps` helpers.
+
+**Security (`encryption`, opt-in) — library only, see Known limitations**
+
+- Transparent AES-256-GCM encryption at rest. Pages are encrypted before
+  checksumming and decrypted after verification, so a tampered or swapped page
+  is rejected rather than decrypted into garbage.
+- Role-based access control with constant-time credential comparison.
+- An append-only audit log kept separate from the WAL, resistant to log
+  injection.
+
+**Observability (`metrics`, opt-in) — library only, see Known limitations**
+
+- Latency histograms with p50/p99/p999, covering WAL fsync, compaction
+  throughput, and cache hit/miss ratios.
+- Structured tracing spans with trace ids.
+
+**Dart API**
+
+- `PhoenixPrefs`, a `shared_preferences`-style typed facade (`getString`,
+  `setInt`, `getBool`, …) over the key/value store.
+- `phoenix_has_sql()` reports whether the loaded library includes the SQL
+  layer, so an app can degrade gracefully on a lean embedded build.
+
+### Fixed
+
+- **The package could not be used as an ordinary dependency.** Every native
+  library search path was relative to the *consumer's* working directory, but
+  the binaries ship inside the installed package (in the pub cache, or at a
+  `path:` dependency's location). A plain `dart pub get` followed by
+  `dart run` failed with "Could not load phoenixdb.dll". The loader now
+  resolves its own package root first — via `Isolate.resolvePackageUriSync`,
+  falling back to reading `.dart_tool/package_config.json`, which is what the
+  `flutter test` runner needs.
+- **Windows lookups missed MSVC builds.** Only `x86_64-pc-windows-gnu` was
+  searched, so the MSVC library that CI ships would not be found. Both triples
+  are now searched, and `windows_arm64` was added.
+- **Flutter and script builds produced an unloadable library.** The Linux and
+  Windows CMake files, the Apple build script, `build.sh`, and `build.ps1` all
+  ran `cargo build` without `--features sql`, yielding an ABI v1 library that
+  the v2 loader rejects. All build paths now enable the feature.
+- **Platform manifests still declared 0.1.0.** The iOS and macOS podspecs and
+  `android/build.gradle` were never bumped, so CocoaPods and Gradle advertised
+  a version that no longer matched the package.
+- **A missing Rust toolchain failed opaquely.** A desktop Flutter build without
+  `cargo` on PATH stopped at `Error 1` from the custom build command, with no
+  indication that Rust was the cause. The Linux and Windows CMake files now
+  fail configuration with an explicit message pointing at rustup.
+
+### Changed
+
+- Feature flags (`encryption`, `json`, `sql`, `metrics`, `async-runtime`,
+  `full`) keep the default build lean for Flutter. The default build adds no
+  heavy dependencies.
+- `serde_json` is now optional, behind the `json` feature.
+
+### Notes on dependencies
+
+Three crates named in the original design could not be used, because they
+require a C toolchain that is unavailable on the Flutter/Android
+cross-compilation path. Substitutions with the same guarantees were used
+instead:
+
+| Planned | Shipped | Reason |
+| --- | --- | --- |
+| `ring` | `aes-gcm` | Pure Rust, same AES-256-GCM construction |
+| `sqlparser-rs` | hand-written parser | Its `stacker` dependency needs a C compiler |
+| OpenTelemetry OTLP | internal tracing | `tonic` pulls in `cc`-based dependencies |
+
+### Known limitations
+
+- **The `lsm`, `security::encryption`, `security::rbac`, `security::audit` and
+  `observability` modules are libraries, not yet engine behaviour.** They are
+  implemented and tested, but `Database` still writes through the B+Tree only,
+  the pager does not encrypt, no permission check runs at the FFI boundary, and
+  the engine emits no metrics. Key and value length validation from `security`
+  *is* enforced on every FFI call.
+- `SELECT` scans the visible key space per query rather than using a
+  prefix-bounded iterator: appropriate for embedded workloads, O(database) on
+  large tables.
+- The SQL layer has no planner, joins, subqueries, or aggregate functions.
+- Raft replication, gossip anti-entropy, full-text search, and the REPL are
+  not implemented.
+- Web is not supported: the engine is native code reached over `dart:ffi`.
+
 ## 0.1.0 - 2026-08-09
 
 Initial release.
