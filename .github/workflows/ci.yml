@@ -84,6 +84,30 @@ jobs:
       - name: dart pub get
         run: dart pub get
 
+      # Regression guard: the package must resolve under the *standalone* Dart
+      # SDK. A `flutter:` constraint in pubspec's `environment:` makes the whole
+      # package require the Flutter SDK, and `dart pub get` then fails with
+      # "Because phoenixdb requires the Flutter SDK, version solving failed" —
+      # even though nothing under lib/ imports package:flutter. This is easy to
+      # miss locally, because Flutter ships its own `dart` binary that resolves
+      # such a package happily.
+      - name: package does not require the Flutter SDK
+        shell: bash
+        run: |
+          if grep -qE '^\s+flutter:\s*"' pubspec.yaml; then
+            echo '::error::pubspec environment: declares a flutter constraint;'
+            echo '::error::this breaks dart pub get for plain Dart consumers.'
+            exit 1
+          fi
+          for pkg in $(grep -rho "package:[a-z_]*" lib | sort -u); do
+            case "$pkg" in
+              package:flutter*)
+                echo "::error::lib/ imports $pkg — the package is no longer pure Dart"
+                exit 1 ;;
+            esac
+          done
+          echo "pure Dart: resolves without the Flutter SDK"
+
       - name: dart analyze
         run: dart analyze
 

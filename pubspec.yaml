@@ -19,9 +19,14 @@ topics:
 # loader in lib/src/bindings.dart finds the native library on disk. Flutter
 # consumers additionally get the platform folders below, which bundle or build
 # the native library as part of the app.
+#
+# There is deliberately no `flutter:` constraint here. Declaring one makes the
+# whole package require the Flutter SDK, so `dart pub get` fails with
+# "Because phoenixdb requires the Flutter SDK, version solving failed" — even
+# though nothing under lib/ imports package:flutter. Flutter support comes
+# from the `flutter: plugin:` section below, which plain Dart ignores.
 environment:
   sdk: ^3.12.2
-  flutter: ">=3.10.0"
 
 dependencies:
   ffi: ^2.1.0

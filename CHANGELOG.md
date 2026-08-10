@@ -93,6 +93,18 @@ core stays small.
 - **Platform manifests still declared 0.1.0.** The iOS and macOS podspecs and
   `android/build.gradle` were never bumped, so CocoaPods and Gradle advertised
   a version that no longer matched the package.
+- **`dart pub get` failed for plain Dart consumers.** `pubspec.yaml` declared a
+  `flutter:` constraint under `environment:`, which makes the whole package
+  require the Flutter SDK:
+
+  ```
+  Because phoenixdb requires the Flutter SDK, version solving failed.
+  ```
+
+  Nothing under `lib/` imports `package:flutter` — the only package imports are
+  `ffi` and `phoenixdb` — so the constraint was never warranted. Flutter
+  support comes from the `flutter: plugin:` section, which plain Dart ignores.
+  The constraint is removed and CI now guards against its return.
 - **A missing Rust toolchain failed opaquely.** A desktop Flutter build without
   `cargo` on PATH stopped at `Error 1` from the custom build command, with no
   indication that Rust was the cause. The Linux and Windows CMake files now
