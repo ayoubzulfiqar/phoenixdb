@@ -11,7 +11,10 @@ fn main() {
     let crate_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR"));
 
-    println!("cargo:rerun-if-changed=src/ffi.rs");
+    println!("cargo:rerun-if-changed=src/ffi/mod.rs");
+    println!("cargo:rerun-if-changed=src/ffi/vector_ffi.rs");
+    println!("cargo:rerun-if-changed=src/vector/mod.rs");
+    println!("cargo:rerun-if-changed=src/vector/distance.rs");
     println!("cargo:rerun-if-changed=src/lib.rs");
     println!("cargo:rerun-if-changed=cbindgen.toml");
     println!("cargo:rerun-if-env-changed=PHOENIXDB_SKIP_CBINDGEN");

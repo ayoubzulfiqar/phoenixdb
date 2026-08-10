@@ -11,6 +11,21 @@
 //! * Memory allocated by this library is owned by this library. The caller must
 //!   release it with `phoenix_buffer_free` (values) or `phoenix_string_free`
 //!   (error strings) — never with the host `free`.
+//!
+//! The vector-search surface (`phoenix_vector_*`) follows exactly the same
+//! contract and lives in [`vector_ffi`]; it is re-exported here so the whole C
+//! ABI is reachable from one module.
+
+pub mod vector_ffi;
+
+pub use vector_ffi::{
+    MAX_SEARCH_K, PhoenixVectorHandle, phoenix_free_string_array, phoenix_vector_compact,
+    phoenix_vector_contains, phoenix_vector_count, phoenix_vector_dim, phoenix_vector_flush,
+    phoenix_vector_free, phoenix_vector_get, phoenix_vector_init, phoenix_vector_insert,
+    phoenix_vector_kernel, phoenix_vector_last_error, phoenix_vector_max_dim,
+    phoenix_vector_max_id_len, phoenix_vector_max_k, phoenix_vector_remove, phoenix_vector_save,
+    phoenix_vector_search, phoenix_vector_stats,
+};
 
 use crate::error::{Error, PhoenixStatus};
 use crate::security::{self, HandleTag, MAX_KEY_LEN, MAX_VALUE_LEN, ct_eq_u64, slice_from_parts};
@@ -514,12 +529,25 @@ pub unsafe extern "C" fn phoenix_count(handle: *mut PhoenixDbHandle, out_len: *m
 
 /// ABI version of this build. Dart refuses to load a mismatched library.
 ///
-/// Bumped to 2 in PhoenixDB 2.0: `phoenix_sql_query` was added. Existing
-/// entry points are unchanged, so a v1 caller still works, but the version
-/// tells Dart whether the SQL surface is present.
+/// Bumped to 3 in PhoenixDB 2.1: the `phoenix_vector_*` surface was added.
+/// Every earlier entry point keeps its signature, so the change is purely
+/// additive, but the version is what tells Dart the vector symbols are
+/// present — the loader would otherwise fail with a missing symbol at first
+/// use rather than at load time.
 #[unsafe(no_mangle)]
 pub extern "C" fn phoenix_abi_version() -> u32 {
-    2
+    3
+}
+
+/// Whether this build includes the vector search engine.
+///
+/// Always true for the current build: the vector engine has no optional
+/// dependencies and is compiled unconditionally. The flag exists so a Dart
+/// caller can branch on capability rather than on version arithmetic, exactly
+/// as it does for [`phoenix_has_sql`].
+#[unsafe(no_mangle)]
+pub extern "C" fn phoenix_has_vector() -> c_int {
+    1
 }
 
 /// Whether this build was compiled with the `sql` feature.

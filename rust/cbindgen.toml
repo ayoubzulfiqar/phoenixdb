@@ -51,6 +51,16 @@ exclude = [
     "MAX_LOGGED_KEY_BYTES",
     # observability/
     "HISTOGRAM_BUCKETS",
+    # vector/ — internal layout constants. The caller-facing limits are
+    # exposed as functions (phoenix_vector_max_dim / _max_k / _max_id_len) so
+    # they can never drift from what the library actually enforces.
+    "VECTOR_MAGIC",
+    "VECTOR_FORMAT_VERSION",
+    "HEADER_LEN",
+    "MAX_ID_LEN",
+    "MAX_DIM",
+    "MAX_SEARCH_K",
+    "BRUTE_FORCE_THRESHOLD",
 ]
 
 [export.rename]

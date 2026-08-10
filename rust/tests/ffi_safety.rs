@@ -311,10 +311,17 @@ fn last_error_is_populated_and_freeable() {
 
 #[test]
 fn abi_version_matches_expectation() {
-    // Bumped 1 -> 2 in PhoenixDB 2.0, which adds `phoenix_sql_query` and
-    // `phoenix_has_sql`. Must stay in lockstep with `kExpectedAbiVersion` in
+    // Bumped 2 -> 3 in PhoenixDB 2.1, which adds the `phoenix_vector_*`
+    // surface. Must stay in lockstep with `kExpectedAbiVersion` in
     // lib/src/bindings.dart, or Dart refuses to load the library.
-    assert_eq!(phoenix_abi_version(), 2);
+    assert_eq!(phoenix_abi_version(), 3);
+}
+
+#[test]
+fn the_vector_capability_flag_is_set() {
+    // The vector engine has no optional dependencies and is compiled
+    // unconditionally, so this is always true for an ABI v3 library.
+    assert_eq!(phoenix_has_vector(), 1);
 }
 
 #[test]
