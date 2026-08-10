@@ -142,7 +142,13 @@ fn insert_get_delete_via_ffi() {
     };
     unsafe {
         assert_eq!(
-            phoenix_put_auto(h.handle, key.as_ptr(), key.len(), value.as_ptr(), value.len()),
+            phoenix_put_auto(
+                h.handle,
+                key.as_ptr(),
+                key.len(),
+                value.as_ptr(),
+                value.len()
+            ),
             OK
         );
         assert_eq!(
@@ -173,7 +179,14 @@ fn transaction_lifecycle_via_ffi() {
         assert_eq!(phoenix_begin_txn(h.handle, 0, &mut txn), OK);
         assert!(txn > 0);
         assert_eq!(
-            phoenix_insert(h.handle, txn, key.as_ptr(), key.len(), value.as_ptr(), value.len()),
+            phoenix_insert(
+                h.handle,
+                txn,
+                key.as_ptr(),
+                key.len(),
+                value.as_ptr(),
+                value.len()
+            ),
             OK
         );
         assert_eq!(phoenix_commit_txn(h.handle, txn), OK);
@@ -183,7 +196,10 @@ fn transaction_lifecycle_via_ffi() {
             len: 0,
             cap: 0,
         };
-        assert_eq!(phoenix_get(h.handle, 0, key.as_ptr(), key.len(), &mut buf), OK);
+        assert_eq!(
+            phoenix_get(h.handle, 0, key.as_ptr(), key.len(), &mut buf),
+            OK
+        );
         assert_eq!(std::slice::from_raw_parts(buf.ptr, buf.len), value);
         phoenix_buffer_free(&mut buf);
     }
@@ -203,7 +219,14 @@ fn rollback_via_ffi_discards_writes() {
     unsafe {
         assert_eq!(phoenix_begin_txn(h.handle, 0, &mut txn), OK);
         assert_eq!(
-            phoenix_insert(h.handle, txn, key.as_ptr(), key.len(), value.as_ptr(), value.len()),
+            phoenix_insert(
+                h.handle,
+                txn,
+                key.as_ptr(),
+                key.len(),
+                value.as_ptr(),
+                value.len()
+            ),
             OK
         );
         assert_eq!(phoenix_rollback_txn(h.handle, txn), OK);
@@ -288,5 +311,17 @@ fn last_error_is_populated_and_freeable() {
 
 #[test]
 fn abi_version_matches_expectation() {
-    assert_eq!(phoenix_abi_version(), 1);
+    // Bumped 1 -> 2 in PhoenixDB 2.0, which adds `phoenix_sql_query` and
+    // `phoenix_has_sql`. Must stay in lockstep with `kExpectedAbiVersion` in
+    // lib/src/bindings.dart, or Dart refuses to load the library.
+    assert_eq!(phoenix_abi_version(), 2);
+}
+
+#[test]
+fn the_sql_capability_flag_matches_the_build() {
+    // Dart branches on this to degrade gracefully on a lean embedded build,
+    // so it must reflect the actual compiled feature set rather than a
+    // hardcoded answer.
+    let expected = i32::from(cfg!(feature = "sql"));
+    assert_eq!(phoenix_has_sql(), expected);
 }

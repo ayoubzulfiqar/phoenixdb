@@ -47,10 +47,14 @@
 pub mod btree;
 pub mod error;
 pub mod ffi;
+pub mod lsm;
 pub mod mmap;
+pub mod observability;
 pub mod page;
 pub mod pager;
 pub mod security;
+#[cfg(feature = "sql")]
+pub mod sql;
 pub mod txn;
 pub mod wal;
 
@@ -530,7 +534,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = Arc::new(Database::open(dir.path().join("t.pdb"), Options::default()).unwrap());
         for i in 0..50u32 {
-            db.put_auto(format!("k{i:03}").as_bytes(), b"initial").unwrap();
+            db.put_auto(format!("k{i:03}").as_bytes(), b"initial")
+                .unwrap();
         }
         let mut handles = Vec::new();
         for _ in 0..4 {
@@ -545,7 +550,8 @@ mod tests {
             let db = Arc::clone(&db);
             std::thread::spawn(move || {
                 for i in 0..50u32 {
-                    db.put_auto(format!("k{i:03}").as_bytes(), b"updated").unwrap();
+                    db.put_auto(format!("k{i:03}").as_bytes(), b"updated")
+                        .unwrap();
                 }
             })
         };

@@ -13,12 +13,10 @@
 //!   (error strings) — never with the host `free`.
 
 use crate::error::{Error, PhoenixStatus};
-use crate::security::{
-    self, ct_eq_u64, slice_from_parts, HandleTag, MAX_KEY_LEN, MAX_VALUE_LEN,
-};
+use crate::security::{self, HandleTag, MAX_KEY_LEN, MAX_VALUE_LEN, ct_eq_u64, slice_from_parts};
 use crate::{Database, Options};
 use std::os::raw::{c_char, c_int};
-use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::PathBuf;
 
 /// Opaque database handle handed to C.
@@ -515,9 +513,87 @@ pub unsafe extern "C" fn phoenix_count(handle: *mut PhoenixDbHandle, out_len: *m
 }
 
 /// ABI version of this build. Dart refuses to load a mismatched library.
+///
+/// Bumped to 2 in PhoenixDB 2.0: `phoenix_sql_query` was added. Existing
+/// entry points are unchanged, so a v1 caller still works, but the version
+/// tells Dart whether the SQL surface is present.
 #[unsafe(no_mangle)]
 pub extern "C" fn phoenix_abi_version() -> u32 {
-    1
+    2
+}
+
+/// Whether this build was compiled with the `sql` feature.
+///
+/// Lets a Dart caller degrade gracefully instead of getting an error from a
+/// lean embedded build that has no query layer.
+#[unsafe(no_mangle)]
+pub extern "C" fn phoenix_has_sql() -> c_int {
+    c_int::from(cfg!(feature = "sql"))
+}
+
+/// Executes one SQL statement, returning the result as a JSON document.
+///
+/// JSON is deliberate: a result set is a ragged, dynamically-typed table, and
+/// modelling it as a C struct would mean a second allocation protocol and a
+/// matching free function for every shape. One UTF-8 buffer with one owner is
+/// far harder to leak.
+///
+/// The document is one of:
+///
+/// ```json
+/// {"type":"rows","columns":["a","b"],"rows":[[1,"x"]]}
+/// {"type":"affected","count":3}
+/// {"type":"schema","detail":"table `t` created with 2 column(s)"}
+/// ```
+///
+/// On success `*out_json` receives a NUL-terminated string that the caller
+/// must release with [`phoenix_string_free`]. On failure it is set to null and
+/// a negative status is returned; the message is available from
+/// `phoenix_last_error`.
+///
+/// # Safety
+/// `handle` must be live, `sql` a NUL-terminated UTF-8 string, and `out_json` a
+/// writable pointer-sized location.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn phoenix_sql_query(
+    handle: *mut PhoenixDbHandle,
+    sql: *const c_char,
+    out_json: *mut *mut c_char,
+) -> c_int {
+    guard(|| {
+        if out_json.is_null() {
+            return Err(Error::invalid("out_json is null"));
+        }
+        // SAFETY: checked non-null immediately above.
+        unsafe { *out_json = std::ptr::null_mut() };
+        if sql.is_null() {
+            return Err(Error::invalid("sql is null"));
+        }
+        // SAFETY: see `phoenix_begin_txn`.
+        let db = unsafe { PhoenixDbHandle::validate(handle) }?;
+        // SAFETY: caller guarantees a NUL-terminated string.
+        let text = unsafe { std::ffi::CStr::from_ptr(sql) }
+            .to_str()
+            .map_err(|_| Error::invalid("sql is not valid UTF-8"))?;
+
+        #[cfg(feature = "sql")]
+        {
+            let result = crate::sql::Executor::new(db).run(text)?;
+            let json = crate::sql::executor::result_to_json(&result);
+            let c = std::ffi::CString::new(json)
+                .map_err(|_| Error::invalid("result contained an interior NUL"))?;
+            // SAFETY: validated non-null above; ownership moves to the caller.
+            unsafe { *out_json = c.into_raw() };
+            Ok(())
+        }
+        #[cfg(not(feature = "sql"))]
+        {
+            let _ = (db, text);
+            Err(Error::invalid(
+                "this build was compiled without the `sql` feature",
+            ))
+        }
+    })
 }
 
 /// Maximum key length accepted by the FFI layer, in bytes.

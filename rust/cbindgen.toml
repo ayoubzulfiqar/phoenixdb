@@ -29,6 +29,29 @@ sys_includes = ["stdint.h", "stddef.h", "stdbool.h"]
 prefix = ""
 include = ["PhoenixStatus"]
 item_types = ["enums", "structs", "opaque", "functions", "constants", "typedefs"]
+# Internal storage-engine, security and observability constants are `pub` for
+# the Rust integration tests and fuzz targets, but they are NOT part of the C
+# ABI. Excluding them keeps the generated header stable as internals grow.
+exclude = [
+    # lsm/
+    "DEFAULT_BITS_PER_KEY",
+    "SSTABLE_MAGIC",
+    "FOOTER_LEN",
+    "RESTART_INTERVAL",
+    "COMPACT_AFTER_EDITS",
+    "MANIFEST_FILE",
+    # sql/
+    "SCHEMA_PREFIX",
+    "ROW_PREFIX",
+    # security/
+    "KEY_LEN",
+    "NONCE_LEN",
+    "TAG_LEN",
+    "CIPHERTEXT_OVERHEAD",
+    "MAX_LOGGED_KEY_BYTES",
+    # observability/
+    "HISTOGRAM_BUCKETS",
+]
 
 [export.rename]
 "PhoenixDbHandle" = "PhoenixDB"

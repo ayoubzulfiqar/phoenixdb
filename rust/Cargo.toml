@@ -1,11 +1,11 @@
 [package]
 name = "phoenixdb"
-version = "0.1.0"
+version = "2.0.0"
 edition = "2024"
 rust-version = "1.85"
 authors = ["PhoenixDB Authors"]
 license = "BSD-3-Clause"
-description = "ACID-compliant embedded key/value engine (B+Tree + MVCC + WAL) with a C ABI"
+description = "ACID-compliant embedded key/value engine (hybrid LSM + B+Tree, MVCC, WAL) with a C ABI"
 repository = "https://github.com/phoenixdb/phoenixdb"
 readme = "README.md"
 publish = false
@@ -15,6 +15,36 @@ name = "phoenixdb"
 # cdylib -> Dart FFI, staticlib -> static embedding, rlib -> integration tests + fuzz targets
 crate-type = ["cdylib", "staticlib", "rlib"]
 
+[features]
+# The default build stays lean enough to embed in a Flutter app: core storage
+# engine only, no async runtime, no crypto, no query layer.
+default = []
+
+# AES-256-GCM encryption at rest. Pure-Rust (`aes-gcm`) rather than `ring`, so
+# the crate still cross-compiles to every mobile target without a C toolchain.
+encryption = ["dep:aes-gcm"]
+
+# Structured-value indexing and the JSON path extractor used by secondary
+# indexes.
+json = ["dep:serde_json"]
+
+# Minimal SQL front end (lexer, parser, AST). Hand-written: the `sqlparser`
+# crate depends on `stacker`, which needs a C compiler and therefore breaks
+# Flutter/Android cross-compilation. No extra dependencies.
+sql = []
+
+# Prometheus-format metrics export. The metrics registry itself is always
+# compiled in (it is dependency-free); this flag only adds the exposition
+# format.
+metrics = ["dep:prometheus"]
+
+# Background compaction scheduler + async runtime. Kept off by default so an
+# embedded build has no runtime threads it did not ask for.
+async-runtime = ["dep:tokio"]
+
+# Convenience: everything that builds without a C toolchain.
+full = ["encryption", "json", "sql", "metrics", "async-runtime"]
+
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 bincode = "1.3"
@@ -22,6 +52,26 @@ crc32fast = "1.4"
 libc = "0.2"
 parking_lot = "0.12"
 lru = "0.12"
+
+# --- optional, feature-gated ------------------------------------------------
+# NOTE ON CRATE CHOICES:
+#   * `ring` (originally requested) requires a C compiler, which breaks the
+#     Flutter/Android cross-compilation story. `aes-gcm` is the pure-Rust
+#     RustCrypto implementation of the same AES-256-GCM AEAD.
+#   * `sqlparser` pulls in `stacker`, which also needs a C compiler, so the SQL
+#     layer uses a hand-written recursive-descent parser instead.
+aes-gcm = { version = "0.10", optional = true, default-features = false, features = [
+    "aes",
+    "alloc",
+] }
+serde_json = { version = "1", optional = true }
+prometheus = { version = "0.13", optional = true, default-features = false }
+tokio = { version = "1", optional = true, default-features = false, features = [
+    "rt",
+    "rt-multi-thread",
+    "sync",
+    "time",
+] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
