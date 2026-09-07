@@ -421,12 +421,23 @@ impl Database {
         let overlay: std::collections::BTreeMap<Vec<u8>, Option<Vec<u8>>> =
             inner.versions.keys_with_versions(snapshot).into_iter().collect();
 
-        tree.scan_iter(&mut inner.pager, |(key, value)| {
-            match overlay.get(&key) {
-                Some(Some(v)) => f((key, v.clone())),
-                Some(None) => Ok(()),
-                None => f((key, value)),
+        let mut overlay_writes = Vec::new();
+        let mut overlay_deletes = std::collections::BTreeSet::new();
+        for (key, value) in overlay {
+            if let Some(v) = value {
+                overlay_writes.push((key, v));
+            } else {
+                overlay_deletes.insert(key);
             }
+        }
+        for (key, value) in overlay_writes {
+            f((key, value))?;
+        }
+        tree.scan_iter(&mut inner.pager, |(key, value)| {
+            if !overlay_deletes.contains(&key) {
+                f((key, value))?;
+            }
+            Ok(())
         })
     }
 
@@ -618,6 +629,28 @@ mod tests {
             assert!(w[0].0 < w[1].0);
         }
         assert!(!items.iter().any(|(k, _)| k == b"k005"));
+    }
+
+    #[test]
+    fn scan_iter_streams_without_full_materialization() {
+        let (_d, db) = open_temp();
+        for i in 0..40u32 {
+            db.put_auto(format!("k{i:03}").as_bytes(), b"v").unwrap();
+        }
+        db.delete_auto(b"k005").unwrap();
+
+        let mut streamed = Vec::new();
+        db.scan_iter(|(key, value)| {
+            streamed.push((key, value));
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(streamed.len(), 39);
+        for w in streamed.windows(2) {
+            assert!(w[0].0 < w[1].0, "streamed scan is not ordered");
+        }
+        assert!(!streamed.iter().any(|(k, _)| k == b"k005"));
     }
 
     #[test]
