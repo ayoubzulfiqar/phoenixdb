@@ -51,8 +51,10 @@ pub mod lsm;
 pub mod mmap;
 pub mod observability;
 pub mod page_pool;
+pub mod page_cache;
 pub mod page;
 pub mod pager;
+pub use pager::Pager;
 pub mod security;
 #[cfg(feature = "sql")]
 pub mod sql;
@@ -66,7 +68,6 @@ pub use page::{MetaData, PAGE_SIZE};
 pub use txn::{TxnState, Write};
 pub use vector::{Metric, VectorEngine, VectorMatch, VectorOptions};
 
-use pager::Pager;
 use parking_lot::RwLock;
 use std::path::{Path, PathBuf};
 use txn::VersionStore;
