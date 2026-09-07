@@ -654,6 +654,18 @@ mod tests {
     }
 
     #[test]
+    fn scan_iter_on_empty_database_yields_nothing() {
+        let (_d, db) = open_temp();
+        let mut streamed = Vec::new();
+        db.scan_iter(|item| {
+            streamed.push(item);
+            Ok(())
+        })
+        .unwrap();
+        assert!(streamed.is_empty());
+    }
+
+    #[test]
     fn oversized_key_is_rejected_at_the_api() {
         let (_d, db) = open_temp();
         let t = db.begin(false).unwrap();

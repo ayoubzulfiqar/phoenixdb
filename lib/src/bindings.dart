@@ -262,6 +262,34 @@ typedef HasSqlNative = Int32 Function();
 /// Dart signature for `phoenix_has_sql`.
 typedef HasSqlDart = int Function();
 
+typedef ScanIterNative =
+    Int32 Function(
+      Pointer<PhoenixDB> handle,
+      Pointer<NativeFunction<NativeScanIterCallback>> callback,
+    );
+
+typedef ScanIterDart =
+    int Function(
+      Pointer<PhoenixDB> handle,
+      Pointer<NativeFunction<NativeScanIterCallback>> callback,
+    );
+
+typedef NativeScanIterCallback =
+    Void Function(
+      Pointer<Uint8> key,
+      Size keyLen,
+      Pointer<Uint8> value,
+      Size valueLen,
+    );
+
+typedef ScanIterCallbackDart =
+    Void Function(
+      Pointer<Uint8> key,
+      int keyLen,
+      Pointer<Uint8> value,
+      int valueLen,
+    );
+
 // ---------------------------------------------------------------------------
 // Library loading
 // ---------------------------------------------------------------------------
@@ -550,6 +578,9 @@ class PhoenixBindings {
   /// Maximum value length accepted by the native layer.
   final LimitDart maxValueLen;
 
+  /// Streams visible key/value pairs.
+  final ScanIterDart scanIter;
+
   /// Pointer to `phoenix_buffer_free`, for use with [NativeFinalizer].
   final Pointer<NativeFunction<BufferFreeNative>> bufferFreePtr;
 
@@ -611,6 +642,9 @@ class PhoenixBindings {
       ),
       maxValueLen = library.lookupFunction<LimitNative, LimitDart>(
         'phoenix_max_value_len',
+      ),
+      scanIter = library.lookupFunction<ScanIterNative, ScanIterDart>(
+        'phoenix_scan_iter',
       ),
       bufferFreePtr = library.lookup<NativeFunction<BufferFreeNative>>(
         'phoenix_buffer_free',

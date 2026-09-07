@@ -5,6 +5,7 @@
 /// disk I/O off the UI thread.
 library;
 
+import 'dart:convert';
 import 'dart:ffi';
 import 'dart:typed_data';
 
@@ -276,6 +277,18 @@ class PhoenixDatabase implements Finalizable {
     }
   }
 
+  /// Calls [callback] for every visible key/value pair in ascending order.
+  ///
+  /// The native side holds the lock for the duration of the scan, so the
+  /// callback must return quickly and must not call back into PhoenixDB.
+  void scanIter(void Function(Uint8List key, Uint8List value) callback) {
+    _ensureOpen();
+    _scanIterTrampoline = _ScanIterTrampoline(callback);
+    final rc = _b.scanIter(_owner.pointer, Pointer.fromFunction(_scanIterCallback));
+    _scanIterTrampoline = null;
+    if (rc != PhoenixStatus.ok) _throw(rc, 'scanIter');
+  }
+
   /// Merges pending versions into the tree, flushes and truncates the WAL.
   void checkpoint() {
     _ensureOpen();
@@ -409,4 +422,38 @@ class PhoenixDatabase implements Finalizable {
     _b.bufferFree(out);
     return copy;
   }
+}
+
+final class _ScanIterTrampoline {
+  final void Function(Uint8List key, Uint8List value) callback;
+  final List<Uint8List> keys = <Uint8List>[];
+  final List<Uint8List> values = <Uint8List>[];
+
+  _ScanIterTrampoline(this.callback);
+
+  void call(Pointer<Uint8> key, int keyLen, Pointer<Uint8> value, int valueLen) {
+    final k = Uint8List.fromList(key.asTypedList(keyLen));
+    final v = Uint8List.fromList(value.asTypedList(valueLen));
+    keys.add(k);
+    values.add(v);
+    callback(k, v);
+  }
+
+  void dispose() {
+    keys.clear();
+    values.clear();
+  }
+}
+
+_ScanIterTrampoline? _scanIterTrampoline;
+
+void _scanIterCallback(
+  Pointer<Uint8> key,
+  int keyLen,
+  Pointer<Uint8> value,
+  int valueLen,
+) {
+  final trampoline = _scanIterTrampoline;
+  if (trampoline == null) return;
+  trampoline.call(key, keyLen, value, valueLen);
 }

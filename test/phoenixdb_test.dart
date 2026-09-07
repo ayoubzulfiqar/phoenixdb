@@ -4,11 +4,33 @@
 /// When it is missing the whole suite is skipped rather than failing.
 library;
 
+import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:phoenixdb/phoenixdb.dart';
 import 'package:test/test.dart';
+
+Uint8List utf8Key(String text) => Uint8List.fromList(utf8.encode(text));
+
+Uint8List utf8Value(String text) => Uint8List.fromList(utf8.encode(text));
+
+bool _byteListLessThan(Uint8List a, Uint8List b) {
+  final limit = a.length < b.length ? a.length : b.length;
+  for (var i = 0; i < limit; i++) {
+    if (a[i] < b[i]) return true;
+    if (a[i] > b[i]) return false;
+  }
+  return a.length < b.length;
+}
+
+bool _byteListEquals(Uint8List a, Uint8List b) {
+  if (a.length != b.length) return false;
+  for (var i = 0; i < a.length; i++) {
+    if (a[i] != b[i]) return false;
+  }
+  return true;
+}
 
 void main() {
   late Directory dir;
@@ -190,6 +212,23 @@ void main() {
       db.insert(utf8Key('big'), value);
       db.checkpoint();
       expect(db.getOrThrow(utf8Key('big')), equals(value));
+    }, skip: skipReason);
+
+    test('scanIter streams visible keys in order', () {
+      for (var i = 0; i < 40; i++) {
+        db.insert(utf8Key('k${i.toString().padLeft(3, '0')}'), utf8Value('v'));
+      }
+      db.delete(utf8Key('k005'));
+
+      final streamed = <Uint8List>[];
+      db.scanIter((Uint8List key, Uint8List value) {
+        streamed.add(key);
+      });
+      expect(streamed.length, 39);
+      for (var i = 0; i < streamed.length - 1; i++) {
+        expect(_byteListLessThan(streamed[i], streamed[i + 1]), isTrue);
+      }
+      expect(streamed.any((key) => _byteListEquals(key, utf8Key('k005'))), isFalse);
     }, skip: skipReason);
 
     test('verify passes after heavy churn', () {

@@ -635,3 +635,36 @@ pub extern "C" fn phoenix_max_key_len() -> usize {
 pub extern "C" fn phoenix_max_value_len() -> usize {
     MAX_VALUE_LEN
 }
+
+type ScanIterCallback =
+    unsafe extern "C" fn(*const u8, usize, *const u8, usize) -> c_int;
+
+/// Streams every visible key/value pair to `callback`.
+///
+/// The callback receives pointers into Rust-owned memory. It must not free
+/// them. Return `0` to continue scanning or non-zero to abort early; the
+/// first non-zero status is propagated to Dart.
+///
+/// # Safety
+/// `callback` must be valid for the duration of the scan.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn phoenix_scan_iter(
+    handle: *mut PhoenixDbHandle,
+    callback: ScanIterCallback,
+) -> c_int {
+    guard(|| {
+        let db = unsafe { PhoenixDbHandle::validate(handle) }?;
+
+        db.scan_iter(|(key, value)| {
+            let key_ptr = key.as_ptr();
+            let key_len = key.len();
+            let value_ptr = value.as_ptr();
+            let value_len = value.len();
+            let rc = unsafe { callback(key_ptr, key_len, value_ptr, value_len) };
+            if rc != 0 {
+                return Err(Error::invalid("scan callback aborted"));
+            }
+            Ok(())
+        })
+    })
+}
