@@ -133,12 +133,15 @@ impl std::fmt::Debug for Page {
 }
 
 impl Page {
-    /// Allocates a zeroed page and initialises its header.
+    /// Allocates a zeroed page from `pool` when supplied, otherwise fresh.
     #[must_use]
-    pub fn new(page_id: u32, page_type: PageType) -> Self {
-        let mut p = Page {
-            buf: Box::new([0u8; PAGE_SIZE]),
-        };
+    pub fn new(
+        page_id: u32,
+        page_type: PageType,
+        pool: Option<&crate::page_pool::PagePool>,
+    ) -> Self {
+        let buf = pool.map_or_else(|| Box::new([0u8; PAGE_SIZE]), |p| p.acquire());
+        let mut p = Page { buf };
         p.set_page_id(page_id);
         p.set_parent(SENTINEL);
         p.set_extra(SENTINEL);
@@ -766,7 +769,7 @@ mod tests {
 
     #[test]
     fn header_roundtrip() {
-        let mut p = Page::new(7, PageType::Leaf);
+        let mut p = Page::new(7, PageType::Leaf, None);
         p.set_parent(3);
         p.set_extra(9);
         p.set_lsn(42);
@@ -782,7 +785,7 @@ mod tests {
 
     #[test]
     fn crc_detects_single_bit_flip() {
-        let mut p = Page::new(1, PageType::Leaf);
+        let mut p = Page::new(1, PageType::Leaf, None);
         let cell = Page::encode_leaf_cell(b"alpha", b"beta", 4, None);
         p.insert_cell_at(0, &cell).unwrap();
         p.finalize();
@@ -794,7 +797,7 @@ mod tests {
 
     #[test]
     fn crc_detects_header_tamper() {
-        let mut p = Page::new(1, PageType::Leaf);
+        let mut p = Page::new(1, PageType::Leaf, None);
         p.finalize();
         let mut bytes = *p.as_bytes();
         bytes[OFF_PAGE_ID] = 0xFF;
@@ -803,7 +806,7 @@ mod tests {
 
     #[test]
     fn slotted_insert_keeps_order() {
-        let mut p = Page::new(1, PageType::Leaf);
+        let mut p = Page::new(1, PageType::Leaf, None);
         for (i, k) in [b"bbb", b"aaa", b"ccc"].iter().enumerate() {
             let cell = Page::encode_leaf_cell(*k, b"v", 1, None);
             let pos = match p.search(*k).unwrap() {
@@ -821,7 +824,7 @@ mod tests {
 
     #[test]
     fn leaf_cell_roundtrip_inline_and_overflow() {
-        let mut p = Page::new(1, PageType::Leaf);
+        let mut p = Page::new(1, PageType::Leaf, None);
         let c1 = Page::encode_leaf_cell(b"k1", b"hello", 5, None);
         let c2 = Page::encode_leaf_cell(b"k2", &[], 100_000, Some(77));
         p.insert_cell_at(0, &c1).unwrap();
@@ -840,7 +843,7 @@ mod tests {
 
     #[test]
     fn remove_then_compact_reclaims_space() {
-        let mut p = Page::new(1, PageType::Leaf);
+        let mut p = Page::new(1, PageType::Leaf, None);
         let payload = vec![0xABu8; 512];
         for i in 0..6u8 {
             let key = [i];
@@ -859,7 +862,7 @@ mod tests {
 
     #[test]
     fn full_page_reports_full_not_panic() {
-        let mut p = Page::new(1, PageType::Leaf);
+        let mut p = Page::new(1, PageType::Leaf, None);
         let big = vec![0u8; 1000];
         let mut inserted = 0;
         loop {
@@ -879,7 +882,7 @@ mod tests {
 
     #[test]
     fn structure_validation_rejects_wild_slots() {
-        let mut p = Page::new(1, PageType::Leaf);
+        let mut p = Page::new(1, PageType::Leaf, None);
         let cell = Page::encode_leaf_cell(b"k", b"v", 1, None);
         p.insert_cell_at(0, &cell).unwrap();
         p.set_num_keys(500); // slot directory would overlap the heap
@@ -899,7 +902,7 @@ mod tests {
             next_txn_id: 56,
             last_lsn: 78,
         };
-        let mut p = Page::new(0, PageType::Meta);
+        let mut p = Page::new(0, PageType::Meta, None);
         p.write_meta(&meta);
         p.finalize();
         let bytes = *p.as_bytes();
@@ -909,7 +912,7 @@ mod tests {
 
     #[test]
     fn overflow_roundtrip() {
-        let mut p = Page::new(3, PageType::Overflow);
+        let mut p = Page::new(3, PageType::Overflow, None);
         let payload = vec![7u8; OVERFLOW_PAYLOAD];
         p.write_overflow(&payload, 4).unwrap();
         p.finalize();

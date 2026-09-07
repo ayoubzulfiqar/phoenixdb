@@ -50,6 +50,7 @@ pub mod ffi;
 pub mod lsm;
 pub mod mmap;
 pub mod observability;
+pub mod page_pool;
 pub mod page;
 pub mod pager;
 pub mod security;

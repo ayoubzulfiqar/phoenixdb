@@ -30,13 +30,12 @@ pub struct Pager {
     path: PathBuf,
     file: File,
     map: Mmap,
-    /// Bytes of the file currently covered by `map`.
     mapped_len: usize,
-    /// Physical pages the file has been extended to hold.
     file_pages: u32,
     cache: LruCache<u32, Page>,
     dirty: HashMap<u32, Page>,
     meta: MetaData,
+    pool: std::sync::Arc<crate::page_pool::PagePool>,
 }
 
 impl Pager {
@@ -61,6 +60,7 @@ impl Pager {
             cache: LruCache::new(capacity),
             dirty: HashMap::new(),
             meta: MetaData::default(),
+            pool: std::sync::Arc::new(crate::page_pool::PagePool::default()),
         };
 
         if len == 0 {
@@ -83,11 +83,11 @@ impl Pager {
         self.ensure_file_pages(2)?;
         let meta = MetaData::default();
 
-        let mut meta_page = Page::new(0, PageType::Meta);
+        let mut meta_page = Page::new(0, PageType::Meta, Some(&self.pool));
         meta_page.write_meta(&meta);
         self.write_page_raw(&mut meta_page)?;
 
-        let mut root = Page::new(meta.root, PageType::Leaf);
+        let mut root = Page::new(meta.root, PageType::Leaf, Some(&self.pool));
         root.set_extra(SENTINEL); // no sibling yet
         self.write_page_raw(&mut root)?;
 
@@ -190,7 +190,7 @@ impl Pager {
             let id = self.meta.free_list;
             let recycled = self.read_page(id)?;
             self.meta.free_list = recycled.extra();
-            let page = Page::new(id, page_type);
+            let page = Page::new(id, page_type, Some(&self.pool));
             self.write_page(page.clone());
             return Ok(page);
         }
@@ -200,7 +200,7 @@ impl Pager {
         }
         self.meta.page_count += 1;
         self.ensure_file_pages(self.meta.page_count)?;
-        let page = Page::new(id, page_type);
+        let page = Page::new(id, page_type, Some(&self.pool));
         self.write_page(page.clone());
         Ok(page)
     }
@@ -210,7 +210,7 @@ impl Pager {
         if page_id == 0 {
             return Err(Error::invalid("refusing to free the meta page"));
         }
-        let mut page = Page::new(page_id, PageType::Free);
+        let mut page = Page::new(page_id, PageType::Free, Some(&self.pool));
         page.set_extra(self.meta.free_list);
         self.meta.free_list = page_id;
         self.write_page(page);
@@ -248,7 +248,7 @@ impl Pager {
 
     /// Writes page 0 and `fsync`s.
     fn flush_meta(&mut self) -> Result<()> {
-        let mut meta_page = Page::new(0, PageType::Meta);
+        let mut meta_page = Page::new(0, PageType::Meta, Some(&self.pool));
         let meta = self.meta;
         meta_page.write_meta(&meta);
         self.write_page_raw(&mut meta_page)?;
