@@ -35,8 +35,10 @@ fn sync_false_commit_durability_after_crash() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("sync_false.pdb");
     {
-        let mut opts = Options::default();
-        opts.sync_on_commit = false;
+        let opts = phoenixdb::Options {
+            sync_on_commit: false,
+            ..Default::default()
+        };
         let db = Database::open(&path, opts).unwrap();
         let t = db.begin(false).unwrap();
         db.insert(t, b"durable", b"yes").unwrap();
