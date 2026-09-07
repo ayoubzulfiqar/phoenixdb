@@ -636,8 +636,7 @@ pub extern "C" fn phoenix_max_value_len() -> usize {
     MAX_VALUE_LEN
 }
 
-type ScanIterCallback =
-    unsafe extern "C" fn(*const u8, usize, *const u8, usize) -> c_int;
+type ScanIterCallback = unsafe extern "C" fn(*const u8, usize, *const u8, usize) -> c_int;
 
 /// Streams every visible key/value pair to `callback`.
 ///

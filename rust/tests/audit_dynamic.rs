@@ -2,7 +2,7 @@
 //!
 //! Run with: cargo test --test audit_dynamic
 
-use phoenixdb::{vector, Database, Options};
+use phoenixdb::{Database, Options, vector};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};

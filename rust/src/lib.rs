@@ -418,8 +418,11 @@ impl Database {
         let snapshot = inner.versions.current_ts();
         let tree = inner.tree;
 
-        let overlay: std::collections::BTreeMap<Vec<u8>, Option<Vec<u8>>> =
-            inner.versions.keys_with_versions(snapshot).into_iter().collect();
+        let overlay: std::collections::BTreeMap<Vec<u8>, Option<Vec<u8>>> = inner
+            .versions
+            .keys_with_versions(snapshot)
+            .into_iter()
+            .collect();
 
         let mut overlay_writes = Vec::new();
         let mut overlay_deletes = std::collections::BTreeSet::new();
