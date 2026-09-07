@@ -134,10 +134,10 @@ impl Database {
     /// Opens (creating if necessary) the database at `path`, replaying the WAL.
     pub fn open(path: impl AsRef<Path>, options: Options) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
-        if let Some(parent) = path.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            std::fs::create_dir_all(parent)?;
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)?;
+            }
         }
         let wal_path = Self::wal_path(&path);
 
@@ -203,6 +203,18 @@ impl Database {
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Copies the database file to `backup_path`.
+    pub fn backup(&self, backup_path: impl AsRef<Path>) -> Result<()> {
+        std::fs::copy(self.path(), backup_path)?;
+        Ok(())
+    }
+
+    /// Replaces the database file with `backup_path` and verifies integrity.
+    pub fn restore(&mut self, backup_path: impl AsRef<Path>) -> Result<()> {
+        std::fs::copy(backup_path, self.path())?;
+        self.verify()
     }
 
     /// Engine options in force.
