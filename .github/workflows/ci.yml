@@ -317,6 +317,19 @@ jobs:
       - name: stage binaries into the package layout
         run: tool/stage_artifacts.sh artifacts
 
+      - name: commit rebuilt binaries if staging changed them
+        shell: bash
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git diff --quiet -- android native; then
+            echo "binaries unchanged"
+          else
+            git add android native
+            git commit -m "chore(ci): stage native binaries for package validation"
+            echo "committed rebuilt binaries"
+          fi
+
       - name: every shipped binary carries the v3 ABI
         run: tool/check_abi.sh --shipped
 
