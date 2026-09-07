@@ -313,15 +313,11 @@ impl Database {
         inner.versions.detect_conflict(txn_id)?;
 
         let commit_ts = inner.versions.current_ts() + 1;
-        if self.options.sync_on_commit {
-            inner.wal.commit(txn_id, commit_ts)?;
-        } else {
-            inner.wal.append(&WalRecord::Commit { txn_id, commit_ts })?;
-        }
+        inner.wal.commit(txn_id, commit_ts)?;
         let actual = inner.versions.commit(txn_id)?;
         debug_assert_eq!(actual, commit_ts, "commit timestamp drifted");
 
-        if inner.wal.size() >= self.options.checkpoint_bytes {
+        if !self.options.sync_on_commit && inner.wal.size() >= self.options.checkpoint_bytes {
             Self::checkpoint_locked(&mut inner)?;
         }
         Ok(())
