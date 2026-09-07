@@ -5,7 +5,6 @@
 /// disk I/O off the UI thread.
 library;
 
-import 'dart:convert';
 import 'dart:ffi';
 import 'dart:typed_data';
 
