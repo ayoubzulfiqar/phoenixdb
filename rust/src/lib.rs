@@ -70,6 +70,7 @@ pub use vector::{Metric, VectorEngine, VectorMatch, VectorOptions};
 
 use parking_lot::RwLock;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use txn::VersionStore;
 use wal::{RecoveredOp, Wal, WalRecord};
 
@@ -128,6 +129,7 @@ pub struct Database {
     inner: RwLock<Inner>,
     options: Options,
     path: PathBuf,
+    exporter: Arc<crate::observability::tracing::CollectingExporter>,
 }
 
 impl Database {
@@ -179,6 +181,9 @@ impl Database {
             wal.checkpoint(watermark)?;
         }
 
+        let exporter = Arc::new(crate::observability::tracing::CollectingExporter::new(1024));
+        let _tracer = crate::observability::tracing::Tracer::new(exporter.clone());
+
         Ok(Database {
             inner: RwLock::new(Inner {
                 pager,
@@ -188,6 +193,7 @@ impl Database {
             }),
             options,
             path,
+            exporter,
         })
     }
 
@@ -478,6 +484,11 @@ impl Database {
             wal_bytes: inner.wal.size(),
             commit_ts: inner.versions.current_ts(),
         }
+    }
+
+    /// Retains a snapshot of exported spans for tests/debugging.
+    pub fn spans(&self) -> Vec<crate::observability::tracing::SpanRecord> {
+        self.exporter.spans()
     }
 
     /// Verifies B+Tree invariants and every page checksum.
