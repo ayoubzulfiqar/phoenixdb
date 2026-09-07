@@ -439,6 +439,21 @@ impl BTree {
     /// Iterates every key/value pair in ascending key order.
     pub fn scan(&self, pager: &mut Pager) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         let mut out = Vec::new();
+        self.scan_iter(pager, |item| {
+            out.push(item);
+            Ok(())
+        })?;
+        Ok(out)
+    }
+
+    /// Calls `f` for every key/value pair in ascending key order.
+    ///
+    /// This is the streaming primitive: it avoids materializing the full result
+    /// set when the caller can process entries incrementally.
+    pub fn scan_iter<F>(&self, pager: &mut Pager, mut f: F) -> Result<()>
+    where
+        F: FnMut((Vec<u8>, Vec<u8>)) -> Result<()>,
+    {
         let mut leaf_id = self.first_leaf(pager)?;
         let mut visited = 0u64;
         while leaf_id != SENTINEL {
@@ -453,11 +468,11 @@ impl BTree {
                     Some(head) => pager.read_overflow_chain(head, cell.total_len)?,
                     None => cell.value,
                 };
-                out.push((cell.key, value));
+                f((cell.key, value))?;
             }
             leaf_id = leaf.extra();
         }
-        Ok(out)
+        Ok(())
     }
 
     /// Number of live keys in the tree.

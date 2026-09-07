@@ -405,6 +405,31 @@ impl Database {
         Ok(merged.into_iter().collect())
     }
 
+    /// Streams every visible key/value pair in ascending key order.
+    ///
+    /// This avoids materializing the full scan result in memory. The version
+    /// overlay is collected first because it lives in memory, then the tree is
+    /// streamed page-by-page.
+    pub fn scan_iter<F>(&self, mut f: F) -> Result<()>
+    where
+        F: FnMut((Vec<u8>, Vec<u8>)) -> Result<()>,
+    {
+        let mut inner = self.inner.write();
+        let snapshot = inner.versions.current_ts();
+        let tree = inner.tree;
+
+        let overlay: std::collections::BTreeMap<Vec<u8>, Option<Vec<u8>>> =
+            inner.versions.keys_with_versions(snapshot).into_iter().collect();
+
+        tree.scan_iter(&mut inner.pager, |(key, value)| {
+            match overlay.get(&key) {
+                Some(Some(v)) => f((key, v.clone())),
+                Some(None) => Ok(()),
+                None => f((key, value)),
+            }
+        })
+    }
+
     /// Number of visible keys.
     pub fn len(&self) -> Result<u64> {
         Ok(self.scan()?.len() as u64)
