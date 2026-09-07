@@ -496,12 +496,12 @@ impl BTree {
             let leaf = pager.read_page(leaf_id)?;
             for i in 0..leaf.num_keys() as usize {
                 let key = leaf.cell_key(i)?.to_vec();
-                if let Some(prev) = &previous
-                    && prev.as_slice() >= key.as_slice()
-                {
-                    return Err(Error::corrupt(format!(
-                        "key ordering violated in leaf {leaf_id} at slot {i}"
-                    )));
+                if let Some(prev) = &previous {
+                    if prev.as_slice() >= key.as_slice() {
+                        return Err(Error::corrupt(format!(
+                            "key ordering violated in leaf {leaf_id} at slot {i}"
+                        )));
+                    }
                 }
                 previous = Some(key);
             }
