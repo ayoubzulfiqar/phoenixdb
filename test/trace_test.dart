@@ -27,4 +27,24 @@ void main() {
       dir.deleteSync(recursive: true);
     }
   });
+
+  test('metricsReport returns a human-readable snapshot', () {
+    final dir = Directory.systemTemp.createTempSync();
+    try {
+      final path = '${dir.path}/metrics.pdb';
+      final db = PhoenixDatabase.open(path);
+      try {
+        db.insert(Uint8List.fromList('k'.codeUnits), Uint8List.fromList('v'.codeUnits));
+        db.get(Uint8List.fromList('k'.codeUnits));
+        final report = db.metricsReport();
+        expect(report, contains('PhoenixDB metrics'));
+        expect(report, contains('wal'));
+        expect(report, contains('cache'));
+      } finally {
+        db.close();
+      }
+    } finally {
+      dir.deleteSync(recursive: true);
+    }
+  });
 }

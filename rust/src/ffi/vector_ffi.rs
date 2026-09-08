@@ -678,9 +678,15 @@ pub extern "C" fn phoenix_vector_last_error() -> *mut c_char {
 pub extern "C" fn phoenix_vector_kernel() -> *const c_char {
     // NUL-terminated at the source so no allocation and no free are needed.
     match VectorEngine::kernel() {
-        "avx2+fma" => c"avx2+fma".as_ptr(),
-        "neon" => c"neon".as_ptr(),
-        _ => c"portable".as_ptr(),
+        "avx2+fma" => unsafe {
+            std::ffi::CStr::from_bytes_with_nul_unchecked(b"avx2+fma\0").as_ptr()
+        },
+        "neon" => unsafe {
+            std::ffi::CStr::from_bytes_with_nul_unchecked(b"neon\0").as_ptr()
+        },
+        _ => unsafe {
+            std::ffi::CStr::from_bytes_with_nul_unchecked(b"portable\0").as_ptr()
+        },
     }
 }
 

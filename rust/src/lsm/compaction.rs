@@ -401,11 +401,11 @@ pub fn merge_runs(
         }
 
         // Duplicate (key, seqno) from an older run: the first one already won.
-        if let Some(last) = out.last()
-            && last.0 == ik
-        {
-            stats.versions_dropped += 1;
-            continue;
+        if let Some(last) = out.last() {
+            if last.0 == ik {
+                stats.versions_dropped += 1;
+                continue;
+            }
         }
 
         if ik.seqno <= retain_floor {

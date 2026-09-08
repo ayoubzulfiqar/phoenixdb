@@ -130,6 +130,7 @@ pub struct Database {
     options: Options,
     path: PathBuf,
     exporter: Arc<crate::observability::tracing::CollectingExporter>,
+    metrics: crate::observability::metrics::EngineMetrics,
 }
 
 impl Database {
@@ -194,6 +195,7 @@ impl Database {
             options,
             path,
             exporter,
+            metrics: crate::observability::metrics::EngineMetrics::new(),
         })
     }
 
@@ -234,6 +236,7 @@ impl Database {
     /// A `read_only` transaction never takes the writer path and cannot stage
     /// writes; it is the cheapest way to get a stable snapshot.
     pub fn begin(&self, read_only: bool) -> Result<u64> {
+        let _timer = crate::observability::metrics::Timer::start(&self.metrics.read_latency);
         let mut inner = self.inner.write();
         let id = inner.versions.begin(read_only);
         if !read_only {
@@ -253,6 +256,7 @@ impl Database {
                 page::MAX_KEY_SIZE
             )));
         }
+        let _timer = crate::observability::metrics::Timer::start(&self.metrics.read_latency);
         let mut inner = self.inner.write();
         inner.wal.append(&WalRecord::Insert {
             txn_id,
@@ -501,6 +505,28 @@ impl Database {
     /// Flushes and checkpoints; called by `Drop` and `phoenix_close`.
     pub fn close(&self) -> Result<()> {
         self.checkpoint()
+    }
+
+    /// Adds an observed duration into the engine's metrics histograms.
+    pub fn record_latency(&self, op: &str, micros: u64) {
+        let histo = match op {
+            "begin" | "commit" | "get" | "scan" => &self.metrics.read_latency,
+            _ => return,
+        };
+        histo.record_micros(micros);
+    }
+
+    /// Increments the write counter for an insert/delete operation.
+    pub fn record_write(&self, op: &str) {
+        let _ = match op {
+            "insert" => &self.metrics.writes,
+            _ => return,
+        };
+    }
+
+    /// Human-readable metrics snapshot for debugging.
+    pub fn metrics_report(&self) -> String {
+        self.metrics.report()
     }
 }
 

@@ -667,3 +667,57 @@ pub unsafe extern "C" fn phoenix_scan_iter(
         })
     })
 }
+
+// ---------------------------------------------------------------------------
+// Metrics
+// ---------------------------------------------------------------------------
+
+/// Writes the engine's metrics report into `out_buf` as a NUL-terminated UTF-8
+/// string.
+///
+/// Returns the number of bytes written (excluding the NUL terminator) on
+/// success, or a negative [`PhoenixStatus`] on failure. When `out_buf` is too
+/// small, the call returns the required size as a negative error; grow the
+/// buffer and retry.
+///
+/// # Safety
+/// `handle` must be live, `out_buf` must point to `out_len` writable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn phoenix_metrics_report(
+    handle: *mut PhoenixDbHandle,
+    out_buf: *mut u8,
+    out_len: usize,
+) -> isize {
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        if out_buf.is_null() && out_len != 0 {
+            return Err(Error::invalid("null buffer with non-zero length"));
+        }
+        // SAFETY: handle validity is the caller's documented obligation.
+        let db = unsafe { PhoenixDbHandle::validate(handle) }?;
+        let report = db.metrics_report();
+        let bytes = report.as_bytes();
+        if out_len < bytes.len() + 1 {
+            return Err(Error::invalid("metrics buffer too small"));
+        }
+        // SAFETY: out_buf is valid for out_len bytes, out_len >= bytes.len()+1.
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), out_buf, bytes.len());
+        }
+        Ok(bytes.len())
+    }));
+
+    use crate::error::PhoenixStatus;
+    match result {
+        Ok(Ok(n)) => n as isize,
+        Ok(Err(e)) => {
+            set_last_error(&e);
+            // Return the negative status code so callers can distinguish from
+            // byte counts (which are always non-negative).
+            -(e.status() as isize)
+        }
+        Err(_) => {
+            set_last_error(&Error::corrupt("panic caught at the FFI boundary"));
+            -(PhoenixStatus::Panic as isize)
+        }
+    }
+}

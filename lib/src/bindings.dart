@@ -290,6 +290,22 @@ typedef ScanIterCallbackDart =
       int valueLen,
     );
 
+/// Native signature for `phoenix_metrics_report`.
+typedef MetricsReportNative =
+    IntPtr Function(
+      Pointer<PhoenixDB> handle,
+      Pointer<Uint8> outBuf,
+      IntPtr outLen,
+    );
+
+/// Dart signature for `phoenix_metrics_report`.
+typedef MetricsReportDart =
+    int Function(
+      Pointer<PhoenixDB> handle,
+      Pointer<Uint8> outBuf,
+      int outLen,
+    );
+
 // ---------------------------------------------------------------------------
 // Library loading
 // ---------------------------------------------------------------------------
@@ -581,6 +597,9 @@ class PhoenixBindings {
   /// Streams visible key/value pairs.
   final ScanIterDart scanIter;
 
+  /// Reads the engine's metrics report into a caller-provided buffer.
+  final MetricsReportDart metricsReport;
+
   /// Pointer to `phoenix_buffer_free`, for use with [NativeFinalizer].
   final Pointer<NativeFunction<BufferFreeNative>> bufferFreePtr;
 
@@ -645,6 +664,9 @@ class PhoenixBindings {
       ),
       scanIter = library.lookupFunction<ScanIterNative, ScanIterDart>(
         'phoenix_scan_iter',
+      ),
+      metricsReport = library.lookupFunction<MetricsReportNative, MetricsReportDart>(
+        'phoenix_metrics_report',
       ),
       bufferFreePtr = library.lookup<NativeFunction<BufferFreeNative>>(
         'phoenix_buffer_free',

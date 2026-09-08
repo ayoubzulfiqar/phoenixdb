@@ -7,6 +7,7 @@ library;
 
 import 'dart:ffi';
 import 'dart:typed_data';
+import 'dart:convert' show utf8;
 
 import 'package:ffi/ffi.dart';
 
@@ -461,6 +462,35 @@ class PhoenixDatabase implements Finalizable {
     final copy = Uint8List.fromList(buffer.ptr.asTypedList(buffer.len));
     _b.bufferFree(out);
     return copy;
+  }
+
+  /// Returns the engine's metrics report as a human-readable string.
+  ///
+  /// The report is generated synchronously on the native side and includes
+  /// WAL fsync latency percentiles, cache hit ratio, and LSM compaction stats.
+  String metricsReport() {
+    _ensureOpen();
+    const initialSize = 4096;
+    final ptr = calloc<Uint8>(initialSize);
+    try {
+      final written = _b.metricsReport(_owner.pointer, ptr, initialSize);
+      if (written < 0) {
+        // The buffer was too small; grow and retry once.
+        final needed = -written;
+        calloc.free(ptr);
+        final bigger = calloc<Uint8>(needed);
+        final written2 = _b.metricsReport(_owner.pointer, bigger, needed);
+        try {
+          if (written2 < 0) _throw(written2, 'metricsReport');
+          return utf8.decode(bigger.asTypedList(written2));
+        } finally {
+          calloc.free(bigger);
+        }
+      }
+      return utf8.decode(ptr.asTypedList(written));
+    } finally {
+      calloc.free(ptr);
+    }
   }
 }
 

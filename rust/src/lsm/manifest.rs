@@ -173,10 +173,10 @@ impl Manifest {
     /// Opens (creating if needed) the manifest at `path`, positioned to append.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
-        if let Some(parent) = path.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            std::fs::create_dir_all(parent)?;
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)?;
+            }
         }
         let file = OpenOptions::new()
             .read(true)
@@ -375,10 +375,10 @@ impl Manifest {
 
         // fsync the directory so the rename itself is durable, not just the
         // file contents. Without this a crash can resurrect the old manifest.
-        if let Some(dir) = path.parent()
-            && let Ok(handle) = File::open(dir)
-        {
-            let _ = handle.sync_all(); // best-effort: not supported everywhere
+        if let Some(dir) = path.parent() {
+            if let Ok(handle) = File::open(dir) {
+                let _ = handle.sync_all(); // best-effort: not supported everywhere
+            }
         }
 
         Manifest::open(&path)
