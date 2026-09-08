@@ -271,7 +271,7 @@ class PhoenixDatabase implements Finalizable {
       if (status == PhoenixStatus.notFound) return null;
       if (status != PhoenixStatus.ok) _throw(status, 'get');
       final value = _takeBuffer(out);
-      _recordTrace('get(key=${_preview(key)}, txn=${txnId ?? 0}, found=${value != null})');
+      _recordTrace('get(key=${_preview(key)}, txn=${txnId ?? 0})');
       return value;
     } finally {
       _b.bufferFree(out); // idempotent; the buffer is already drained
