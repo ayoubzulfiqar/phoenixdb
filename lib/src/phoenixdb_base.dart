@@ -106,7 +106,9 @@ class PhoenixDatabase implements Finalizable {
         );
       }
       final finalizer = NativeFinalizer(bindings.closePtr.cast());
-      return PhoenixDatabase._(bindings, _HandleOwner(handle), finalizer);
+      final db = PhoenixDatabase._(bindings, _HandleOwner(handle), finalizer);
+      db._recordTrace('open(path=$path)');
+      return db;
     } finally {
       calloc.free(pathPtr);
       calloc.free(outHandle);
@@ -134,6 +136,12 @@ class PhoenixDatabase implements Finalizable {
     }
   }
 
+  static String _preview(Uint8List key) {
+    final shown = key.length <= 32 ? key : key.sublist(0, 32);
+    final hex = shown.map((b) => b.toRadixString(16).padLeft(2, '0')).join();
+    return key.length <= 32 ? '0x$hex' : '0x$hex... (${key.length} bytes)';
+  }
+
   static PhoenixException _errorFor(
     PhoenixBindings b,
     int status,
@@ -154,6 +162,33 @@ class PhoenixDatabase implements Finalizable {
   Never _throw(int status, String context) =>
       throw _errorFor(_b, status, context);
 
+  /// Collects tracing events emitted by this database instance.
+  ///
+  /// Attach a listener before operations you want to observe, and detach it
+  /// afterwards. Only one listener can be active at a time.
+  void setTraceListener(void Function(String event) listener) {
+    _ensureOpen();
+    _traceListener = listener;
+  }
+
+  /// Removes the active trace listener, if any.
+  void clearTraceListener() {
+    _traceListener = null;
+  }
+
+  /// Visible trace events since the last [clearTraceListener].
+  List<String> get traceEvents {
+    return List<String>.unmodifiable(_traceEvents);
+  }
+
+  void _recordTrace(String event) {
+    _traceEvents.add(event);
+    _traceListener?.call(event);
+  }
+
+  final List<String> _traceEvents = <String>[];
+  void Function(String event)? _traceListener;
+
   /// Begins a transaction and returns its id.
   ///
   /// Pass `readOnly: true` for a snapshot that cannot write but never blocks a
@@ -164,7 +199,9 @@ class PhoenixDatabase implements Finalizable {
     try {
       final status = _b.beginTxn(_owner.pointer, readOnly ? 1 : 0, out);
       if (status != PhoenixStatus.ok) _throw(status, 'beginTransaction');
-      return out.value;
+      final txn = out.value;
+      _recordTrace('begin(txn=$txn, readOnly=$readOnly)');
+      return txn;
     } finally {
       calloc.free(out);
     }
@@ -175,6 +212,7 @@ class PhoenixDatabase implements Finalizable {
     _ensureOpen();
     final status = _b.commitTxn(_owner.pointer, txnId);
     if (status != PhoenixStatus.ok) _throw(status, 'commit($txnId)');
+    _recordTrace('commit(txn=$txnId)');
   }
 
   /// Rolls [txnId] back, discarding its writes.
@@ -210,6 +248,7 @@ class PhoenixDatabase implements Finalizable {
               value.length,
             );
       if (status != PhoenixStatus.ok) _throw(status, 'insert');
+      _recordTrace('insert(key=${_preview(key)}, txn=${txnId ?? 0})');
     } finally {
       calloc.free(keyPtr);
       calloc.free(valuePtr);
@@ -231,7 +270,9 @@ class PhoenixDatabase implements Finalizable {
       );
       if (status == PhoenixStatus.notFound) return null;
       if (status != PhoenixStatus.ok) _throw(status, 'get');
-      return _takeBuffer(out);
+      final value = _takeBuffer(out);
+      _recordTrace('get(key=${_preview(key)}, txn=${txnId ?? 0}, found=${value != null})');
+      return value;
     } finally {
       _b.bufferFree(out); // idempotent; the buffer is already drained
       calloc.free(keyPtr);
