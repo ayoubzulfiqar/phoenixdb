@@ -200,10 +200,10 @@ impl SSTableWriter {
     /// Creates a writer for a table expected to hold `expected_keys` distinct keys.
     pub fn create(path: impl AsRef<Path>, expected_keys: usize) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
-        if let Some(parent) = path.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            std::fs::create_dir_all(parent)?;
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)?;
+            }
         }
         let file = File::create(&path)?;
         Ok(SSTableWriter {
@@ -235,13 +235,13 @@ impl SSTableWriter {
     /// Returns [`Error::InvalidArgument`] on an out-of-order key rather than
     /// silently producing a table whose index lies about its contents.
     pub fn append(&mut self, key: &InternalKey, slot: &ValueSlot) -> Result<()> {
-        if let Some(last) = &self.last_user_key
-            && key.user_key < *last
-        {
-            return Err(Error::invalid(format!(
-                "sstable entries must be sorted: {:?} follows {:?}",
-                key.user_key, last
-            )));
+        if let Some(last) = &self.last_user_key {
+            if key.user_key < *last {
+                return Err(Error::invalid(format!(
+                    "sstable entries must be sorted: {:?} follows {:?}",
+                    key.user_key, last
+                )));
+            }
         }
         let is_new_key = self.last_user_key.as_deref() != Some(key.user_key.as_slice());
         if is_new_key {

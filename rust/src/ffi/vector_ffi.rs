@@ -678,17 +678,17 @@ pub extern "C" fn phoenix_vector_last_error() -> *mut c_char {
 pub extern "C" fn phoenix_vector_kernel() -> *const c_char {
     // NUL-terminated at the source so no allocation and no free are needed.
     match VectorEngine::kernel() {
-        "avx2+fma" => unsafe {
-            std::ffi::CStr::from_bytes_with_nul_unchecked(b"avx2+fma\0").as_ptr()
-        },
-        "neon" => unsafe {
-            std::ffi::CStr::from_bytes_with_nul_unchecked(b"neon\0").as_ptr()
-        },
-        _ => unsafe {
-            std::ffi::CStr::from_bytes_with_nul_unchecked(b"portable\0").as_ptr()
-        },
+        "avx2+fma" => KERNEL_AVX2,
+        "neon" => KERNEL_NEON,
+        _ => KERNEL_PORTABLE,
     }
 }
+
+// Pre-declared NUL-terminated C strings avoid the `c"..."` literal parser
+// issue on edition 2024 match arms.
+const KERNEL_AVX2: *const c_char = b"avx2+fma\0" as *const [u8] as *const c_char;
+const KERNEL_NEON: *const c_char = b"neon\0" as *const [u8] as *const c_char;
+const KERNEL_PORTABLE: *const c_char = b"portable\0" as *const [u8] as *const c_char;
 
 /// Largest dimensionality this build accepts.
 #[unsafe(no_mangle)]

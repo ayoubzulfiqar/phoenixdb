@@ -452,11 +452,12 @@ impl HnswGraph {
         while let Some(Nearest(current)) = frontier.pop() {
             // Stop as soon as the frontier's best is worse than the result
             // set's worst: nothing reachable from here can improve the answer.
-            if results.len() >= ef
-                && let Some(worst) = results.peek()
-                && current.distance > worst.distance
-            {
-                break;
+            if results.len() >= ef {
+                if let Some(worst) = results.peek() {
+                    if current.distance > worst.distance {
+                        break;
+                    }
+                }
             }
             for &neighbour in self.links_at(current.id, layer) {
                 if neighbour as usize >= self.nodes.len() || !visited.visit(neighbour) {

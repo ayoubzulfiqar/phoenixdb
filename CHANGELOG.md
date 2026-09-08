@@ -5,6 +5,38 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 3.9.6 - 2026-09-08
+
+Phase 4 observability: engine metrics are now reachable from Dart.
+
+### Added
+
+- **`PhoenixDatabase.metricsReport()`** — returns the engine's metrics
+  snapshot as a human-readable string. The report covers WAL fsync latency
+  percentiles, page-cache hit ratio, LSM compaction throughput, and
+  transaction counters. The engine records `begin`/`insert` latencies into
+  the same `EngineMetrics` histograms that power the Rust-side report.
+- New C entry point `phoenix_metrics_report(handle, out_buf, out_len)`
+  exports the report into a caller-provided buffer.
+- `TraceListener` lifecycle hooks now fire for `open`, `beginTransaction`,
+  `insert`, `get`, `delete`, and `commit` — enough to reconstruct a request's
+  critical path from the Dart side.
+
+### Fixed
+
+- Rust 2024 let-chains in `lsm/manifest.rs` and `lsm/compaction.rs` that
+  failed to parse on the current toolchain (converted to nested `if let`).
+- `c"..."` c-string literals in `ffi/vector_ffi.rs` that broke `cargo check`
+  under edition 2024 (replaced with `CStr::from_bytes_with_nul_unchecked`).
+
+### Notes
+
+- Native ABI remains **3** (additive change — no new signatures on existing
+  entry points). The new `phoenix_metrics_report` is covered by the ABI
+  version guard, so a v3 native library loaded by this package is guaranteed
+  to expose it.
+- `AUDIT_AND_ROADMAP.md` remains an untracked scratchpad.
+
 ## 2.1.0 - 2026-08-10
 
 Embedded vector search: approximate k-NN over `f32` embeddings, so a

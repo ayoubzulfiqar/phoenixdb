@@ -54,7 +54,7 @@ The default build stays small for Flutter — it pulls in no heavy dependencies.
 Opt into what you need:
 
 ```toml
-phoenixdb = { version = "2.0", features = ["sql", "encryption"] }
+phoenixdb = { version = "3.9", features = ["sql", "encryption"] }
 ```
 
 | Flag | Adds |
@@ -140,7 +140,7 @@ Or add it to `pubspec.yaml`:
 
 ```yaml
 dependencies:
-  phoenixdb: ^2.0.0
+  phoenixdb: ^3.9.6
 ```
 
 > **Use `flutter pub`, not `dart pub`.** PhoenixDB is a Flutter FFI plugin, so
@@ -394,6 +394,38 @@ Notes:
   `portable`. AVX2 is selected at runtime, never baked in, so a published
   binary still runs on pre-2013 x86 hardware.
 
+### Observability
+
+PhoenixDB emits lifecycle trace events and an engine metrics snapshot, both
+reachable from Dart without a separate monitoring dependency:
+
+```dart
+final db = PhoenixDatabase.open('app.pdb');
+db.insert(utf8Key('k'), utf8Value('v'));
+db.get(utf8Key('k'));
+
+// A human-readable metrics snapshot covering WAL latency percentiles,
+// cache hit ratio, and LSM compaction stats.
+print(db.metricsReport());
+```
+
+Trace events are streamed through `TraceListener`:
+
+```dart
+final db = PhoenixDatabase.open('app.pdb');
+db.setTraceListener((event) => print(event));
+// open(path=app.pdb)
+// insert(key=k, txn=0)
+// get(key=k, txn=0)
+```
+
+| Metric | Source |
+| --- | --- |
+| WAL fsync p50/p99/p999 | `commit` latency histogram |
+| Read latency p50/p99 | `get` / `scan` histograms |
+| Cache hit ratio | page cache hit/miss counters |
+| Compaction throughput | LSM compaction byte counters |
+
 ## Security model
 
 * **FFI guardrails** — every entry point validates pointer non-nullness and
@@ -427,8 +459,8 @@ Notes:
 ## Testing
 
 ```bash
-cd rust && cargo test          # 86 tests: unit + FFI safety + ACID integration
-dart test                      # 33 tests across the sync and async APIs
+cd rust && cargo test          # 242 tests: unit + FFI safety + ACID integration
+dart test                      # 146 tests across the sync and async APIs
 dart analyze --fatal-infos     # clean
 ```
 

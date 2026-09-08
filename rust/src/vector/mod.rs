@@ -403,11 +403,11 @@ impl VectorEngine {
         for (id, vector) in items {
             // Replacing: tombstone first so the graph stops returning the old
             // record the moment the new one is visible.
-            if let Some(previous) = inner.ids.get(*id).copied()
-                && !inner.store.is_deleted(previous)
-            {
-                inner.store.tombstone(previous)?;
-                inner.live -= 1;
+            if let Some(previous) = inner.ids.get(*id).copied() {
+                if !inner.store.is_deleted(previous) {
+                    inner.store.tombstone(previous)?;
+                    inner.live -= 1;
+                }
             }
 
             let norm = if self.metric.uses_norm() {
@@ -551,10 +551,10 @@ impl VectorEngine {
             Some(p) => p.to_path_buf(),
             None => Self::snapshot_path(&self.path),
         };
-        if let Some(parent) = target.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            std::fs::create_dir_all(parent)?;
+        if let Some(parent) = target.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)?;
+            }
         }
 
         let mut temporary = target.as_os_str().to_os_string();

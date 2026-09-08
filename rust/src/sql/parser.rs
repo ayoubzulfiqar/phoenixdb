@@ -318,14 +318,14 @@ impl Parser {
         let rows = self.comma_separated(Self::parse_values_row)?;
 
         // Arity is checked after parsing so the error names the offending row.
-        if !columns.is_empty()
-            && let Some(bad) = rows.iter().find(|r| r.len() != columns.len())
-        {
-            return Err(Error::invalid(format!(
-                "INSERT lists {} column(s) but this row supplies {} value(s)",
-                columns.len(),
-                bad.len()
-            )));
+        if !columns.is_empty() {
+            if let Some(bad) = rows.iter().find(|r| r.len() != columns.len()) {
+                return Err(Error::invalid(format!(
+                    "INSERT lists {} column(s) but this row supplies {} value(s)",
+                    columns.len(),
+                    bad.len()
+                )));
+            }
         }
         Ok(Statement::Insert {
             table,

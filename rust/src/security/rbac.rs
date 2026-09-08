@@ -263,10 +263,10 @@ impl AccessControl {
             .authenticate(token)
             .ok_or_else(|| Error::invalid("authentication failed: unknown token"))?;
         for role_name in &principal.roles {
-            if let Some(role) = self.roles.get(role_name)
-                && role.grants(permission)
-            {
-                return Ok(principal);
+            if let Some(role) = self.roles.get(role_name) {
+                if role.grants(permission) {
+                    return Ok(principal);
+                }
             }
         }
         Err(Error::invalid(format!(

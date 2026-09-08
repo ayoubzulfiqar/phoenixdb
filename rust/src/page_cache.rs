@@ -53,6 +53,12 @@ impl PageCache {
     pub fn len(&self) -> usize {
         self.cache.lock().len()
     }
+
+    /// True when the cache holds no entries.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.cache.lock().len() == 0
+    }
 }
 
 #[cfg(test)]

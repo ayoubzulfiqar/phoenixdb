@@ -8,7 +8,7 @@ description: >-
   ACID-compliant embedded database for Dart and Flutter, written in Rust with
   dart:ffi. B+Tree storage, MVCC transactions, a write-ahead log, HNSW vector
   search and optional SQL.
-version: 2.1.0
+version: 3.9.6
 repository: https://github.com/ayoubzulfiqar/phoenixdb
 issue_tracker: https://github.com/ayoubzulfiqar/phoenixdb/issues
 documentation: https://github.com/ayoubzulfiqar/phoenixdb#readme

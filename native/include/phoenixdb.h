@@ -16,7 +16,7 @@
 
 #pragma once
 
-/* Generated with cbindgen:0.27.0 */
+/* Generated with cbindgen:0.29.4 */
 
 /* Generated with cbindgen. Regenerate with `cargo build`. */
 
@@ -108,9 +108,9 @@
  * `0` means success; every failure is negative so callers can test `< 0`.
  */
 enum PhoenixStatus
-#ifdef __cplusplus
+#if defined(__cplusplus) || __STDC_VERSION__ >= 202311L
   : int32_t
-#endif // __cplusplus
+#endif // defined(__cplusplus) || __STDC_VERSION__ >= 202311L
  {
     /**
      * Operation completed successfully.
@@ -155,7 +155,530 @@ enum PhoenixStatus
     PHOENIX_STATUS_FULL = -9,
 };
 #ifndef __cplusplus
+#if __STDC_VERSION__ >= 202311L
+typedef enum PhoenixStatus PhoenixStatus;
+#else
 typedef int32_t PhoenixStatus;
+#endif // __STDC_VERSION__ >= 202311L
 #endif // __cplusplus
+
+/**
+ * The embedded database handle.
+ *
+ * Cloning is intentionally not provided: the FFI layer owns exactly one
+ * `Database` per `PhoenixDB*` and frees it in `phoenix_close`.
+ */
+typedef struct Database Database;
+
+/**
+ * A thread-safe embedded vector index.
+ */
+typedef struct VectorEngine VectorEngine;
+
+/**
+ * A 64-bit magic tag embedded in every heap object exposed to C.
+ *
+ * The tag is verified in constant time on every entry point. A mismatch means
+ * the pointer is stale (use-after-free), foreign, or corrupted, and the call
+ * is rejected with `InvalidArgument` instead of dereferencing further.
+ */
+typedef uint64_t HandleTag;
+/**
+ * "PHNXDB\0\x01" — chosen to be unlikely in freed or uninitialised memory.
+ */
+#define HandleTag_MAGIC 5784959862366666753
+
+/**
+ * Opaque database handle handed to C.
+ *
+ * The `tag` is the first field so a stale or foreign pointer is caught by the
+ * constant-time check in [`DbHandle::validate`] before `db` is touched.
+ */
+typedef struct {
+    HandleTag tag;
+    Database *db;
+} PhoenixDB;
+
+/**
+ * An owned byte buffer returned to the caller.
+ *
+ * Release it with [`phoenix_buffer_free`]. `ptr` is null when `len` is zero.
+ */
+typedef struct {
+    /**
+     * Pointer to `len` bytes owned by PhoenixDB.
+     */
+    uint8_t *ptr;
+    /**
+     * Number of valid bytes.
+     */
+    uintptr_t len;
+    /**
+     * Allocated capacity; required to reconstruct the `Vec` on free.
+     */
+    uintptr_t cap;
+} PhoenixBuffer;
+
+typedef int (*ScanIterCallback)(const uint8_t*, uintptr_t, const uint8_t*, uintptr_t);
+
+/**
+ * Opaque vector-engine handle handed to C.
+ *
+ * The `tag` is the first field so a stale or foreign pointer is caught by the
+ * constant-time check in [`PhoenixVectorHandle::validate`] before `engine` is
+ * touched.
+ */
+typedef struct {
+    HandleTag tag;
+    VectorEngine *engine;
+} PhoenixVectorHandle;
+
+#ifdef __cplusplus
+extern "C" {
+#endif // __cplusplus
+
+/**
+ * Opens (or creates) a database.
+ *
+ * `path` must be a NUL-terminated UTF-8 string. On success `*out_handle`
+ * receives a handle that must be released with [`phoenix_close`].
+ *
+ * # Safety
+ * `path` must point to a valid NUL-terminated string and `out_handle` to a
+ * writable pointer-sized location.
+ */
+int phoenix_open(const char *path, uintptr_t cache_pages, PhoenixDB **out_handle);
+
+/**
+ * Checkpoints and closes a database, freeing the handle.
+ *
+ * Passing the same handle twice is detected by the poisoned tag and reported
+ * as `-2` rather than causing a double free.
+ *
+ * # Safety
+ * `handle` must come from [`phoenix_open`] and must not be used afterwards.
+ */
+int phoenix_close(PhoenixDB *handle);
+
+/**
+ * Begins a transaction. `read_only != 0` requests a read-only snapshot.
+ *
+ * # Safety
+ * `handle` must be live and `out_txn` writable.
+ */
+int phoenix_begin_txn(PhoenixDB *handle, int read_only, uint64_t *out_txn);
+
+/**
+ * Commits a transaction, making its writes durable before returning.
+ *
+ * # Safety
+ * `handle` must be live.
+ */
+int phoenix_commit_txn(PhoenixDB *handle, uint64_t txn_id);
+
+/**
+ * Rolls a transaction back, discarding its writes.
+ *
+ * # Safety
+ * `handle` must be live.
+ */
+int phoenix_rollback_txn(PhoenixDB *handle, uint64_t txn_id);
+
+/**
+ * Inserts or replaces a key within `txn_id`.
+ *
+ * Rejects a null pointer, an empty key, a key over 1 MiB or a value over
+ * 10 MiB with `-2` *before* dereferencing anything.
+ *
+ * # Safety
+ * `key`/`value` must each point to at least the stated number of readable
+ * bytes for the duration of the call.
+ */
+int phoenix_insert(PhoenixDB *handle, uint64_t txn_id, const uint8_t *key, uintptr_t key_len, const uint8_t *value, uintptr_t value_len);
+
+/**
+ * Reads a key within `txn_id` into a freshly allocated buffer.
+ *
+ * On success `*out` owns the value and must be released with
+ * [`phoenix_buffer_free`]. Returns `-3` when the key is not visible.
+ *
+ * # Safety
+ * `key` must be readable for `key_len` bytes; `out` must be writable.
+ */
+int phoenix_get(PhoenixDB *handle, uint64_t txn_id, const uint8_t *key, uintptr_t key_len, PhoenixBuffer *out);
+
+/**
+ * Deletes a key within `txn_id`. Returns `-3` when the key does not exist.
+ *
+ * # Safety
+ * `key` must be readable for `key_len` bytes.
+ */
+int phoenix_delete(PhoenixDB *handle, uint64_t txn_id, const uint8_t *key, uintptr_t key_len);
+
+/**
+ * Single-call insert in an implicit transaction (begin + insert + commit).
+ *
+ * # Safety
+ * Same buffer requirements as [`phoenix_insert`].
+ */
+int phoenix_put_auto(PhoenixDB *handle, const uint8_t *key, uintptr_t key_len, const uint8_t *value, uintptr_t value_len);
+
+/**
+ * Releases a buffer produced by [`phoenix_get`].
+ *
+ * Idempotent for a zeroed buffer and safe with a null argument. This is the
+ * **only** legal way to release PhoenixDB memory; the host allocator's `free`
+ * must never be used.
+ *
+ * # Safety
+ * `buf`, if non-null, must point to a `PhoenixBuffer` this library produced
+ * and that has not already been freed.
+ */
+void phoenix_buffer_free(PhoenixBuffer *buf);
+
+/**
+ * Frees a string returned by [`phoenix_last_error`].
+ *
+ * # Safety
+ * `s` must have come from [`phoenix_last_error`] and not been freed already.
+ */
+void phoenix_string_free(char *s);
+
+/**
+ * Returns a NUL-terminated description of this thread's last failure.
+ *
+ * The caller owns the string and must release it with
+ * [`phoenix_string_free`]. Returns null when no error has been recorded.
+ */
+char *phoenix_last_error(void);
+
+/**
+ * Merges pending versions into the tree, flushes and truncates the WAL.
+ *
+ * # Safety
+ * `handle` must be live.
+ */
+int phoenix_checkpoint(PhoenixDB *handle);
+
+/**
+ * Flushes dirty pages and syncs the WAL without truncating it.
+ *
+ * # Safety
+ * `handle` must be live.
+ */
+int phoenix_flush(PhoenixDB *handle);
+
+/**
+ * Verifies every page checksum and the B+Tree ordering invariants.
+ *
+ * # Safety
+ * `handle` must be live.
+ */
+int phoenix_verify(PhoenixDB *handle);
+
+/**
+ * Writes the number of visible keys to `*out_len`.
+ *
+ * # Safety
+ * `handle` must be live and `out_len` writable.
+ */
+int phoenix_count(PhoenixDB *handle, uint64_t *out_len);
+
+/**
+ * ABI version of this build. Dart refuses to load a mismatched library.
+ *
+ * Bumped to 3 in PhoenixDB 2.1: the `phoenix_vector_*` surface was added.
+ * Every earlier entry point keeps its signature, so the change is purely
+ * additive, but the version is what tells Dart the vector symbols are
+ * present — the loader would otherwise fail with a missing symbol at first
+ * use rather than at load time.
+ */
+uint32_t phoenix_abi_version(void);
+
+/**
+ * Whether this build includes the vector search engine.
+ *
+ * Always true for the current build: the vector engine has no optional
+ * dependencies and is compiled unconditionally. The flag exists so a Dart
+ * caller can branch on capability rather than on version arithmetic, exactly
+ * as it does for [`phoenix_has_sql`].
+ */
+int phoenix_has_vector(void);
+
+/**
+ * Whether this build was compiled with the `sql` feature.
+ *
+ * Lets a Dart caller degrade gracefully instead of getting an error from a
+ * lean embedded build that has no query layer.
+ */
+int phoenix_has_sql(void);
+
+/**
+ * Executes one SQL statement, returning the result as a JSON document.
+ *
+ * JSON is deliberate: a result set is a ragged, dynamically-typed table, and
+ * modelling it as a C struct would mean a second allocation protocol and a
+ * matching free function for every shape. One UTF-8 buffer with one owner is
+ * far harder to leak.
+ *
+ * The document is one of:
+ *
+ * ```json
+ * {"type":"rows","columns":["a","b"],"rows":[[1,"x"]]}
+ * {"type":"affected","count":3}
+ * {"type":"schema","detail":"table `t` created with 2 column(s)"}
+ * ```
+ *
+ * On success `*out_json` receives a NUL-terminated string that the caller
+ * must release with [`phoenix_string_free`]. On failure it is set to null and
+ * a negative status is returned; the message is available from
+ * `phoenix_last_error`.
+ *
+ * # Safety
+ * `handle` must be live, `sql` a NUL-terminated UTF-8 string, and `out_json` a
+ * writable pointer-sized location.
+ */
+int phoenix_sql_query(PhoenixDB *handle, const char *sql, char **out_json);
+
+/**
+ * Maximum key length accepted by the FFI layer, in bytes.
+ */
+uintptr_t phoenix_max_key_len(void);
+
+/**
+ * Maximum value length accepted by the FFI layer, in bytes.
+ */
+uintptr_t phoenix_max_value_len(void);
+
+/**
+ * Streams every visible key/value pair to `callback`.
+ *
+ * The callback receives pointers into Rust-owned memory. It must not free
+ * them. Return `0` to continue scanning or non-zero to abort early; the
+ * first non-zero status is propagated to Dart.
+ *
+ * # Safety
+ * `callback` must be valid for the duration of the scan.
+ */
+int phoenix_scan_iter(PhoenixDB *handle, ScanIterCallback callback);
+
+/**
+ * Writes the engine's metrics report into `out_buf` as a NUL-terminated UTF-8
+ * string.
+ *
+ * Returns the number of bytes written (excluding the NUL terminator) on
+ * success, or a negative [`PhoenixStatus`] on failure. When `out_buf` is too
+ * small, the call returns the required size as a negative error; grow the
+ * buffer and retry.
+ *
+ * # Safety
+ * `handle` must be live, `out_buf` must point to `out_len` writable bytes.
+ */
+intptr_t phoenix_metrics_report(PhoenixDB *handle, uint8_t *out_buf, uintptr_t out_len);
+
+/**
+ * Creates a vector index at `path`, or opens an existing one.
+ *
+ * * `path` — NUL-terminated UTF-8 file path. The graph snapshot lives beside
+ *   it at `<path>.hnsw`.
+ * * `dim` — dimensionality, `1..=65536`. Must match an existing file.
+ * * `metric` — `0` cosine, `1` euclidean, `2` dot product.
+ * * `max_elements` — capacity hint used to pre-reserve the id map; `0` means
+ *   "unknown", and the index still grows without bound.
+ *
+ * On success `*out_handle` receives a handle that must be released with
+ * [`phoenix_vector_free`]. On failure it is set to null.
+ *
+ * # Safety
+ * `path` must be a valid NUL-terminated string and `out_handle` a writable
+ * pointer-sized location.
+ */
+int phoenix_vector_init(const char *path, uintptr_t dim, uint8_t metric, uintptr_t max_elements, PhoenixVectorHandle **out_handle);
+
+/**
+ * Saves and destroys a vector index, freeing the handle.
+ *
+ * Passing the same handle twice is caught by the poisoned tag and ignored,
+ * rather than causing a double free. Null is a no-op.
+ *
+ * # Safety
+ * `handle` must come from [`phoenix_vector_init`] and must not be used
+ * afterwards.
+ */
+void phoenix_vector_free(PhoenixVectorHandle *handle);
+
+/**
+ * Inserts or replaces a vector.
+ *
+ * `vec_ptr` must point to `vec_len` contiguous `f32`s, and `vec_len` must
+ * equal the index's dimensionality. The buffer is read, not retained: it may
+ * be freed the moment this returns.
+ *
+ * Re-inserting an existing id replaces it.
+ *
+ * # Safety
+ * `id` must be a valid NUL-terminated string and `vec_ptr` must be readable
+ * for `vec_len` floats for the duration of the call.
+ */
+int phoenix_vector_insert(PhoenixVectorHandle *handle, const char *id, const float *vec_ptr, uintptr_t vec_len);
+
+/**
+ * Searches for the `k` nearest neighbours of `query_ptr`.
+ *
+ * The caller owns both output arrays and must size each to hold at least `k`
+ * elements:
+ *
+ * * `out_ids` receives `*out_count` NUL-terminated strings allocated by this
+ *   library. Release the whole array with [`phoenix_free_string_array`],
+ *   passing the same count.
+ * * `out_scores` receives the matching distances, ascending (nearest first).
+ *
+ * `*out_count` is set to the number of results actually written, which is at
+ * most `k` and may be fewer when the index holds fewer live vectors. It is
+ * written before anything else can fail, so it is always meaningful.
+ *
+ * `ef` overrides the search beam width; `0` selects the configured default.
+ * Higher values trade latency for recall.
+ *
+ * # Safety
+ * `query_ptr` must be readable for `query_len` floats; `out_ids` and
+ * `out_scores` must each be writable for `k` elements; `out_count` must be
+ * writable.
+ */
+int phoenix_vector_search(const PhoenixVectorHandle *handle, const float *query_ptr, uintptr_t query_len, uintptr_t k, uintptr_t ef, char **out_ids, float *out_scores, uintptr_t *out_count);
+
+/**
+ * Fetches a stored vector by id, copying it into `out_vec`.
+ *
+ * `out_vec` must be writable for `out_len` floats, and `out_len` must equal
+ * the index's dimensionality. Returns `-3` when the id is unknown or has been
+ * removed.
+ *
+ * # Safety
+ * `id` must be a valid NUL-terminated string; `out_vec` must be writable for
+ * `out_len` floats.
+ */
+int phoenix_vector_get(const PhoenixVectorHandle *handle, const char *id, float *out_vec, uintptr_t out_len);
+
+/**
+ * Removes a vector by id. Returns `-3` when it is absent.
+ *
+ * # Safety
+ * `id` must be a valid NUL-terminated string.
+ */
+int phoenix_vector_remove(PhoenixVectorHandle *handle, const char *id);
+
+/**
+ * Writes `1` to `*out_present` when `id` is stored and live, `0` otherwise.
+ *
+ * # Safety
+ * `id` must be a valid NUL-terminated string; `out_present` must be writable.
+ */
+int phoenix_vector_contains(const PhoenixVectorHandle *handle, const char *id, int *out_present);
+
+/**
+ * Syncs the vector file and writes the HNSW snapshot.
+ *
+ * `path` overrides the snapshot location; pass null for the default
+ * `<vector file>.hnsw`. The write is atomic — a temporary file is `fsync`ed
+ * and then renamed — so a crash mid-save leaves the previous snapshot intact.
+ *
+ * # Safety
+ * `handle` must be live; `path`, when non-null, must be a valid
+ * NUL-terminated string.
+ */
+int phoenix_vector_save(PhoenixVectorHandle *handle, const char *path);
+
+/**
+ * Syncs the vector file without writing a snapshot.
+ *
+ * # Safety
+ * `handle` must be live.
+ */
+int phoenix_vector_flush(PhoenixVectorHandle *handle);
+
+/**
+ * Rewrites the index without tombstoned records, writing the number of
+ * reclaimed slots to `*out_reclaimed`.
+ *
+ * # Safety
+ * `handle` must be live; `out_reclaimed`, when non-null, must be writable.
+ */
+int phoenix_vector_compact(PhoenixVectorHandle *handle, uintptr_t *out_reclaimed);
+
+/**
+ * Writes the number of live vectors to `*out_len`.
+ *
+ * # Safety
+ * `handle` must be live and `out_len` writable.
+ */
+int phoenix_vector_count(const PhoenixVectorHandle *handle, uintptr_t *out_len);
+
+/**
+ * Writes the index's dimensionality to `*out_dim`.
+ *
+ * # Safety
+ * `handle` must be live and `out_dim` writable.
+ */
+int phoenix_vector_dim(const PhoenixVectorHandle *handle, uintptr_t *out_dim);
+
+/**
+ * Writes live, total and deleted record counts to the three outputs.
+ *
+ * Any output may be null, in which case that statistic is skipped.
+ *
+ * # Safety
+ * `handle` must be live; each non-null output must be writable.
+ */
+int phoenix_vector_stats(const PhoenixVectorHandle *handle, uintptr_t *out_live, uintptr_t *out_total, uintptr_t *out_deleted);
+
+/**
+ * Returns a NUL-terminated description of this thread's last vector failure.
+ *
+ * The caller owns the string and must release it with `phoenix_string_free`.
+ * Returns null when no error has been recorded.
+ */
+char *phoenix_vector_last_error(void);
+
+/**
+ * Name of the SIMD kernel this CPU selected: `avx2+fma`, `neon` or
+ * `portable`.
+ *
+ * The returned pointer is a `'static` string owned by the library and must
+ * **not** be freed.
+ */
+const char *phoenix_vector_kernel(void);
+
+/**
+ * Largest dimensionality this build accepts.
+ */
+uintptr_t phoenix_vector_max_dim(void);
+
+/**
+ * Largest `k` a single search may request.
+ */
+uintptr_t phoenix_vector_max_k(void);
+
+/**
+ * Largest vector id this build accepts, in bytes.
+ */
+uintptr_t phoenix_vector_max_id_len(void);
+
+/**
+ * Releases an array of `len` strings produced by [`phoenix_vector_search`].
+ *
+ * Frees each string and then nulls its slot, so a double free is a no-op
+ * rather than undefined behaviour. The array itself belongs to the caller and
+ * is **not** freed here — only the strings inside it. Null is a no-op.
+ *
+ * # Safety
+ * `ptrs` must point to `len` pointers that this library produced and that have
+ * not already been freed.
+ */
+void phoenix_free_string_array(char **ptrs, uintptr_t len);
+
+#ifdef __cplusplus
+}  // extern "C"
+#endif  // __cplusplus
 
 #endif  /* PHOENIXDB_H */
