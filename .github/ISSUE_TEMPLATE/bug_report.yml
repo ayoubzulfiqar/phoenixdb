@@ -1,0 +1,78 @@
+name: Bug report
+description: Something is broken, crashes, or loses data.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting. **Security problems** (memory safety at the FFI
+        boundary, crafted database files, key leaks) belong in a private
+        report — see [SECURITY.md](https://github.com/ayoubzulfiqar/phoenixdb/blob/main/SECURITY.md) — not here.
+  - type: input
+    id: version
+    attributes:
+      label: PhoenixDB version
+      placeholder: "4.0.0"
+    validations:
+      required: true
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Platform
+      multiple: true
+      options:
+        - Android
+        - iOS
+        - macOS
+        - Linux
+        - Windows
+        - Other
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      multiple: true
+      options:
+        - Key/value store and transactions
+        - SQL
+        - Vector search
+        - Document collections and hybrid search
+        - AI toolkit (package:phoenixdb/ai.dart)
+        - Preferences (PhoenixPrefs)
+        - Native library loading / build
+        - Rust crate or C ABI
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you expected, and what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal reproduction
+      description: The smallest code or steps that show the problem. A failing test is ideal.
+      render: dart
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Error output
+      description: >-
+        The full exception or panic message and stack trace. If a database file
+        is involved, the output of `cd rust && cargo run --bin phoenixdb_verify -- <file>`
+        helps a lot.
+      render: text
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Output of `flutter --version` (or `dart --version`), and the Rust version if you build the library yourself.
+      render: text
