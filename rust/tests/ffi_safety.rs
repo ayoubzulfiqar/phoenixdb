@@ -311,10 +311,11 @@ fn last_error_is_populated_and_freeable() {
 
 #[test]
 fn abi_version_matches_expectation() {
-    // Bumped 2 -> 3 in PhoenixDB 2.1, which adds the `phoenix_vector_*`
-    // surface. Must stay in lockstep with `kExpectedAbiVersion` in
+    // 2 -> 3 in PhoenixDB 2.1 (the `phoenix_vector_*` surface), 3 -> 4 in
+    // 4.0 (open_ex, range scans, batches, backup, stats, check, tracing).
+    // Must stay in lockstep with `kExpectedAbiVersion` in
     // lib/src/bindings.dart, or Dart refuses to load the library.
-    assert_eq!(phoenix_abi_version(), 3);
+    assert_eq!(phoenix_abi_version(), 4);
 }
 
 #[test]
