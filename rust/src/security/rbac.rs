@@ -129,6 +129,10 @@ pub struct AccessControl {
     /// This preserves backwards compatibility for embedded single-user
     /// deployments that never opt into RBAC.
     open_by_default: bool,
+    /// Set once any principal has been registered. Open mode never returns
+    /// after that: revoking the last user must lock the table, not throw it
+    /// wide open again.
+    configured: bool,
 }
 
 impl AccessControl {
@@ -140,6 +144,7 @@ impl AccessControl {
             roles: HashMap::new(),
             principals: Vec::new(),
             open_by_default: false,
+            configured: false,
         }
     }
 
@@ -147,20 +152,23 @@ impl AccessControl {
     ///
     /// This is the mode an existing embedded application gets by default, so
     /// enabling the security module does not silently break it. As soon as one
-    /// principal is added, the table becomes fail-closed.
+    /// principal is added, the table becomes fail-closed — permanently, even
+    /// if every principal is later removed.
     #[must_use]
     pub fn open() -> Self {
         AccessControl {
             roles: HashMap::new(),
             principals: Vec::new(),
             open_by_default: true,
+            configured: false,
         }
     }
 
-    /// True when no principals are registered and the table is in open mode.
+    /// True while the table is in open mode: created with
+    /// [`AccessControl::open`] and never configured with a principal.
     #[must_use]
     pub fn is_open(&self) -> bool {
-        self.open_by_default && self.principals.is_empty()
+        self.open_by_default && !self.configured
     }
 
     /// Registers or replaces a role.
@@ -205,6 +213,7 @@ impl AccessControl {
                 roles,
             },
         ));
+        self.configured = true;
         Ok(())
     }
 
@@ -263,10 +272,10 @@ impl AccessControl {
             .authenticate(token)
             .ok_or_else(|| Error::invalid("authentication failed: unknown token"))?;
         for role_name in &principal.roles {
-            if let Some(role) = self.roles.get(role_name) {
-                if role.grants(permission) {
-                    return Ok(principal);
-                }
+            if let Some(role) = self.roles.get(role_name)
+                && role.grants(permission)
+            {
+                return Ok(principal);
             }
         }
         Err(Error::invalid(format!(
@@ -468,5 +477,21 @@ mod tests {
         assert_eq!(Permission::Delete.name(), "delete");
         assert_eq!(Permission::Maintain.name(), "maintain");
         assert_eq!(Permission::Admin.name(), "admin");
+    }
+
+    #[test]
+    fn revoking_the_last_principal_does_not_reopen_the_table() {
+        let mut acl = AccessControl::open();
+        assert!(acl.is_open());
+        acl.define_role(Role::superuser("admin"));
+        acl.add_principal(b"tok".to_vec(), "ada", ["admin".to_string()])
+            .unwrap();
+        assert!(!acl.is_open());
+        assert!(acl.remove_principal(b"tok"));
+        assert!(!acl.is_open(), "revocation must lock, not unlock");
+        assert!(
+            acl.authorize_open(b"anyone", Permission::all()[0]).is_err(),
+            "no token may be authorized once RBAC was configured"
+        );
     }
 }
