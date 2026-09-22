@@ -34,7 +34,7 @@
 
 use crate::error::Result;
 use std::fs::{File, OpenOptions};
-use std::io::{BufWriter, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -161,12 +161,24 @@ pub fn current_millis() -> u64 {
         .unwrap_or(0)
 }
 
-/// Escapes tabs, newlines and backslashes so a field cannot forge a record.
+/// Escapes a field so it can neither forge a record nor drive a terminal.
 ///
-/// Without this, a key or user id containing `\n` could inject a fabricated
-/// audit line — the classic log-injection attack.
+/// Backslash, tab, CR and LF get readable escapes; every other control
+/// character (C0, DEL, C1 — ESC and ANSI sequences included) and the Unicode
+/// line/paragraph separators become `\u{…}`. Without this, a key or user id
+/// containing `\n` could inject a fabricated audit line, and an embedded
+/// escape sequence could rewrite what a reviewer's terminal shows.
+///
+/// An empty field renders as `-` (keeping the column count fixed) and a
+/// literal `-` as `\-`, so the two stay distinguishable.
 #[must_use]
 pub fn escape_field(s: &str) -> String {
+    if s.is_empty() {
+        return "-".to_string();
+    }
+    if s == "-" {
+        return "\\-".to_string();
+    }
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         match c {
@@ -174,19 +186,23 @@ pub fn escape_field(s: &str) -> String {
             '\t' => out.push_str("\\t"),
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
+            c if c.is_control() || c == '\u{2028}' || c == '\u{2029}' => {
+                out.push_str(&format!("\\u{{{:04x}}}", c as u32));
+            }
             c => out.push(c),
         }
-    }
-    if out.is_empty() {
-        out.push('-'); // keep the column count fixed
     }
     out
 }
 
 /// An append-only audit trail.
+///
+/// Each record is written with a single `write` on an `O_APPEND` file, so
+/// concurrent writers can never interleave inside a record (a buffered writer
+/// could split one across two writes).
 pub struct AuditLog {
     path: PathBuf,
-    writer: BufWriter<File>,
+    writer: File,
     /// `fsync` after every record.
     sync_each: bool,
     records_written: u64,
@@ -199,19 +215,31 @@ impl AuditLog {
     /// records rather than overwriting one another.
     pub fn open(path: impl AsRef<Path>, sync_each: bool) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent)?;
-            }
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent)?;
         }
-        let file = OpenOptions::new()
+        let mut file = OpenOptions::new()
             .create(true)
             .append(true)
             .read(true)
             .open(&path)?;
+        // A crash mid-record leaves a line without its newline; terminate it
+        // so the next record does not fuse onto the torn one.
+        let len = file.metadata()?.len();
+        if len > 0 {
+            use std::io::{Read, Seek, SeekFrom};
+            let mut last = [0u8; 1];
+            file.seek(SeekFrom::Start(len - 1))?;
+            file.read_exact(&mut last)?;
+            if last[0] != b'\n' {
+                file.write_all(b"\n")?;
+            }
+        }
         Ok(AuditLog {
             path,
-            writer: BufWriter::new(file),
+            writer: file,
             sync_each,
             records_written: 0,
         })
@@ -231,8 +259,9 @@ impl AuditLog {
 
     /// Appends `record`, syncing when configured to.
     pub fn append(&mut self, record: &AuditRecord) -> Result<()> {
-        self.writer.write_all(record.encode().as_bytes())?;
-        self.writer.write_all(b"\n")?;
+        let mut line = record.encode().into_bytes();
+        line.push(b'\n');
+        self.writer.write_all(&line)?;
         self.records_written += 1;
         if self.sync_each {
             self.sync()?;
@@ -252,8 +281,7 @@ impl AuditLog {
 
     /// Flushes buffers and `fsync`s the file.
     pub fn sync(&mut self) -> Result<()> {
-        self.writer.flush()?;
-        self.writer.get_ref().sync_all()?;
+        self.writer.sync_all()?;
         Ok(())
     }
 
@@ -421,5 +449,35 @@ mod tests {
         let b = AuditRecord::now(Outcome::Allowed, "u", "read");
         assert!(b.timestamp_ms >= a.timestamp_ms);
         assert!(a.timestamp_ms > 1_600_000_000_000, "clock looks unset");
+    }
+
+    #[test]
+    fn control_characters_and_separators_are_escaped() {
+        let hostile = "\u{1b}[2Jfake\u{7f}\u{85}\u{2028}ok";
+        let escaped = escape_field(hostile);
+        assert!(!escaped.chars().any(|c| c.is_control()), "{escaped:?}");
+        assert!(!escaped.contains('\u{2028}'));
+        assert!(escaped.contains("\\u{001b}"), "{escaped}");
+        assert_eq!(escape_field(""), "-");
+        assert_eq!(
+            escape_field("-"),
+            "\\-",
+            "a literal dash is not an empty field"
+        );
+    }
+
+    #[test]
+    fn a_torn_last_line_is_terminated_on_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.log");
+        std::fs::write(&path, b"torn partial record without newline").unwrap();
+        let mut log = AuditLog::open(&path, true).unwrap();
+        log.allow("ada", "put", b"k").unwrap();
+        let lines = AuditLog::read_lines(&path).unwrap();
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(
+            lines[1].contains("ada"),
+            "the new record stands on its own line"
+        );
     }
 }
