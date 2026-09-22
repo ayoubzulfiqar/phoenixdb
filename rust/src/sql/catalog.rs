@@ -6,9 +6,15 @@
 //! namespaced by prefix:
 //!
 //! ```text
-//!   \x00schema\x00<table>              -> bincode(TableSchema)
-//!   \x01row\x00<table>\x00<rowid u64>  -> bincode(Row)
+//!   \x00schema\x00<table>                -> bincode(TableSchema)
+//!   \x01row\x00<table>\x00<rowid u64>    -> bincode(Row)
+//!   \x02pk\x00<table>\x00<encoded key>   -> rowid u64 (primary-key index)
+//!   \x02pkready\x00<table>               -> marker: the index is complete
 //! ```
+//!
+//! Table names are folded to lower case in keys and may not contain control
+//! characters, so the `\x00` separator can never be forged by a name and one
+//! table's prefix can never cover another's rows.
 //!
 //! The prefixes start with control bytes that ordinary user keys are unlikely
 //! to contain, and the big-endian row id means a prefix scan returns rows in
@@ -31,8 +37,39 @@ pub const SCHEMA_PREFIX: &[u8] = b"\x00schema\x00";
 /// Key prefix for row entries.
 pub const ROW_PREFIX: &[u8] = b"\x01row\x00";
 
+/// Key prefix for primary-key index entries.
+pub const PK_PREFIX: &[u8] = b"\x02pk\x00";
+
+/// Key prefix for "primary-key index is complete" markers.
+pub const PK_READY_PREFIX: &[u8] = b"\x02pkready\x00";
+
 /// Separator between a table name and the row id.
 const SEP: u8 = 0x00;
+
+/// Case folding for table and column names. One function, used everywhere,
+/// so matching and key-building can never disagree.
+#[must_use]
+pub fn fold(name: &str) -> String {
+    name.to_lowercase()
+}
+
+/// Rejects names that cannot be stored safely: empty, over-long, or holding
+/// control characters (a `\x00` would forge the key separator).
+pub fn validate_name(name: &str, what: &str) -> Result<()> {
+    if name.is_empty() || name.len() > crate::sql::parser::MAX_IDENT_LEN {
+        return Err(Error::invalid(format!(
+            "{what} name must be 1..={} bytes",
+            crate::sql::parser::MAX_IDENT_LEN
+        )));
+    }
+    if let Some(c) = name.chars().find(|c| c.is_control()) {
+        return Err(Error::invalid(format!(
+            "{what} name `{}` contains the control character {c:?}",
+            name.escape_debug()
+        )));
+    }
+    Ok(())
+}
 
 /// A stored value. Mirrors [`Value`] but owns its data and is serialisable.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -58,6 +95,50 @@ impl From<&Value> for Cell {
     }
 }
 
+impl From<Value> for Cell {
+    fn from(v: Value) -> Self {
+        match v {
+            Value::Text(s) => Cell::Text(s),
+            Value::Integer(i) => Cell::Integer(i),
+            Value::Float(f) => Cell::Float(f),
+            Value::Null => Cell::Null,
+        }
+    }
+}
+
+/// Exact comparison of an integer with a float, with no rounding: `i as f64`
+/// loses precision above 2^53, which made `9007199254740993 > 9007199254740992.0`
+/// false.
+#[must_use]
+pub fn cmp_int_float(i: i64, f: f64) -> Option<std::cmp::Ordering> {
+    use std::cmp::Ordering;
+    if f.is_nan() {
+        return None;
+    }
+    // Every i64 lies in [-2^63, 2^63).
+    if f >= 9_223_372_036_854_775_808.0 {
+        return Some(Ordering::Less);
+    }
+    if f < -9_223_372_036_854_775_808.0 {
+        return Some(Ordering::Greater);
+    }
+    let whole = f.trunc();
+    let as_int = whole as i64; // exact: |whole| < 2^63
+    match i.cmp(&as_int) {
+        Ordering::Equal => {
+            let frac = f - whole;
+            Some(if frac > 0.0 {
+                Ordering::Less
+            } else if frac < 0.0 {
+                Ordering::Greater
+            } else {
+                Ordering::Equal
+            })
+        }
+        other => Some(other),
+    }
+}
+
 impl Cell {
     /// Renders the cell for display in a result set.
     #[must_use]
@@ -65,8 +146,33 @@ impl Cell {
         match self {
             Cell::Text(s) => s.clone(),
             Cell::Integer(i) => i.to_string(),
-            Cell::Float(f) => f.to_string(),
+            Cell::Float(f) => format!("{f:?}"),
             Cell::Null => "NULL".to_string(),
+        }
+    }
+
+    /// Total order for sorting: numbers (integers and floats compared
+    /// exactly) before text, `NULL` last. Unlike [`Cell::partial_compare`] it
+    /// is transitive over mixed columns, which a sort requires.
+    #[must_use]
+    pub fn total_cmp(&self, other: &Cell) -> std::cmp::Ordering {
+        use std::cmp::Ordering;
+        fn rank(c: &Cell) -> u8 {
+            match c {
+                Cell::Integer(_) | Cell::Float(_) => 0,
+                Cell::Text(_) => 1,
+                Cell::Null => 2,
+            }
+        }
+        match (self, other) {
+            (Cell::Integer(a), Cell::Integer(b)) => a.cmp(b),
+            (Cell::Float(a), Cell::Float(b)) => a.total_cmp(b),
+            (Cell::Integer(a), Cell::Float(b)) => cmp_int_float(*a, *b).unwrap_or(Ordering::Less),
+            (Cell::Float(a), Cell::Integer(b)) => cmp_int_float(*b, *a)
+                .map(Ordering::reverse)
+                .unwrap_or(Ordering::Greater),
+            (Cell::Text(a), Cell::Text(b)) => a.cmp(b),
+            _ => rank(self).cmp(&rank(other)),
         }
     }
 
@@ -82,10 +188,10 @@ impl Cell {
             (Cell::Integer(a), Cell::Integer(b)) => Some(a.cmp(b)),
             (Cell::Text(a), Cell::Text(b)) => Some(a.cmp(b)),
             (Cell::Float(a), Cell::Float(b)) => a.partial_cmp(b),
-            // Mixed numeric: promote to f64 so `age > 30.5` works on an
-            // integer column.
-            (Cell::Integer(a), Cell::Float(b)) => (*a as f64).partial_cmp(b),
-            (Cell::Float(a), Cell::Integer(b)) => a.partial_cmp(&(*b as f64)),
+            // Mixed numeric compares exactly, so `age > 30.5` works on an
+            // integer column without rounding above 2^53.
+            (Cell::Integer(a), Cell::Float(b)) => cmp_int_float(*a, *b),
+            (Cell::Float(a), Cell::Integer(b)) => cmp_int_float(*b, *a).map(|o| o.reverse()),
             // Text vs number is a type error, reported as "not comparable"
             // rather than silently ordering by some arbitrary rule.
             _ => None,
@@ -155,9 +261,16 @@ impl TableSchema {
         let mut primary_key = None;
         let mut not_null = Vec::new();
 
+        validate_name(name, "table")?;
+        if defs.is_empty() {
+            return Err(Error::invalid(format!(
+                "table `{name}` needs at least one column"
+            )));
+        }
         for (i, d) in defs.iter().enumerate() {
-            let lower = d.name.to_lowercase();
-            if columns.iter().any(|c: &String| c.to_lowercase() == lower) {
+            validate_name(&d.name, "column")?;
+            let lower = fold(&d.name);
+            if columns.iter().any(|c: &String| fold(c) == lower) {
                 return Err(Error::invalid(format!(
                     "duplicate column `{}` in table `{name}`",
                     d.name
@@ -190,9 +303,10 @@ impl TableSchema {
 
     /// Index of `column`, matched case-insensitively as SQL requires.
     pub fn column_index(&self, column: &str) -> Result<usize> {
+        let wanted = fold(column);
         self.columns
             .iter()
-            .position(|c| c.eq_ignore_ascii_case(column))
+            .position(|c| fold(c) == wanted)
             .ok_or_else(|| {
                 Error::invalid(format!(
                     "no column `{column}` in table `{}` (have: {})",
@@ -224,7 +338,7 @@ impl TableSchema {
 pub fn schema_key(table: &str) -> Vec<u8> {
     let mut k = SCHEMA_PREFIX.to_vec();
     // Table names are case-insensitive, so normalise before building the key.
-    k.extend_from_slice(table.to_lowercase().as_bytes());
+    k.extend_from_slice(fold(table).as_bytes());
     k
 }
 
@@ -242,9 +356,64 @@ pub fn row_key(table: &str, row_id: u64) -> Vec<u8> {
 #[must_use]
 pub fn row_prefix(table: &str) -> Vec<u8> {
     let mut k = ROW_PREFIX.to_vec();
-    k.extend_from_slice(table.to_lowercase().as_bytes());
+    k.extend_from_slice(fold(table).as_bytes());
     k.push(SEP);
     k
+}
+
+/// Key prefix covering every primary-key index entry of `table`.
+#[must_use]
+pub fn pk_prefix(table: &str) -> Vec<u8> {
+    let mut k = PK_PREFIX.to_vec();
+    k.extend_from_slice(fold(table).as_bytes());
+    k.push(SEP);
+    k
+}
+
+/// Key of the "primary-key index complete" marker of `table`.
+#[must_use]
+pub fn pk_ready_key(table: &str) -> Vec<u8> {
+    let mut k = PK_READY_PREFIX.to_vec();
+    k.extend_from_slice(fold(table).as_bytes());
+    k
+}
+
+/// Primary-key index key for `value`, or an error for `NULL`.
+///
+/// Numbers are encoded so that equal numeric values collide (`1` and `1.0`
+/// are the same key, as SQL equality says) and so that byte order follows
+/// numeric order; text sorts after every number.
+pub fn pk_key(table: &str, value: &Cell) -> Result<Vec<u8>> {
+    let mut k = pk_prefix(table);
+    match value {
+        Cell::Null => return Err(Error::invalid("a PRIMARY KEY value cannot be NULL")),
+        Cell::Integer(i) => {
+            k.push(0x10);
+            k.extend_from_slice(&((*i as u64) ^ (1 << 63)).to_be_bytes());
+        }
+        Cell::Float(f) => {
+            if f.fract() == 0.0 && *f >= -9.223_372_036_854_776e18 && *f < 9.223_372_036_854_776e18
+            {
+                k.push(0x10);
+                k.extend_from_slice(&((*f as i64 as u64) ^ (1 << 63)).to_be_bytes());
+            } else {
+                // Order-preserving f64 encoding (sign-flipped IEEE bits).
+                let bits = f.to_bits();
+                let ordered = if bits >> 63 == 1 {
+                    !bits
+                } else {
+                    bits ^ (1 << 63)
+                };
+                k.push(0x11);
+                k.extend_from_slice(&ordered.to_be_bytes());
+            }
+        }
+        Cell::Text(s) => {
+            k.push(0x20);
+            k.extend_from_slice(s.as_bytes());
+        }
+    }
+    Ok(k)
 }
 
 /// Extracts the row id from a row key, or `None` when it is malformed.
