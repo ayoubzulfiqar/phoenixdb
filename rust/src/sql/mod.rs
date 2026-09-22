@@ -52,8 +52,8 @@ pub mod executor;
 pub mod lexer;
 pub mod parser;
 
-pub use ast::{ColumnDef, ComparisonOp, Predicate, Statement, Value, WhereClause};
+pub use ast::{AggFunc, ColumnDef, ComparisonOp, Expr, OrderItem, SelectItem, Statement, Value};
 pub use catalog::{Cell, Row, TableSchema};
-pub use executor::{Executor, QueryResult};
+pub use executor::{Executor, QueryResult, params_from_json};
 pub use lexer::{Token, TokenKind, tokenize};
-pub use parser::parse;
+pub use parser::{parse, parse_with_params};
