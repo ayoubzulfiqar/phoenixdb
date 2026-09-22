@@ -31,10 +31,12 @@
 
 use crate::error::{Error, PhoenixStatus};
 use crate::security::HandleTag;
-use crate::vector::{MAX_DIM, MAX_ID_LEN, Metric, VectorEngine, VectorOptions};
+use crate::vector::{MAX_DIM, MAX_ID_LEN, Metric, VectorEngine, VectorMatch, VectorOptions};
+use parking_lot::Mutex;
 use std::os::raw::{c_char, c_int};
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Weak};
 
 /// Largest `k` a single search may request.
 ///
@@ -51,7 +53,48 @@ pub const MAX_SEARCH_K: usize = 4096;
 #[repr(C)]
 pub struct PhoenixVectorHandle {
     tag: HandleTag,
-    engine: *mut VectorEngine,
+    /// One strong reference (`Arc::into_raw`) to a possibly shared engine.
+    engine: *const VectorEngine,
+}
+
+/// Vector engines open in this process, by canonical path.
+///
+/// As for the key/value engine: a second `phoenix_vector_init` of a file this
+/// process already has open joins the running engine (the store is locked, so
+/// a second engine would be refused anyway), which keeps several isolates and
+/// Flutter hot restart working. The final release happens under this lock.
+static VECTOR_REGISTRY: Mutex<Vec<(PathBuf, Weak<VectorEngine>)>> =
+    parking_lot::const_mutex(Vec::new());
+
+fn open_shared(
+    path: &Path,
+    dim: usize,
+    metric: Metric,
+    options: VectorOptions,
+) -> Result<Arc<VectorEngine>, Error> {
+    let mut registry = VECTOR_REGISTRY.lock();
+    registry.retain(|(_, weak)| weak.strong_count() > 0);
+    if let Ok(key) = std::fs::canonicalize(path)
+        && let Some(engine) = registry
+            .iter()
+            .find(|(p, _)| *p == key)
+            .and_then(|(_, weak)| weak.upgrade())
+    {
+        if engine.dim() != dim || engine.metric() != metric {
+            return Err(Error::invalid(format!(
+                "{} is already open as a {}-dimensional {} index",
+                path.display(),
+                engine.dim(),
+                engine.metric().name()
+            )));
+        }
+        return Ok(engine);
+    }
+    let engine = Arc::new(VectorEngine::open(path, dim, metric, options)?);
+    if let Ok(key) = std::fs::canonicalize(path) {
+        registry.push((key, Arc::downgrade(&engine)));
+    }
+    Ok(engine)
 }
 
 impl PhoenixVectorHandle {
@@ -75,9 +118,9 @@ impl PhoenixVectorHandle {
         if h.engine.is_null() {
             return Err(Error::Closed);
         }
-        // SAFETY: `engine` was created by `Box::into_raw` in
-        // `phoenix_vector_init` and is only freed in `phoenix_vector_free`,
-        // which poisons the tag first.
+        // SAFETY: `engine` came from `Arc::into_raw` in `phoenix_vector_init`
+        // and this handle's reference is only released in
+        // `phoenix_vector_free`, which poisons the tag first.
         Ok(unsafe { &*h.engine })
     }
 }
@@ -132,7 +175,7 @@ unsafe fn slice_from_raw_f32<'a>(ptr: *const f32, len: usize) -> Result<&'a [f32
         return Err(Error::invalid("null vector pointer"));
     }
     let address = ptr as usize;
-    if address % std::mem::align_of::<f32>() != 0 {
+    if !address.is_multiple_of(std::mem::align_of::<f32>()) {
         return Err(Error::invalid(
             "vector pointer is not 4-byte aligned; pass a Float32List buffer",
         ));
@@ -240,11 +283,11 @@ pub unsafe extern "C" fn phoenix_vector_init(
             max_elements,
             ..VectorOptions::default()
         };
-        let engine = VectorEngine::open(path, dim, metric, options)?;
+        let engine = open_shared(&path, dim, metric, options)?;
 
         let handle = Box::new(PhoenixVectorHandle {
             tag: HandleTag::new(),
-            engine: Box::into_raw(Box::new(engine)),
+            engine: Arc::into_raw(engine),
         });
         // SAFETY: `out_handle` was validated as non-null above.
         unsafe { *out_handle = Box::into_raw(handle) };
@@ -277,12 +320,15 @@ pub unsafe extern "C" fn phoenix_vector_free(handle: *mut PhoenixVectorHandle) {
             ));
         }
         h.tag.poison(); // reject any concurrent or subsequent use
-        let engine_ptr = std::mem::replace(&mut h.engine, std::ptr::null_mut());
+        let engine_ptr = std::mem::replace(&mut h.engine, std::ptr::null());
         if !engine_ptr.is_null() {
-            // SAFETY: created by `Box::into_raw` in `phoenix_vector_init`, and
-            // freed exactly once because the tag is poisoned above. `Drop`
-            // saves the snapshot.
-            drop(unsafe { Box::from_raw(engine_ptr) });
+            // SAFETY: created by `Arc::into_raw` in `phoenix_vector_init`, and
+            // released exactly once because the tag is poisoned above. The
+            // last reference's `Drop` saves the snapshot — under the registry
+            // lock, so a concurrent init never races it for the file lock.
+            let engine = unsafe { Arc::from_raw(engine_ptr) };
+            let _registry = VECTOR_REGISTRY.lock();
+            drop(engine);
         }
         // SAFETY: the handle box itself is freed exactly once, here.
         drop(unsafe { Box::from_raw(handle) });
@@ -414,6 +460,223 @@ pub unsafe extern "C" fn phoenix_vector_search(
         }
         // SAFETY: validated non-null above.
         unsafe { *out_count = matches.len() };
+        Ok(())
+    })
+}
+
+/// Inserts (or replaces) `n` vectors in one call and one lock acquisition.
+///
+/// `ids` holds `n` NUL-terminated ids; `vectors` holds the vectors back to
+/// back (`n * dim` floats). The whole batch is validated before anything is
+/// written, so a bad id or vector leaves the index untouched.
+///
+/// # Safety
+/// `ids` must hold `n` valid NUL-terminated strings and `vectors` must be
+/// readable for `n * dim` floats.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn phoenix_vector_insert_batch(
+    handle: *const PhoenixVectorHandle,
+    ids: *const *const c_char,
+    n: usize,
+    vectors: *const f32,
+    dim: usize,
+) -> c_int {
+    guard(|| {
+        if n == 0 {
+            return Ok(());
+        }
+        if n > 1_000_000 {
+            return Err(Error::invalid("at most 1,000,000 vectors per batch"));
+        }
+        if ids.is_null() {
+            return Err(Error::invalid("ids is null"));
+        }
+        // SAFETY: see `phoenix_vector_insert`.
+        let engine = unsafe { PhoenixVectorHandle::validate(handle) }?;
+        if dim != engine.dim() {
+            return Err(Error::invalid(format!(
+                "vectors have {dim} dimension(s), index expects {}",
+                engine.dim()
+            )));
+        }
+        if vectors.is_null() || !(vectors as usize).is_multiple_of(std::mem::align_of::<f32>()) {
+            return Err(Error::invalid(
+                "vectors must be a non-null, aligned f32 buffer",
+            ));
+        }
+        let total = n
+            .checked_mul(dim)
+            .ok_or_else(|| Error::invalid("batch size overflows"))?;
+        // SAFETY: non-null, aligned; extent is the caller's obligation.
+        let flat = unsafe { std::slice::from_raw_parts(vectors, total) };
+        let mut items: Vec<(&str, &[f32])> = Vec::with_capacity(n);
+        for (i, vector) in flat.chunks_exact(dim).enumerate() {
+            // SAFETY: the caller guarantees `n` readable id pointers.
+            let id = unsafe { id_from_raw(*ids.add(i)) }?;
+            items.push((id, vector));
+        }
+        engine.insert_many(&items)
+    })
+}
+
+/// Writes `matches` into caller arrays (ids as owned C strings, distances).
+///
+/// Every id is converted before any is published, so a failure part-way
+/// frees its own allocations instead of leaving a half-filled array.
+///
+/// # Safety
+/// `out_ids`/`out_scores` must be writable for `matches.len()` elements.
+unsafe fn publish_matches(
+    matches: &[VectorMatch],
+    out_ids: *mut *mut c_char,
+    out_scores: *mut f32,
+) -> Result<(), Error> {
+    let mut owned: Vec<*mut c_char> = Vec::with_capacity(matches.len());
+    for entry in matches {
+        match std::ffi::CString::new(entry.id.as_str()) {
+            Ok(c) => owned.push(c.into_raw()),
+            Err(_) => {
+                for ptr in owned {
+                    // SAFETY: from `CString::into_raw` above, never handed out.
+                    drop(unsafe { std::ffi::CString::from_raw(ptr) });
+                }
+                return Err(Error::corrupt("stored id contains an interior NUL"));
+            }
+        }
+    }
+    for (index, (ptr, entry)) in owned.iter().zip(matches).enumerate() {
+        // SAFETY: the caller guarantees room for `matches.len()` elements.
+        unsafe {
+            out_ids.add(index).write(*ptr);
+            out_scores.add(index).write(entry.distance);
+        }
+    }
+    Ok(())
+}
+
+/// Exact `k`-nearest search restricted to the ids in `ids[0..n_ids]` —
+/// typically the result of a metadata filter. Unknown or removed ids are
+/// ignored. Outputs follow [`phoenix_vector_search`].
+///
+/// # Safety
+/// As [`phoenix_vector_search`]; additionally `ids` must hold `n_ids` valid
+/// NUL-terminated strings.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn phoenix_vector_search_ids(
+    handle: *const PhoenixVectorHandle,
+    query_ptr: *const f32,
+    query_len: usize,
+    k: usize,
+    ef: usize,
+    ids: *const *const c_char,
+    n_ids: usize,
+    out_ids: *mut *mut c_char,
+    out_scores: *mut f32,
+    out_count: *mut usize,
+) -> c_int {
+    guard(|| {
+        if out_count.is_null() {
+            return Err(Error::invalid("out_count is null"));
+        }
+        // SAFETY: validated non-null above.
+        unsafe { *out_count = 0 };
+        if k == 0 || k > MAX_SEARCH_K {
+            return Err(Error::invalid(format!("k must be in 1..={MAX_SEARCH_K}")));
+        }
+        if out_ids.is_null() || out_scores.is_null() {
+            return Err(Error::invalid("output arrays must not be null"));
+        }
+        if n_ids > 0 && ids.is_null() {
+            return Err(Error::invalid("ids is null"));
+        }
+        if n_ids > 10_000_000 {
+            return Err(Error::invalid("too many ids"));
+        }
+        // SAFETY: see `phoenix_vector_insert`.
+        let engine = unsafe { PhoenixVectorHandle::validate(handle) }?;
+        // SAFETY: length and alignment are checked inside before any read.
+        let query = unsafe { slice_from_raw_f32(query_ptr, query_len) }?;
+        let mut names: Vec<&str> = Vec::with_capacity(n_ids);
+        for i in 0..n_ids {
+            // SAFETY: the caller guarantees `n_ids` readable pointers.
+            let ptr = unsafe { *ids.add(i) };
+            // SAFETY: each must be a NUL-terminated string.
+            names.push(unsafe { id_from_raw(ptr) }?);
+        }
+        let matches = engine.search_ids(query, k, (ef > 0).then_some(ef), &names)?;
+        // SAFETY: arrays validated non-null; `matches.len() <= k`.
+        unsafe { publish_matches(&matches, out_ids, out_scores) }?;
+        // SAFETY: validated non-null above.
+        unsafe { *out_count = matches.len() };
+        Ok(())
+    })
+}
+
+/// Runs `n_queries` searches in one call. `queries` holds the queries back to
+/// back (`n_queries * dim` floats). Query `i` writes up to `k` results at
+/// `out_ids[i * k..]` / `out_scores[i * k..]` and its count at
+/// `out_counts[i]`. Free each query's ids with [`phoenix_free_string_array`]
+/// using its own count.
+///
+/// # Safety
+/// `queries` must be readable for `n_queries * dim` floats; `out_ids` and
+/// `out_scores` writable for `n_queries * k` elements; `out_counts` for
+/// `n_queries`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn phoenix_vector_search_batch(
+    handle: *const PhoenixVectorHandle,
+    queries: *const f32,
+    n_queries: usize,
+    dim: usize,
+    k: usize,
+    ef: usize,
+    out_ids: *mut *mut c_char,
+    out_scores: *mut f32,
+    out_counts: *mut usize,
+) -> c_int {
+    guard(|| {
+        if out_counts.is_null() || out_ids.is_null() || out_scores.is_null() {
+            return Err(Error::invalid("output arrays must not be null"));
+        }
+        if n_queries == 0 {
+            return Ok(());
+        }
+        if n_queries > 65_536 {
+            return Err(Error::invalid("at most 65536 queries per batch"));
+        }
+        for i in 0..n_queries {
+            // SAFETY: the caller guarantees `n_queries` writable counts.
+            unsafe { *out_counts.add(i) = 0 };
+        }
+        if k == 0 || k > MAX_SEARCH_K {
+            return Err(Error::invalid(format!("k must be in 1..={MAX_SEARCH_K}")));
+        }
+        // SAFETY: see `phoenix_vector_insert`.
+        let engine = unsafe { PhoenixVectorHandle::validate(handle) }?;
+        if dim != engine.dim() {
+            return Err(Error::invalid(format!(
+                "queries have {dim} dimension(s), index expects {}",
+                engine.dim()
+            )));
+        }
+        let total = n_queries
+            .checked_mul(dim)
+            .ok_or_else(|| Error::invalid("batch size overflows"))?;
+        if queries.is_null() || !(queries as usize).is_multiple_of(std::mem::align_of::<f32>()) {
+            return Err(Error::invalid(
+                "queries must be a non-null, aligned f32 buffer",
+            ));
+        }
+        // SAFETY: non-null, aligned; extent is the caller's obligation.
+        let flat = unsafe { std::slice::from_raw_parts(queries, total) };
+        let views: Vec<&[f32]> = flat.chunks_exact(dim).collect();
+        let results = engine.search_batch(&views, k, (ef > 0).then_some(ef))?;
+        for (i, matches) in results.iter().enumerate() {
+            // SAFETY: slot `i` spans `k` elements inside the caller's arrays.
+            unsafe { publish_matches(matches, out_ids.add(i * k), out_scores.add(i * k)) }?;
+            // SAFETY: `i < n_queries`.
+            unsafe { *out_counts.add(i) = matches.len() };
+        }
         Ok(())
     })
 }
