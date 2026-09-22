@@ -27,6 +27,7 @@
 //! in a single session. Tests depend on this.
 
 use crate::error::{Error, Result};
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::collections::BinaryHeap;
 
@@ -222,6 +223,36 @@ impl VisitSet {
     }
 }
 
+/// Reusable visited sets for queries.
+///
+/// A query holds only `&self`, so it cannot borrow the build-time scratch
+/// set. Allocating a fresh `VisitSet` per query costs an `O(N)` zeroed
+/// allocation — for a million-node graph, 4 MiB cleared per search, which
+/// turned an `O(log N)` search into an `O(N)` one. Queries check a set out of
+/// this pool and return it, so steady-state searches allocate nothing.
+#[derive(Debug, Default)]
+struct VisitPool(Mutex<Vec<VisitSet>>);
+
+impl VisitPool {
+    fn take(&self) -> VisitSet {
+        self.0.lock().pop().unwrap_or_default()
+    }
+
+    fn give(&self, set: VisitSet) {
+        let mut pool = self.0.lock();
+        // Bounded by the number of concurrent searches worth keeping warm.
+        if pool.len() < 16 {
+            pool.push(set);
+        }
+    }
+}
+
+impl Clone for VisitPool {
+    fn clone(&self) -> Self {
+        VisitPool::default() // an allocation cache has nothing to copy
+    }
+}
+
 /// The navigable small-world graph.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HnswGraph {
@@ -240,6 +271,9 @@ pub struct HnswGraph {
     /// node for nothing.
     #[serde(skip)]
     scratch: VisitSet,
+    /// Visited sets lent to concurrent queries.
+    #[serde(skip)]
+    query_sets: VisitPool,
 }
 
 impl HnswGraph {
@@ -253,6 +287,7 @@ impl HnswGraph {
             entry: None,
             max_level: 0,
             scratch: VisitSet::default(),
+            query_sets: VisitPool::default(),
         })
     }
 
@@ -429,6 +464,21 @@ impl HnswGraph {
         source: &D,
         visited: &mut VisitSet,
     ) -> Vec<Candidate> {
+        self.search_layer_where(entry_points, ef, layer, source, visited, &|_| true)
+    }
+
+    /// [`HnswGraph::search_layer`] with an extra result predicate: nodes for
+    /// which `accept` is false are traversed like tombstones (the topology
+    /// stays connected) but never returned.
+    fn search_layer_where<D: DistanceSource>(
+        &self,
+        entry_points: &[u32],
+        ef: usize,
+        layer: usize,
+        source: &D,
+        visited: &mut VisitSet,
+        accept: &dyn Fn(u32) -> bool,
+    ) -> Vec<Candidate> {
         visited.begin(self.nodes.len());
         // Frontier: nearest-first, drives expansion.
         let mut frontier: BinaryHeap<Nearest> = BinaryHeap::new();
@@ -444,7 +494,7 @@ impl HnswGraph {
                 id: entry,
             };
             frontier.push(Nearest(candidate));
-            if !source.is_deleted(entry) {
+            if !source.is_deleted(entry) && accept(entry) {
                 results.push(candidate);
             }
         }
@@ -452,12 +502,11 @@ impl HnswGraph {
         while let Some(Nearest(current)) = frontier.pop() {
             // Stop as soon as the frontier's best is worse than the result
             // set's worst: nothing reachable from here can improve the answer.
-            if results.len() >= ef {
-                if let Some(worst) = results.peek() {
-                    if current.distance > worst.distance {
-                        break;
-                    }
-                }
+            if results.len() >= ef
+                && let Some(worst) = results.peek()
+                && current.distance > worst.distance
+            {
+                break;
             }
             for &neighbour in self.links_at(current.id, layer) {
                 if neighbour as usize >= self.nodes.len() || !visited.visit(neighbour) {
@@ -471,7 +520,7 @@ impl HnswGraph {
                         id: neighbour,
                     };
                     frontier.push(Nearest(candidate));
-                    if !source.is_deleted(neighbour) {
+                    if !source.is_deleted(neighbour) && accept(neighbour) {
                         results.push(candidate);
                         if results.len() > ef {
                             results.pop(); // drop the furthest
@@ -602,6 +651,20 @@ impl HnswGraph {
         ef: Option<usize>,
         source: &D,
     ) -> Vec<(u32, f32)> {
+        self.search_where(k, ef, source, &|_| true)
+    }
+
+    /// Like [`HnswGraph::search`], returning only nodes for which `accept`
+    /// holds. Rejected nodes are still traversed, so a selective filter can
+    /// return fewer than `k` results; callers fall back to an exact scan of
+    /// the accepted set when that matters.
+    pub fn search_where<D: DistanceSource>(
+        &self,
+        k: usize,
+        ef: Option<usize>,
+        source: &D,
+        accept: &dyn Fn(u32) -> bool,
+    ) -> Vec<(u32, f32)> {
         if k == 0 || self.nodes.is_empty() {
             return Vec::new();
         }
@@ -621,14 +684,40 @@ impl HnswGraph {
             layer -= 1;
         }
 
-        // A query holds only `&self`, so the visited set is local here rather
-        // than reusing `self.scratch`. That is one allocation per *query*
-        // instead of one per layer per insert, which is not on the hot path
-        // the build profile identified.
-        let mut visited = VisitSet::default();
-        let mut found = self.search_layer(&[current], ef, 0, source, &mut visited);
+        let mut visited = self.query_sets.take();
+        let mut found = self.search_layer_where(&[current], ef, 0, source, &mut visited, accept);
+        self.query_sets.give(visited);
         found.truncate(k);
         found.into_iter().map(|c| (c.id, c.distance)).collect()
+    }
+
+    /// Exact `k` nearest among `ids` (live ones only), `O(|ids|)`.
+    ///
+    /// The right tool when a filter selects a small subset: scanning it is
+    /// both exact and cheaper than steering a graph walk around everything
+    /// the filter rejects.
+    pub fn brute_force_among<D: DistanceSource>(
+        &self,
+        k: usize,
+        ids: &[u32],
+        source: &D,
+    ) -> Vec<(u32, f32)> {
+        let mut heap: BinaryHeap<Candidate> = BinaryHeap::with_capacity(k + 1);
+        for &id in ids {
+            if id as usize >= self.nodes.len() || source.is_deleted(id) {
+                continue;
+            }
+            heap.push(Candidate {
+                distance: source.to_query(id),
+                id,
+            });
+            if heap.len() > k {
+                heap.pop();
+            }
+        }
+        let mut out = heap.into_vec();
+        out.sort_unstable();
+        out.into_iter().map(|c| (c.id, c.distance)).collect()
     }
 
     /// Exhaustively scans every live node — the exact answer, `O(N)`.
@@ -637,9 +726,19 @@ impl HnswGraph {
     /// approximation would be the only source of error, and by tests as the
     /// recall oracle.
     pub fn brute_force<D: DistanceSource>(&self, k: usize, source: &D) -> Vec<(u32, f32)> {
+        self.brute_force_where(k, source, &|_| true)
+    }
+
+    /// Exact `k` nearest among live nodes for which `accept` holds.
+    pub fn brute_force_where<D: DistanceSource>(
+        &self,
+        k: usize,
+        source: &D,
+        accept: &dyn Fn(u32) -> bool,
+    ) -> Vec<(u32, f32)> {
         let mut heap: BinaryHeap<Candidate> = BinaryHeap::with_capacity(k + 1);
         for id in 0..self.nodes.len() as u32 {
-            if source.is_deleted(id) {
+            if source.is_deleted(id) || !accept(id) {
                 continue;
             }
             heap.push(Candidate {
