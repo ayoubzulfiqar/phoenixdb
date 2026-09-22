@@ -1,30 +1,32 @@
 //! SQL abstract syntax tree.
 //!
-//! Deliberately small: the statements the design directive names
-//! (`CREATE TABLE`, `INSERT INTO`, `SELECT ... WHERE`, `UPDATE`), plus
-//! `DELETE` and `DROP TABLE` because they fall out of the same grammar for
-//! almost no extra code.
+//! Covers `CREATE TABLE`, `DROP TABLE`, `INSERT`, `SELECT` (with `WHERE`,
+//! `GROUP BY`, aggregates, multi-column `ORDER BY`, `LIMIT`/`OFFSET`),
+//! `UPDATE` and `DELETE`.
 //!
 //! Values are typed at parse time rather than kept as strings, so the executor
 //! never re-parses and a type error surfaces before any storage work happens.
+//! Bound parameters (`?`, `?N`) stay symbolic in the tree and are resolved by
+//! the executor against the caller's parameter list, so user data never has
+//! to be spliced into SQL text.
 
 use std::fmt;
 
-/// A literal value appearing in a statement.
+/// A literal value.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
     /// Text.
     Text(String),
     /// 64-bit signed integer.
     Integer(i64),
-    /// Double-precision float.
+    /// Double-precision float (always finite).
     Float(f64),
     /// SQL `NULL`.
     Null,
 }
 
 impl Value {
-    /// Name of this value's type, for error messages.
+    /// Short type label for messages.
     #[must_use]
     pub fn type_name(&self) -> &'static str {
         match self {
@@ -35,7 +37,7 @@ impl Value {
         }
     }
 
-    /// Renders the value the way it is stored in a row.
+    /// Text form used for display.
     #[must_use]
     pub fn to_storage_string(&self) -> String {
         match self {
@@ -50,15 +52,15 @@ impl Value {
 impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Value::Text(s) => write!(f, "'{s}'"),
+            Value::Text(s) => write!(f, "'{}'", s.replace('\'', "''")),
             Value::Integer(i) => write!(f, "{i}"),
-            Value::Float(x) => write!(f, "{x}"),
+            Value::Float(x) => write!(f, "{x:?}"),
             Value::Null => write!(f, "NULL"),
         }
     }
 }
 
-/// A comparison operator in a `WHERE` clause.
+/// A binary comparison.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ComparisonOp {
     /// `=`
@@ -76,7 +78,7 @@ pub enum ComparisonOp {
 }
 
 impl ComparisonOp {
-    /// SQL spelling of the operator.
+    /// The operator's SQL spelling.
     #[must_use]
     pub fn symbol(&self) -> &'static str {
         match self {
@@ -90,117 +92,243 @@ impl ComparisonOp {
     }
 }
 
-/// A single `column <op> value` predicate.
+/// A scalar or boolean expression.
 #[derive(Debug, Clone, PartialEq)]
-pub struct Predicate {
-    /// Column being tested.
-    pub column: String,
-    /// Comparison to apply.
-    pub op: ComparisonOp,
-    /// Value to compare against.
-    pub value: Value,
+pub enum Expr {
+    /// A literal.
+    Literal(Value),
+    /// A column reference.
+    Column(String),
+    /// A bound parameter, as a 0-based index into the parameter list.
+    Param(usize),
+    /// `left op right`.
+    Compare {
+        /// Left operand.
+        left: Box<Expr>,
+        /// Operator.
+        op: ComparisonOp,
+        /// Right operand.
+        right: Box<Expr>,
+    },
+    /// `left AND right`.
+    And(Box<Expr>, Box<Expr>),
+    /// `left OR right`.
+    Or(Box<Expr>, Box<Expr>),
+    /// `NOT expr`.
+    Not(Box<Expr>),
+    /// `expr IS [NOT] NULL`.
+    IsNull {
+        /// Tested expression.
+        expr: Box<Expr>,
+        /// `IS NOT NULL`.
+        negated: bool,
+    },
+    /// `expr [NOT] IN (list…)`.
+    InList {
+        /// Tested expression.
+        expr: Box<Expr>,
+        /// Candidate values.
+        list: Vec<Expr>,
+        /// `NOT IN`.
+        negated: bool,
+    },
+    /// `expr [NOT] BETWEEN low AND high` (inclusive).
+    Between {
+        /// Tested expression.
+        expr: Box<Expr>,
+        /// Lower bound.
+        low: Box<Expr>,
+        /// Upper bound.
+        high: Box<Expr>,
+        /// `NOT BETWEEN`.
+        negated: bool,
+    },
+    /// `expr [NOT] LIKE|ILIKE pattern`, with `%` and `_` wildcards.
+    Like {
+        /// Tested expression.
+        expr: Box<Expr>,
+        /// Pattern.
+        pattern: Box<Expr>,
+        /// `NOT LIKE`.
+        negated: bool,
+        /// `ILIKE`: case-insensitive.
+        case_insensitive: bool,
+    },
 }
 
-/// A `WHERE` clause: predicates joined by `AND` or `OR`.
-///
-/// Mixed `AND`/`OR` without parentheses is rejected by the parser rather than
-/// silently guessing a precedence, which is the kind of ambiguity that produces
-/// wrong answers instead of errors.
-#[derive(Debug, Clone, PartialEq)]
-pub enum WhereClause {
-    /// A single predicate.
-    Single(Predicate),
-    /// Every predicate must hold.
-    And(Vec<Predicate>),
-    /// At least one predicate must hold.
-    Or(Vec<Predicate>),
-}
-
-impl WhereClause {
-    /// Every predicate in the clause, regardless of connective.
-    #[must_use]
-    pub fn predicates(&self) -> &[Predicate] {
+impl Expr {
+    /// Every column this expression references.
+    pub fn columns(&self, out: &mut Vec<String>) {
         match self {
-            WhereClause::Single(p) => std::slice::from_ref(p),
-            WhereClause::And(v) | WhereClause::Or(v) => v.as_slice(),
+            Expr::Column(c) => out.push(c.clone()),
+            Expr::Literal(_) | Expr::Param(_) => {}
+            Expr::Compare { left, right, .. } | Expr::And(left, right) | Expr::Or(left, right) => {
+                left.columns(out);
+                right.columns(out);
+            }
+            Expr::Not(e) | Expr::IsNull { expr: e, .. } => e.columns(out),
+            Expr::InList { expr, list, .. } => {
+                expr.columns(out);
+                for e in list {
+                    e.columns(out);
+                }
+            }
+            Expr::Between {
+                expr, low, high, ..
+            } => {
+                expr.columns(out);
+                low.columns(out);
+                high.columns(out);
+            }
+            Expr::Like { expr, pattern, .. } => {
+                expr.columns(out);
+                pattern.columns(out);
+            }
         }
     }
 }
 
-/// One column in a `CREATE TABLE`.
+/// An aggregate function.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AggFunc {
+    /// `COUNT`
+    Count,
+    /// `SUM`
+    Sum,
+    /// `AVG`
+    Avg,
+    /// `MIN`
+    Min,
+    /// `MAX`
+    Max,
+}
+
+impl AggFunc {
+    /// Lower-case SQL name.
+    #[must_use]
+    pub fn name(&self) -> &'static str {
+        match self {
+            AggFunc::Count => "count",
+            AggFunc::Sum => "sum",
+            AggFunc::Avg => "avg",
+            AggFunc::Min => "min",
+            AggFunc::Max => "max",
+        }
+    }
+}
+
+/// One entry of a `SELECT` list.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SelectItem {
+    /// `*`
+    Wildcard,
+    /// A column, with an optional `AS alias`.
+    Column {
+        /// Column name.
+        name: String,
+        /// Output name.
+        alias: Option<String>,
+    },
+    /// An aggregate: `COUNT(*)` (`column == None`), `SUM(col)`, ...
+    Aggregate {
+        /// Function.
+        func: AggFunc,
+        /// Argument column; `None` for `COUNT(*)`.
+        column: Option<String>,
+        /// `COUNT(DISTINCT col)` etc.
+        distinct: bool,
+        /// Output name.
+        alias: Option<String>,
+    },
+}
+
+/// One `ORDER BY` key.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OrderItem {
+    /// Output column name, alias or table column.
+    pub column: String,
+    /// Descending.
+    pub desc: bool,
+}
+
+/// A column definition in `CREATE TABLE`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ColumnDef {
     /// Column name.
     pub name: String,
-    /// Declared type, uppercased. Advisory: storage is schemaless.
+    /// Declared type (advisory), e.g. `INTEGER`, `VARCHAR(255)`.
     pub data_type: String,
-    /// Whether the column carries `PRIMARY KEY`.
+    /// `PRIMARY KEY`.
     pub primary_key: bool,
-    /// Whether the column carries `NOT NULL`.
+    /// `NOT NULL`.
     pub not_null: bool,
 }
 
-/// A parsed SQL statement.
+/// A parsed statement.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Statement {
-    /// `CREATE TABLE name (cols…)`
+    /// `CREATE TABLE [IF NOT EXISTS] t (...)`
     CreateTable {
         /// Table name.
         table: String,
-        /// Column definitions, in declaration order.
+        /// Columns.
         columns: Vec<ColumnDef>,
-        /// Whether `IF NOT EXISTS` was given.
+        /// `IF NOT EXISTS`.
         if_not_exists: bool,
     },
-    /// `DROP TABLE name`
+    /// `DROP TABLE [IF EXISTS] t`
     DropTable {
         /// Table name.
         table: String,
-        /// Whether `IF EXISTS` was given.
+        /// `IF EXISTS`.
         if_exists: bool,
     },
-    /// `INSERT INTO name (cols…) VALUES (…), (…)`
+    /// `INSERT INTO t [(cols)] VALUES (...), ...`
     Insert {
-        /// Target table.
+        /// Table name.
         table: String,
-        /// Target columns; empty means "every column, in declaration order".
+        /// Named columns; empty means every column in order.
         columns: Vec<String>,
-        /// One `Vec<Value>` per row.
-        rows: Vec<Vec<Value>>,
+        /// Rows of literal or parameter expressions.
+        rows: Vec<Vec<Expr>>,
     },
-    /// `SELECT cols FROM name WHERE … ORDER BY … LIMIT …`
+    /// `SELECT ... FROM t [WHERE] [GROUP BY] [ORDER BY] [LIMIT] [OFFSET]`
     Select {
-        /// Table to read.
+        /// Table name.
         table: String,
-        /// Projection; empty means `*`.
-        columns: Vec<String>,
-        /// Optional filter.
-        filter: Option<WhereClause>,
-        /// Optional `(column, descending)` ordering.
-        order_by: Option<(String, bool)>,
-        /// Optional row cap.
+        /// Select list.
+        items: Vec<SelectItem>,
+        /// `WHERE` condition.
+        filter: Option<Expr>,
+        /// `GROUP BY` columns.
+        group_by: Vec<String>,
+        /// `ORDER BY` keys, most significant first.
+        order_by: Vec<OrderItem>,
+        /// `LIMIT`.
         limit: Option<usize>,
+        /// `OFFSET`.
+        offset: Option<usize>,
     },
-    /// `UPDATE name SET col = val, … WHERE …`
+    /// `UPDATE t SET col = expr, ... [WHERE]`
     Update {
-        /// Table to modify.
+        /// Table name.
         table: String,
-        /// Assignments, in statement order.
-        assignments: Vec<(String, Value)>,
-        /// Optional filter; `None` updates every row.
-        filter: Option<WhereClause>,
+        /// Assignments of literal or parameter expressions.
+        assignments: Vec<(String, Expr)>,
+        /// `WHERE` condition.
+        filter: Option<Expr>,
     },
-    /// `DELETE FROM name WHERE …`
+    /// `DELETE FROM t [WHERE]`
     Delete {
-        /// Table to delete from.
+        /// Table name.
         table: String,
-        /// Optional filter; `None` deletes every row.
-        filter: Option<WhereClause>,
+        /// `WHERE` condition.
+        filter: Option<Expr>,
     },
 }
 
 impl Statement {
-    /// The table this statement operates on.
+    /// The table the statement targets.
     #[must_use]
     pub fn table(&self) -> &str {
         match self {
@@ -213,16 +341,13 @@ impl Statement {
         }
     }
 
-    /// True when the statement modifies data or schema.
-    ///
-    /// Used by the executor to pick a read-only or read-write transaction, and
-    /// by RBAC to choose between the read and write permissions.
+    /// True for statements that write.
     #[must_use]
     pub fn is_mutation(&self) -> bool {
         !matches!(self, Statement::Select { .. })
     }
 
-    /// A short name for tracing spans and audit records.
+    /// Short statement kind, for logs and metrics.
     #[must_use]
     pub fn kind_name(&self) -> &'static str {
         match self {
