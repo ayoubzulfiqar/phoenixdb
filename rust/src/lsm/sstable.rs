@@ -200,10 +200,10 @@ impl SSTableWriter {
     /// Creates a writer for a table expected to hold `expected_keys` distinct keys.
     pub fn create(path: impl AsRef<Path>, expected_keys: usize) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent)?;
-            }
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent)?;
         }
         let file = File::create(&path)?;
         Ok(SSTableWriter {
@@ -235,18 +235,18 @@ impl SSTableWriter {
     /// Returns [`Error::InvalidArgument`] on an out-of-order key rather than
     /// silently producing a table whose index lies about its contents.
     pub fn append(&mut self, key: &InternalKey, slot: &ValueSlot) -> Result<()> {
-        if let Some(last) = &self.last_user_key {
-            if key.user_key < *last {
-                return Err(Error::invalid(format!(
-                    "sstable entries must be sorted: {:?} follows {:?}",
-                    key.user_key, last
-                )));
-            }
+        if let Some(last) = &self.last_user_key
+            && key.user_key < *last
+        {
+            return Err(Error::invalid(format!(
+                "sstable entries must be sorted: {:?} follows {:?}",
+                key.user_key, last
+            )));
         }
         let is_new_key = self.last_user_key.as_deref() != Some(key.user_key.as_slice());
         if is_new_key {
             // One index restart point every RESTART_INTERVAL distinct keys.
-            if self.distinct_keys % RESTART_INTERVAL as u64 == 0 {
+            if self.distinct_keys.is_multiple_of(RESTART_INTERVAL as u64) {
                 self.index.push((key.user_key.clone(), self.data_bytes));
             }
             self.bloom.insert(&key.user_key);
@@ -306,6 +306,9 @@ impl SSTableWriter {
 
         self.writer.flush()?;
         self.writer.get_ref().sync_all()?;
+        // The manifest will reference this file next; its directory entry
+        // must be durable first or a power cut can leave a dangling name.
+        crate::fsutil::sync_parent_dir(&self.path);
 
         let file_bytes = index_offset + index_buf.len() as u64 + FOOTER_LEN as u64;
         Ok(TableMeta {
