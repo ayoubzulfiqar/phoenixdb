@@ -87,6 +87,13 @@ jobs:
           cargo test --lib "vector::" -- --nocapture
           cargo test --test vector_ffi_safety
 
+      # The fuzz targets are a separate crate that `cargo test` never builds,
+      # so an API change could silently break them (one did). Type-checking
+      # them is cheap and needs no nightly toolchain.
+      - name: fuzz targets compile
+        working-directory: rust/fuzz
+        run: cargo check --bins
+
       - name: build native library for Dart tests
         working-directory: rust
         run: cargo build --release --lib --features sql
