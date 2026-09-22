@@ -25,19 +25,34 @@
 //! # Durability
 //!
 //! Appends are WAL-style: the record is written positionally at the end of the
-//! file and the header's `count` is only bumped *after* the record bytes are
-//! durable. A crash between the two leaves a complete record the header does
-//! not yet claim — invisible, and overwritten by the next append. The record's
-//! own CRC32 catches a torn write within a record.
+//! file and the header's `count` is bumped afterwards. With `sync_now` the
+//! record is `fsync`ed before the header is written, so the header never
+//! claims a record that is not on disk. Without it, durability is deferred to
+//! [`VectorStore::sync`]; a crash can then leave the unsynced tail torn, which
+//! the record CRC detects and [`VectorStore::truncate_to`] cuts off — nothing
+//! after the first torn record can have been synced, so no durable record is
+//! ever dropped.
 //!
 //! Deletion is a tombstone flag written in place; the record's bytes stay, so
 //! ids in the graph never shift.
+//!
+//! # Growth
+//!
+//! The file grows geometrically and the mapping covers the whole allocated
+//! capacity, so an append costs one positional write rather than a remap of
+//! the entire file (which made a bulk load quadratic). Unused capacity past
+//! `count` is never read.
+//!
+//! # Locking
+//!
+//! The file is locked exclusively while open, so two engines can never append
+//! to (and corrupt) one store.
 
 use crate::error::{Error, Result};
+use crate::fsutil::{lock_exclusive, read_at, write_at};
 use crate::mmap::Mmap;
 use crate::vector::distance::{Metric, validate_dim};
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 /// "PHNXVEC1" — identifies a vector store and its layout generation.
@@ -75,13 +90,16 @@ pub struct VectorRecord {
 /// Append-only, memory-mapped vector file.
 pub struct VectorStore {
     path: PathBuf,
-    file: File,
+    /// `None` only after [`VectorStore::close`].
+    file: Option<File>,
     map: Mmap,
     dim: usize,
     metric: Metric,
     stride: usize,
     /// Records the header claims are durable.
     count: usize,
+    /// Records the file (and the mapping) has room for.
+    capacity: usize,
     /// Bytes appended since the last `sync`.
     dirty_bytes: u64,
 }
@@ -98,7 +116,8 @@ impl VectorStore {
     ///
     /// An existing file whose `dim` or `metric` disagrees with the arguments is
     /// rejected rather than reinterpreted: silently reading 768-float records
-    /// as 1536-float ones would produce plausible-looking garbage.
+    /// as 1536-float ones would produce plausible-looking garbage. A file
+    /// already open elsewhere fails with [`Error::Busy`].
     pub fn open(path: impl AsRef<Path>, dim: usize, metric: Metric) -> Result<Self> {
         validate_dim(dim)?;
         let path = path.as_ref().to_path_buf();
@@ -108,22 +127,23 @@ impl VectorStore {
             std::fs::create_dir_all(parent)?;
         }
 
-        let mut file = OpenOptions::new()
+        let file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
             .open(&path)?;
+        lock_exclusive(&file, &path)?;
 
         let stride = Self::stride_for(dim);
         let len = file.metadata()?.len();
 
-        let count = if len == 0 {
-            Self::write_header(&mut file, dim, metric, 0)?;
+        let (count, capacity) = if len == 0 {
+            Self::write_header(&file, dim, metric, 0)?;
             file.sync_all()?;
-            0
+            (0, 0)
         } else {
-            let (stored_dim, stored_metric, stored_count) = Self::read_header(&mut file)?;
+            let (stored_dim, stored_metric, stored_count) = Self::read_header(&file)?;
             if stored_dim != dim {
                 return Err(Error::invalid(format!(
                     "vector store at {} holds {stored_dim}-dimensional vectors, not {dim}",
@@ -142,22 +162,25 @@ impl VectorStore {
             // more than the file can hold: that is the crash-between-write-
             // and-header case, and the shorter count is the safe reading.
             let capacity = (len as usize).saturating_sub(HEADER_LEN) / stride;
-            stored_count.min(capacity)
+            (stored_count.min(capacity), capacity)
         };
 
-        let mapped_len = HEADER_LEN + count * stride;
-        let map = Mmap::map(&file, mapped_len)?;
-
+        let map = Mmap::map(&file, HEADER_LEN + capacity * stride)?;
         Ok(VectorStore {
             path,
-            file,
+            file: Some(file),
             map,
             dim,
             metric,
             stride,
             count,
+            capacity,
             dirty_bytes: 0,
         })
+    }
+
+    fn file(&self) -> Result<&File> {
+        self.file.as_ref().ok_or(Error::Closed)
     }
 
     /// Path of the backing file.
@@ -201,22 +224,19 @@ impl VectorStore {
         self.dirty_bytes
     }
 
-    fn write_header(file: &mut File, dim: usize, metric: Metric, count: u64) -> Result<()> {
+    fn write_header(file: &File, dim: usize, metric: Metric, count: u64) -> Result<()> {
         let mut header = [0u8; HEADER_LEN];
         header[0..8].copy_from_slice(&VECTOR_MAGIC.to_le_bytes());
         header[8..12].copy_from_slice(&VECTOR_FORMAT_VERSION.to_le_bytes());
         header[12..16].copy_from_slice(&(dim as u32).to_le_bytes());
         header[16] = metric.as_u8();
         header[20..28].copy_from_slice(&count.to_le_bytes());
-        file.seek(SeekFrom::Start(0))?;
-        file.write_all(&header)?;
-        Ok(())
+        write_at(file, &header, 0)
     }
 
-    fn read_header(file: &mut File) -> Result<(usize, Metric, usize)> {
+    fn read_header(file: &File) -> Result<(usize, Metric, usize)> {
         let mut header = [0u8; HEADER_LEN];
-        file.seek(SeekFrom::Start(0))?;
-        file.read_exact(&mut header).map_err(|e| {
+        read_at(file, &mut header, 0).map_err(|e| {
             Error::corrupt(format!(
                 "vector store header is shorter than {HEADER_LEN} bytes: {e}"
             ))
@@ -239,6 +259,26 @@ impl VectorStore {
         let metric = Metric::from_u8(header[16])?;
         let count = u64::from_le_bytes(header[20..28].try_into().unwrap_or_default()) as usize;
         Ok((dim, metric, count))
+    }
+
+    /// Makes room for at least one more record, growing geometrically.
+    fn reserve_one(&mut self) -> Result<()> {
+        if self.count < self.capacity {
+            return Ok(());
+        }
+        // Double, but by at most ~1 GiB per step so huge-dimensional stores
+        // do not over-allocate wildly, and by at least 64 records.
+        let max_step = ((1usize << 30) / self.stride).max(1);
+        let step = self.capacity.clamp(64, max_step.max(64));
+        let capacity = self
+            .capacity
+            .checked_add(step)
+            .ok_or_else(|| Error::Full("vector store capacity overflow".into()))?;
+        let bytes = HEADER_LEN as u64 + capacity as u64 * self.stride as u64;
+        self.file()?.set_len(bytes)?;
+        self.map = Mmap::map(self.file()?, bytes as usize)?;
+        self.capacity = capacity;
+        Ok(())
     }
 
     /// Appends a record and returns its ordinal, which is also its graph id.
@@ -266,6 +306,7 @@ impl VectorStore {
         }
         let ordinal = u32::try_from(self.count)
             .map_err(|_| Error::Full("vector store exceeded 2^32 records".to_string()))?;
+        self.reserve_one()?;
 
         let mut record = vec![0u8; self.stride];
         record[4..8].copy_from_slice(&(id_bytes.len() as u32).to_le_bytes());
@@ -282,23 +323,21 @@ impl VectorStore {
         record[8..12].copy_from_slice(&crc.to_le_bytes());
 
         let offset = (HEADER_LEN + self.count * self.stride) as u64;
-        self.file.seek(SeekFrom::Start(offset))?;
-        self.file.write_all(&record)?;
+        write_at(self.file()?, &record, offset)?;
         self.dirty_bytes += self.stride as u64;
 
-        // Record bytes first, then the header: a crash in between leaves an
-        // orphan record rather than a header pointing at nothing.
+        // Record bytes first, then the header: with `sync_now` a crash in
+        // between leaves an orphan record rather than a header pointing at
+        // nothing.
         if sync_now {
-            self.file.sync_data()?;
+            self.file()?.sync_data()?;
         }
         self.count += 1;
-        Self::write_header(&mut self.file, self.dim, self.metric, self.count as u64)?;
+        Self::write_header(self.file()?, self.dim, self.metric, self.count as u64)?;
         if sync_now {
-            self.file.sync_all()?;
+            self.file()?.sync_data()?;
             self.dirty_bytes = 0;
         }
-
-        self.remap()?;
         Ok(ordinal)
     }
 
@@ -309,18 +348,32 @@ impl VectorStore {
             return Err(Error::NotFound);
         }
         let offset = (HEADER_LEN + index * self.stride) as u64;
-        self.file.seek(SeekFrom::Start(offset))?;
-        self.file.write_all(&[FLAG_DELETED])?;
+        // The flag byte lies outside the CRC-covered range, so flipping it in
+        // place never invalidates the record's checksum.
+        write_at(self.file()?, &[FLAG_DELETED], offset)?;
         self.dirty_bytes += 1;
-        self.remap()?;
         Ok(())
     }
 
-    /// Re-establishes the mapping after the file grew or changed.
-    fn remap(&mut self) -> Result<()> {
-        let mapped_len = HEADER_LEN + self.count * self.stride;
-        self.file.flush()?;
-        self.map.remap(&self.file, mapped_len)
+    /// Forgets every record from `count` on (a torn, never-synced tail found
+    /// by recovery). The bytes stay until the next append overwrites them.
+    pub fn truncate_to(&mut self, count: usize) -> Result<()> {
+        if count >= self.count {
+            return Ok(());
+        }
+        self.count = count;
+        Self::write_header(self.file()?, self.dim, self.metric, count as u64)?;
+        self.file()?.sync_data()?;
+        Ok(())
+    }
+
+    /// Releases the mapping and the file (and its lock), e.g. so the file can
+    /// be replaced. Every later operation fails with [`Error::Closed`].
+    pub fn close(&mut self) {
+        self.map = Mmap::empty();
+        self.file = None;
+        self.count = 0;
+        self.capacity = 0;
     }
 
     /// Borrows record `ordinal`'s vector directly out of the mapping.
@@ -458,8 +511,7 @@ impl VectorStore {
 
     /// Forces every buffered write to stable storage.
     pub fn sync(&mut self) -> Result<()> {
-        self.file.flush()?;
-        self.file.sync_all()?;
+        self.file()?.sync_all()?;
         self.dirty_bytes = 0;
         Ok(())
     }
@@ -479,6 +531,7 @@ impl std::fmt::Debug for VectorStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Seek, SeekFrom, Write};
 
     fn temp_store(dim: usize) -> (tempfile::TempDir, VectorStore) {
         let dir = tempfile::tempdir().unwrap();
