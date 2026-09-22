@@ -5,6 +5,76 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 4.0.0 - 2026-09-22
+
+A hardening release for every engine, plus document collections with hybrid
+search and an AI toolkit for on-device retrieval-augmented generation.
+
+### Breaking
+
+- **Native ABI 4.** The Dart package requires a v4 native library; the loader
+  checks the version before binding symbols and keeps searching past stale
+  libraries.
+- **Exclusive file locks.** A database, vector index or collection opened by
+  another *process* now fails with the new status `-11` (busy). Opens within
+  one process share the running engine, so multiple isolates and Flutter hot
+  restart keep working.
+- **SQL is stricter:** reserved words and duplicate column names are
+  rejected, `PRIMARY KEY` is enforced, and `= NULL` means `IS NULL`.
+- Rust: `Database::open` takes an `Options` struct; tree read APIs take
+  `&Pager`. MSRV is 1.89.
+
+### Added
+
+- **Document collections** (`PhoenixCollection`, `AsyncPhoenixCollection`):
+  text, JSON metadata and embeddings in one store, searched together with
+  HNSW vector similarity, BM25 full text (Unicode tokenizer with CJK bigrams),
+  MongoDB-style metadata filters served from an index (`Filter` DSL with `&`,
+  `|`, `~`), Reciprocal Rank Fusion or weighted fusion, and MMR
+  diversification. Upserts are atomic and crash-safe. New C entry points
+  `phoenix_collection_*`.
+- **AI toolkit** (`package:phoenixdb/ai.dart`): `AnthropicChatModel` (Claude
+  via the Messages API — streaming, adaptive thinking, prompt caching,
+  server-side refusal fallbacks), `OpenAICompatibleChatModel` (OpenAI,
+  Ollama, Gemini, vLLM, LM Studio, …), `OpenAICompatibleEmbedder` (OpenAI,
+  Voyage AI, Ollama), `HashingEmbedder`, a persistent `CachedEmbedder`,
+  `TextChunker`, `RagPipeline` with cited answers, `SemanticCache` and
+  `ConversationMemory`. No new dependencies.
+- **Key/value:** `PhoenixOptions`, ordered range and prefix scans
+  (`scan`, `scanPrefix`, lazy `entries`, `scanWhile`), atomic `WriteBatch`,
+  `backup`/`restore`/`compact`, `stats`, structural `check`, Prometheus
+  metrics, tracing spans, and full async parity. `PhoenixPrefs` gained
+  `getKeys`, `getAll` and `clear`.
+- **SQL:** bound parameters (`?`, `?N`), statements inside a caller's
+  transaction (`txnId:`), `NOT`/parentheses, `IN`, `BETWEEN`, `LIKE`/`ILIKE`,
+  `IS [NOT] NULL`, `COUNT`/`SUM`/`AVG`/`MIN`/`MAX` with `DISTINCT` and
+  `GROUP BY`, aliases, multi-key `ORDER BY` and `OFFSET`.
+- **Vectors:** filtered search, exact search within an id subset, batch
+  search and batch insert (`insertAll`, `searchIds`, `searchBatch`).
+
+### Fixed
+
+- **Data loss in the B+Tree:** growing a value in a full leaf deleted its
+  neighbour; large cells could wedge splits and every later checkpoint.
+- **WAL and checkpoints:** a checkpoint could strand half of an in-flight
+  transaction or truncate versions a live snapshot still needed; a torn log
+  tail hid every later commit from recovery.
+- **Torn pages:** page flushes are now journaled, so a crash cannot tear a
+  page or the meta page.
+- **Scans** returned unordered and duplicate keys.
+- **SQL** lost concurrent writes, leaked conflicted transactions, sorted
+  `ORDER BY` inconsistently, and returned floats as ints.
+- **Vector index:** `compact()` could lose every vector on a crash, a torn
+  tail made the index unopenable, bulk loads were quadratic and each search
+  was O(N).
+- **Dart:** the scan callback ABI was wrong (scans could stop at random),
+  `metricsReport` double-freed, trace events grew without bound, and async
+  workers hung forever when their isolate died.
+- **LSM** (standalone): torn or corrupt manifests could delete every
+  SSTable; compaction swaps are now atomic.
+- **Security** (standalone): RBAC fell open when emptied, the KDF input was
+  ambiguous, and audit records could carry terminal escapes or interleave.
+
 ## 3.9.6 - 2026-09-08
 
 Phase 4 observability: engine metrics are now reachable from Dart.
