@@ -33,6 +33,16 @@ item_types = ["enums", "structs", "opaque", "functions", "constants", "typedefs"
 # the Rust integration tests and fuzz targets, but they are NOT part of the C
 # ABI. Excluding them keeps the generated header stable as internals grow.
 exclude = [
+    # collection/
+    "MAX_INDEXED_VALUES",
+    "MAX_CANDIDATES",
+    "MAX_K",
+    "MAX_DOCUMENT_BYTES",
+    "MAX_INDEXED_STRING",
+    "BM25_K1",
+    "BM25_B",
+    # btree/
+    "MAX_INLINE_CELL",
     # lsm/
     "DEFAULT_BITS_PER_KEY",
     "SSTABLE_MAGIC",
