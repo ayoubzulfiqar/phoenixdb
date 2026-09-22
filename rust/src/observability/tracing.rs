@@ -91,7 +91,7 @@ impl SpanExporter for NullExporter {
 /// the oldest span is dropped.
 #[derive(Debug)]
 pub struct CollectingExporter {
-    spans: Mutex<Vec<SpanRecord>>,
+    spans: Mutex<std::collections::VecDeque<SpanRecord>>,
     capacity: usize,
 }
 
@@ -100,7 +100,7 @@ impl CollectingExporter {
     #[must_use]
     pub fn new(capacity: usize) -> Self {
         CollectingExporter {
-            spans: Mutex::new(Vec::new()),
+            spans: Mutex::new(std::collections::VecDeque::new()),
             capacity: capacity.max(1),
         }
     }
@@ -108,7 +108,7 @@ impl CollectingExporter {
     /// Snapshot of the retained spans, oldest first.
     #[must_use]
     pub fn spans(&self) -> Vec<SpanRecord> {
-        self.spans.lock().clone()
+        self.spans.lock().iter().cloned().collect()
     }
 
     /// Number of retained spans.
@@ -144,18 +144,22 @@ impl SpanExporter for CollectingExporter {
     fn export(&self, span: SpanRecord) {
         let mut spans = self.spans.lock();
         if spans.len() >= self.capacity {
-            spans.remove(0); // bounded ring: drop the oldest
+            spans.pop_front(); // bounded ring: drop the oldest, O(1)
         }
-        spans.push(span);
+        spans.push_back(span);
     }
 }
 
 /// Creates spans and routes them to an exporter.
 pub struct Tracer {
     exporter: Arc<dyn SpanExporter>,
-    next_id: AtomicU64,
     enabled: bool,
 }
+
+/// Span and trace ids are drawn from one process-wide counter, so spans from
+/// different tracers (one per database handle) never share an id and can be
+/// merged into one timeline without collisions.
+static NEXT_SPAN_ID: AtomicU64 = AtomicU64::new(1);
 
 impl Tracer {
     /// Creates a tracer exporting to `exporter`.
@@ -163,7 +167,6 @@ impl Tracer {
     pub fn new(exporter: Arc<dyn SpanExporter>) -> Self {
         Tracer {
             exporter,
-            next_id: AtomicU64::new(1),
             enabled: true,
         }
     }
@@ -173,7 +176,6 @@ impl Tracer {
     pub fn disabled() -> Self {
         Tracer {
             exporter: Arc::new(NullExporter),
-            next_id: AtomicU64::new(1),
             enabled: false,
         }
     }
@@ -186,7 +188,7 @@ impl Tracer {
 
     /// Allocates a unique id.
     fn allocate_id(&self) -> u64 {
-        self.next_id.fetch_add(1, Ordering::Relaxed)
+        NEXT_SPAN_ID.fetch_add(1, Ordering::Relaxed)
     }
 
     /// Starts a root span for a new trace.
@@ -511,5 +513,18 @@ mod tests {
         ids.sort_unstable();
         ids.dedup();
         assert_eq!(ids.len(), 400, "concurrent span ids must stay unique");
+    }
+
+    #[test]
+    fn span_ids_are_unique_across_tracers() {
+        let a_exp = Arc::new(CollectingExporter::new(8));
+        let b_exp = Arc::new(CollectingExporter::new(8));
+        let a = Tracer::new(a_exp.clone());
+        let b = Tracer::new(b_exp.clone());
+        drop(a.span("x"));
+        drop(b.span("y"));
+        let (sa, sb) = (&a_exp.spans()[0], &b_exp.spans()[0]);
+        assert_ne!(sa.span_id, sb.span_id);
+        assert_ne!(sa.trace_id, sb.trace_id);
     }
 }
