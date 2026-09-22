@@ -333,18 +333,174 @@ class PhoenixVectorDB implements Finalizable {
     }
   }
 
-  /// Inserts every entry of [vectors], keyed by id.
+  /// Inserts every entry of [vectors], keyed by id, in one native call.
   ///
-  /// Each vector is validated before any native call, so a wrong-width entry
-  /// aborts the whole batch rather than leaving it half-applied.
+  /// The whole batch is validated — here and again natively — before anything
+  /// is written, so a bad entry aborts the batch rather than leaving it
+  /// half-applied. Much faster than repeated [insert] calls for bulk loads.
   void insertAll(Map<String, Float32List> vectors) {
     _ensureOpen();
+    if (vectors.isEmpty) return;
     for (final entry in vectors.entries) {
       _checkVector(entry.value, 'vectors["${entry.key}"]');
     }
-    for (final entry in vectors.entries) {
-      insert(entry.key, entry.value);
+    final n = vectors.length;
+    final ids = calloc<Pointer<Utf8>>(n);
+    final flat = calloc<Float>(n * _dimensions);
+    var made = 0;
+    try {
+      var i = 0;
+      for (final entry in vectors.entries) {
+        ids[i] = entry.key.toNativeUtf8();
+        made++;
+        flat
+            .asTypedList(n * _dimensions)
+            .setRange(i * _dimensions, (i + 1) * _dimensions, entry.value);
+        i++;
+      }
+      final status = _b.insertBatch(_owner.pointer, ids, n, flat, _dimensions);
+      if (status != PhoenixStatus.ok) _throw(status, 'insertAll');
+    } finally {
+      for (var i = 0; i < made; i++) {
+        calloc.free(ids[i]);
+      }
+      calloc.free(ids);
+      calloc.free(flat);
     }
+  }
+
+  /// The [k] nearest neighbours of [vector] among [ids] only — typically the
+  /// ids a metadata filter selected. Exact over the subset; unknown and
+  /// removed ids are ignored.
+  List<VectorMatch> searchIds(
+    Float32List vector,
+    Iterable<String> ids, {
+    int k = 10,
+    int? ef,
+  }) {
+    _ensureOpen();
+    _checkVector(vector, 'vector');
+    _checkK(k);
+    final list = ids.toList(growable: false);
+    if (list.isEmpty) return const <VectorMatch>[];
+    final queryPtr = _copyVector(vector);
+    final idArray = calloc<Pointer<Utf8>>(list.length);
+    final idsOut = calloc<Pointer<Utf8>>(k);
+    final scoresOut = calloc<Float>(k);
+    final countPtr = calloc<Size>();
+    var made = 0;
+    try {
+      for (final id in list) {
+        idArray[made++] = id.toNativeUtf8();
+      }
+      final status = _b.searchIds(
+        _owner.pointer,
+        queryPtr,
+        vector.length,
+        k,
+        ef ?? 0,
+        idArray,
+        list.length,
+        idsOut,
+        scoresOut,
+        countPtr,
+      );
+      if (status != PhoenixStatus.ok) _throw(status, 'searchIds');
+      return _takeMatches(idsOut, scoresOut, countPtr.value);
+    } finally {
+      for (var i = 0; i < made; i++) {
+        calloc.free(idArray[i]);
+      }
+      calloc.free(idArray);
+      calloc.free(queryPtr);
+      calloc.free(idsOut);
+      calloc.free(scoresOut);
+      calloc.free(countPtr);
+    }
+  }
+
+  /// Runs one search per entry of [vectors] in a single native call.
+  List<List<VectorMatch>> searchBatch(
+    List<Float32List> vectors, {
+    int k = 10,
+    int? ef,
+  }) {
+    _ensureOpen();
+    _checkK(k);
+    if (vectors.isEmpty) return const <List<VectorMatch>>[];
+    for (var i = 0; i < vectors.length; i++) {
+      _checkVector(vectors[i], 'vectors[$i]');
+    }
+    final n = vectors.length;
+    final flat = calloc<Float>(n * _dimensions);
+    final idsOut = calloc<Pointer<Utf8>>(n * k);
+    final scoresOut = calloc<Float>(n * k);
+    final counts = calloc<Size>(n);
+    try {
+      final view = flat.asTypedList(n * _dimensions);
+      for (var i = 0; i < n; i++) {
+        view.setRange(i * _dimensions, (i + 1) * _dimensions, vectors[i]);
+      }
+      final status = _b.searchBatch(
+        _owner.pointer,
+        flat,
+        n,
+        _dimensions,
+        k,
+        ef ?? 0,
+        idsOut,
+        scoresOut,
+        counts,
+      );
+      if (status != PhoenixStatus.ok) {
+        // Release whatever the native side published before failing.
+        for (var i = 0; i < n; i++) {
+          _b.freeStringArray(idsOut + i * k, counts[i]);
+        }
+        _throw(status, 'searchBatch');
+      }
+      return [
+        for (var i = 0; i < n; i++)
+          _takeMatches(idsOut + i * k, scoresOut + i * k, counts[i]),
+      ];
+    } finally {
+      calloc.free(flat);
+      calloc.free(idsOut);
+      calloc.free(scoresOut);
+      calloc.free(counts);
+    }
+  }
+
+  void _checkK(int k) {
+    if (k <= 0) throw ArgumentError.value(k, 'k', 'must be greater than zero');
+    final limit = maxK;
+    if (k > limit) throw ArgumentError.value(k, 'k', 'must not exceed $limit');
+  }
+
+  /// Converts `count` native results into [VectorMatch]es and frees the ids.
+  List<VectorMatch> _takeMatches(
+    Pointer<Pointer<Utf8>> ids,
+    Pointer<Float> scores,
+    int count,
+  ) {
+    final matches = <VectorMatch>[];
+    try {
+      for (var i = 0; i < count; i++) {
+        final idPtr = ids[i];
+        if (idPtr == nullptr) continue;
+        final distance = scores[i];
+        matches.add(
+          VectorMatch(
+            id: idPtr.toDartString(),
+            distance: distance,
+            score: _scoreFor(distance),
+          ),
+        );
+      }
+    } finally {
+      _b.freeStringArray(ids, count);
+    }
+    return matches;
   }
 
   /// Returns the [VectorQuery.k] nearest neighbours of [query], nearest first.
