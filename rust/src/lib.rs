@@ -15,19 +15,23 @@
 //!                                    txn.rs             btree.rs            wal.rs
 //!                                   (MVCC)            (index)            (durability)
 //!                                       |                  |
-//!                                       +------ pager.rs --+  (cache + CRC + mmap)
+//!                                       +------ pager.rs --+  (cache + CRC + journal + mmap)
 //! ```
 //!
 //! ## Guarantees
 //!
-//! * **Atomicity** — a transaction's writes are staged in memory and published
-//!   at a single commit timestamp only after its WAL `Commit` record is
-//!   `fsync`ed.
-//! * **Consistency** — every page carries a CRC32 that is verified on read.
-//! * **Isolation** — snapshot isolation with MVCC; concurrent readers never
-//!   block, and a single writer is serialised by a `parking_lot::RwLock`.
-//! * **Durability** — WAL-first, with `sync_all` at commit and a checkpoint
-//!   that truncates the log only after the tree is flushed.
+//! * **Atomicity** — a transaction's writes are staged in memory and logged
+//!   together with its `Commit` record at commit time; recovery replays only
+//!   transactions whose `Commit` reached the log.
+//! * **Consistency** — every page carries a CRC32 that is verified on read,
+//!   and [`Database::check`] verifies the whole tree structure.
+//! * **Isolation** — snapshot isolation with MVCC. Readers share a lock and
+//!   never block each other; writers serialise. Write-write conflicts fail
+//!   with [`Error::Conflict`].
+//! * **Durability** — WAL-first. With [`Options::sync_on_commit`] a commit is
+//!   `fsync`ed before it returns. Checkpoints write pages through a journal,
+//!   so a crash mid-checkpoint cannot tear the file, and they keep every
+//!   committed version the tree does not hold yet in the log.
 //!
 //! ## Example
 //!
@@ -45,8 +49,10 @@
 //! ```
 
 pub mod btree;
+pub mod collection;
 pub mod error;
 pub mod ffi;
+mod fsutil;
 pub mod lsm;
 pub mod mmap;
 pub mod observability;
@@ -62,29 +68,37 @@ pub mod txn;
 pub mod vector;
 pub mod wal;
 
-pub use btree::{BTree, FillFactor};
+pub use btree::{BTree, FillFactor, TreeReport};
 pub use error::{Error, PhoenixStatus, Result};
 pub use page::{MetaData, PAGE_SIZE};
 pub use txn::{TxnState, Write};
 pub use vector::{Metric, VectorEngine, VectorMatch, VectorOptions};
 
+use crate::observability::metrics::{EngineMetrics, Timer};
+use crate::observability::tracing::{CollectingExporter, SpanRecord, Tracer};
 use parking_lot::RwLock;
+use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use txn::VersionStore;
-use wal::{RecoveredOp, Wal, WalRecord};
+use std::sync::atomic::{AtomicBool, Ordering};
+use txn::{OverlayEntry, VersionStore};
+use wal::{RecoveredOp, Wal};
 
 /// Tunable engine parameters.
 #[derive(Debug, Clone, Copy)]
 pub struct Options {
     /// Clean-page cache capacity, in pages.
     pub cache_pages: usize,
-    /// B+Tree split/merge thresholds.
+    /// B+Tree split thresholds.
     pub fill_factor: FillFactor,
     /// Merge + flush + checkpoint once the WAL exceeds this many bytes.
     pub checkpoint_bytes: u64,
-    /// `fsync` the WAL on every commit. Disabling trades durability for speed.
+    /// `fsync` the WAL on every commit. When disabled a commit is still handed
+    /// to the operating system before `commit` returns — it survives the app
+    /// crashing, but not the machine losing power.
     pub sync_on_commit: bool,
+    /// Record spans for engine operations (see [`Database::spans`]).
+    pub tracing: bool,
 }
 
 impl Default for Options {
@@ -94,6 +108,7 @@ impl Default for Options {
             fill_factor: FillFactor::default(),
             checkpoint_bytes: 4 * 1024 * 1024,
             sync_on_commit: true,
+            tracing: false,
         }
     }
 }
@@ -111,6 +126,12 @@ pub struct Stats {
     pub wal_bytes: u64,
     /// Latest commit timestamp.
     pub commit_ts: u64,
+    /// Every version at or below this timestamp is in the durable tree.
+    pub tree_ts: u64,
+    /// Page reads served from memory.
+    pub cache_hits: u64,
+    /// Page reads that had to decode a page from the file.
+    pub cache_misses: u64,
 }
 
 /// Everything guarded by the engine lock.
@@ -119,42 +140,78 @@ struct Inner {
     wal: Wal,
     versions: VersionStore,
     tree: BTree,
+    /// WAL size at which the next automatic checkpoint runs.
+    next_auto_checkpoint: u64,
+    /// The configured base threshold ([`Options::checkpoint_bytes`]).
+    checkpoint_bytes: u64,
+}
+
+/// Where a scan starts: `lo`/`hi` bound the keys, and the overlay supplies the
+/// in-memory versions to merge over the tree.
+struct ScanPlan<'a> {
+    lo: Bound<&'a [u8]>,
+    hi: Bound<&'a [u8]>,
+    overlay: Vec<OverlayEntry>,
 }
 
 /// The embedded database handle.
 ///
 /// Cloning is intentionally not provided: the FFI layer owns exactly one
-/// `Database` per `PhoenixDB*` and frees it in `phoenix_close`.
+/// `Database` per `PhoenixDB*` and frees it in `phoenix_close`. Share it across
+/// threads with an `Arc`.
 pub struct Database {
     inner: RwLock<Inner>,
     options: Options,
     path: PathBuf,
-    exporter: Arc<crate::observability::tracing::CollectingExporter>,
-    metrics: crate::observability::metrics::EngineMetrics,
+    exporter: Arc<CollectingExporter>,
+    tracer: Tracer,
+    tracing: AtomicBool,
+    metrics: EngineMetrics,
+    /// See [`Database::serialize_writes`].
+    writer_turn: parking_lot::Mutex<()>,
+    /// Set by [`Database::simulate_crash`]: skip the checkpoint in `Drop`.
+    crashed: bool,
 }
 
 impl Database {
     /// Opens (creating if necessary) the database at `path`, replaying the WAL.
+    ///
+    /// Fails with [`Error::Busy`] when the file is already open by another
+    /// `Database` or process. (The C ABI shares one engine between handles
+    /// that open the same path in one process; see `phoenix_open`.)
     pub fn open(path: impl AsRef<Path>, options: Options) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent)?;
-            }
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent)?;
         }
         let wal_path = Self::wal_path(&path);
+        let exporter = Arc::new(CollectingExporter::new(1024));
+        let tracer = Tracer::new(exporter.clone());
+        let metrics = EngineMetrics::new();
 
-        let mut pager = Pager::open(&path, options.cache_pages)?;
+        let pager = Pager::open(&path, options.cache_pages)?;
         let meta = pager.meta();
         let tree = BTree::new(options.fill_factor);
+
+        // A `.wal.tmp` is a log rewrite that crashed before its rename: the
+        // original log is intact and authoritative, the temporary is not.
+        let mut tmp = wal_path.as_os_str().to_os_string();
+        tmp.push(".tmp");
+        let _ = std::fs::remove_file(PathBuf::from(tmp));
 
         // --- crash recovery -------------------------------------------------
         let recovery = Wal::recover(&wal_path)?;
         let mut versions = VersionStore::new(meta.tree_ts + 1, meta.next_txn_id);
         versions.observe_txn_id(recovery.max_txn_id);
-
-        let replayed = !recovery.committed.is_empty();
+        let mut replayed = 0usize;
         for (commit_ts, ops) in &recovery.committed {
+            // Anything at or below tree_ts is already in the durable tree.
+            if *commit_ts <= meta.tree_ts {
+                continue;
+            }
+            replayed += 1;
             for op in ops {
                 match op {
                     RecoveredOp::Insert(k, v) => {
@@ -166,37 +223,44 @@ impl Database {
                 }
             }
         }
+        // Cut a torn tail off before anything is appended behind it.
+        let mut wal = Wal::open_truncated(&wal_path, recovery.valid_bytes)?;
+        wal.set_lsn(meta.last_lsn);
 
-        let mut wal = Wal::open(&wal_path)?;
+        let mut inner = Inner {
+            pager,
+            wal,
+            versions,
+            tree,
+            next_auto_checkpoint: options.checkpoint_bytes,
+            checkpoint_bytes: options.checkpoint_bytes,
+        };
 
-        if replayed {
+        if replayed > 0 {
             // Fold the replayed versions into the tree and make them durable,
             // so a second crash does not have to replay the same records.
-            let watermark = versions.current_ts();
-            versions.merge_into_tree(&tree, &mut pager, watermark)?;
-            let mut meta = pager.meta();
-            meta.tree_ts = watermark;
-            meta.next_txn_id = versions.peek_txn_id();
-            pager.set_meta(meta);
-            pager.flush()?;
-            wal.checkpoint(watermark)?;
+            Self::checkpoint_locked(&mut inner, &metrics)?;
         }
 
-        let exporter = Arc::new(crate::observability::tracing::CollectingExporter::new(1024));
-        let _tracer = crate::observability::tracing::Tracer::new(exporter.clone());
-
-        Ok(Database {
-            inner: RwLock::new(Inner {
-                pager,
-                wal,
-                versions,
-                tree,
-            }),
+        let db = Database {
+            inner: RwLock::new(inner),
             options,
             path,
             exporter,
-            metrics: crate::observability::metrics::EngineMetrics::new(),
-        })
+            tracer,
+            tracing: AtomicBool::new(options.tracing),
+            metrics,
+            writer_turn: parking_lot::Mutex::new(()),
+            crashed: false,
+        };
+        if db.tracing_enabled() {
+            let _span = db
+                .tracer
+                .span("open")
+                .with_attribute("replayed_txns", replayed.to_string())
+                .with_attribute("torn_bytes", recovery.truncated_bytes.to_string());
+        }
+        Ok(db)
     }
 
     /// Path of the WAL that accompanies a database file.
@@ -213,59 +277,46 @@ impl Database {
         &self.path
     }
 
-    /// Copies the database file to `backup_path`.
-    pub fn backup(&self, backup_path: impl AsRef<Path>) -> Result<()> {
-        std::fs::copy(self.path(), backup_path)?;
-        Ok(())
-    }
-
-    /// Replaces the database file with `backup_path` and verifies integrity.
-    pub fn restore(&mut self, backup_path: impl AsRef<Path>) -> Result<()> {
-        std::fs::copy(backup_path, self.path())?;
-        self.verify()
-    }
-
     /// Engine options in force.
     #[must_use]
     pub fn options(&self) -> Options {
         self.options
     }
 
+    fn tracing_enabled(&self) -> bool {
+        self.tracing.load(Ordering::Relaxed)
+    }
+
+    /// Turns span recording on or off at runtime.
+    pub fn set_tracing(&self, enabled: bool) {
+        self.tracing.store(enabled, Ordering::Relaxed);
+    }
+
+    // -----------------------------------------------------------------------
+    // Transactions
+    // -----------------------------------------------------------------------
+
     /// Begins a transaction and returns its id.
     ///
-    /// A `read_only` transaction never takes the writer path and cannot stage
-    /// writes; it is the cheapest way to get a stable snapshot.
+    /// A `read_only` transaction cannot stage writes; it is the cheapest way
+    /// to get a stable snapshot. Every transaction pins its snapshot until it
+    /// commits or rolls back, so finish transactions promptly: a forgotten one
+    /// keeps old versions in memory and in the WAL.
     pub fn begin(&self, read_only: bool) -> Result<u64> {
-        let _timer = crate::observability::metrics::Timer::start(&self.metrics.read_latency);
         let mut inner = self.inner.write();
-        let id = inner.versions.begin(read_only);
-        if !read_only {
-            inner.wal.append(&WalRecord::Begin { txn_id: id })?;
-        }
-        Ok(id)
+        Ok(inner.versions.begin(read_only))
     }
 
     /// Stages an insert (or overwrite) in transaction `txn_id`.
     pub fn insert(&self, txn_id: u64, key: &[u8], value: &[u8]) -> Result<()> {
-        security::validate_key_len(key.len())?;
-        security::validate_value_len(value.len())?;
-        if key.len() > page::MAX_KEY_SIZE {
-            return Err(Error::invalid(format!(
-                "key length {} exceeds the {}-byte structural limit",
-                key.len(),
-                page::MAX_KEY_SIZE
-            )));
-        }
-        let _timer = crate::observability::metrics::Timer::start(&self.metrics.read_latency);
+        Self::validate_write(key, Some(value))?;
+        let _timer = Timer::start(&self.metrics.write_latency);
         let mut inner = self.inner.write();
-        inner.wal.append(&WalRecord::Insert {
-            txn_id,
-            key: key.to_vec(),
-            value: value.to_vec(),
-        })?;
         inner
             .versions
-            .stage(txn_id, key.to_vec(), Write::Put(value.to_vec()))
+            .stage(txn_id, key.to_vec(), Write::Put(value.to_vec()))?;
+        self.metrics.writes.increment();
+        Ok(())
     }
 
     /// Stages a delete in transaction `txn_id`.
@@ -274,203 +325,423 @@ impl Database {
     /// so callers can distinguish "removed" from "was never there".
     pub fn delete(&self, txn_id: u64, key: &[u8]) -> Result<()> {
         security::validate_key_len(key.len())?;
+        let _timer = Timer::start(&self.metrics.write_latency);
         let mut inner = self.inner.write();
+        inner.versions.check_writable(txn_id)?;
         // Existence check against the transaction's own view.
         let visible = match inner.versions.read(txn_id, key)? {
-            Some(Some(_)) => true,
-            Some(None) => false, // tombstoned in this snapshot
-            None => {
-                let tree = inner.tree;
-                tree.contains(&mut inner.pager, key)?
-            }
+            Some(v) => v.is_some(),
+            None => key.len() <= page::MAX_KEY_SIZE && inner.tree.contains(&inner.pager, key)?,
         };
         if !visible {
             return Err(Error::NotFound);
         }
-        inner.wal.append(&WalRecord::Delete {
-            txn_id,
-            key: key.to_vec(),
-        })?;
-        inner.versions.stage(txn_id, key.to_vec(), Write::Delete)
+        inner.versions.stage(txn_id, key.to_vec(), Write::Delete)?;
+        self.metrics.writes.increment();
+        Ok(())
     }
 
-    /// Reads `key` as of transaction `txn_id`.
+    fn validate_write(key: &[u8], value: Option<&[u8]>) -> Result<()> {
+        security::validate_key_len(key.len())?;
+        if let Some(v) = value {
+            security::validate_value_len(v.len())?;
+        }
+        if key.len() > page::MAX_KEY_SIZE {
+            return Err(Error::invalid(format!(
+                "key length {} exceeds the {}-byte structural limit",
+                key.len(),
+                page::MAX_KEY_SIZE
+            )));
+        }
+        Ok(())
+    }
+
+    /// Reads `key` as of transaction `txn_id`, including its own writes.
     pub fn get(&self, txn_id: u64, key: &[u8]) -> Result<Vec<u8>> {
         security::validate_key_len(key.len())?;
-        let mut inner = self.inner.write(); // pager reads need &mut (cache)
+        let _timer = Timer::start(&self.metrics.read_latency);
+        self.metrics.reads.increment();
+        let inner = self.inner.read();
         match inner.versions.read(txn_id, key)? {
             Some(Some(v)) => Ok(v),
             Some(None) => Err(Error::NotFound),
-            None => {
-                let tree = inner.tree;
-                tree.get(&mut inner.pager, key)
-            }
+            None => Self::tree_get(&inner, key),
         }
     }
 
     /// Reads `key` in an implicit, immediately-released snapshot.
     pub fn get_auto(&self, key: &[u8]) -> Result<Vec<u8>> {
         security::validate_key_len(key.len())?;
-        let mut inner = self.inner.write();
+        let _timer = Timer::start(&self.metrics.read_latency);
+        self.metrics.reads.increment();
+        let inner = self.inner.read();
         let snapshot = inner.versions.current_ts();
-        let from_versions = inner
-            .versions
-            .keys_with_versions(snapshot)
-            .into_iter()
-            .find(|(k, _)| security::ct_eq(k, key))
-            .map(|(_, v)| v);
-        match from_versions {
+        match inner.versions.visible(key, snapshot) {
             Some(Some(v)) => Ok(v),
             Some(None) => Err(Error::NotFound),
-            None => {
-                let tree = inner.tree;
-                tree.get(&mut inner.pager, key)
-            }
+            None => Self::tree_get(&inner, key),
         }
+    }
+
+    fn tree_get(inner: &Inner, key: &[u8]) -> Result<Vec<u8>> {
+        if key.len() > page::MAX_KEY_SIZE {
+            return Err(Error::NotFound); // such a key can never be stored
+        }
+        inner.tree.get(&inner.pager, key)
     }
 
     /// Commits transaction `txn_id`, making its writes durable.
     ///
-    /// Ordering: conflict check -> WAL `Commit` + `fsync` -> publish versions.
+    /// Ordering: conflict check -> log writes + `Commit` (+ `fsync`) ->
+    /// publish versions. On [`Error::Conflict`] the transaction is aborted
+    /// (a later `rollback` reports [`Error::TxnNotFound`]); begin a new one
+    /// and retry.
     pub fn commit(&self, txn_id: u64) -> Result<()> {
+        let _timer = Timer::start(&self.metrics.txn_commit_latency);
         let mut inner = self.inner.write();
-        inner.versions.detect_conflict(txn_id)?;
+        let mut span = self.tracing_enabled().then(|| {
+            self.tracer
+                .span("commit")
+                .with_attribute("txn_id", txn_id.to_string())
+        });
 
-        let commit_ts = inner.versions.current_ts() + 1;
-        inner.wal.commit(txn_id, commit_ts)?;
-        let actual = inner.versions.commit(txn_id)?;
+        let Inner { wal, versions, .. } = &mut *inner;
+        let txn = versions.get(txn_id)?;
+        if txn.read_only || txn.writes.is_empty() {
+            // Nothing to make durable: just release the snapshot.
+            versions.rollback(txn_id)?;
+            self.metrics.txn_commits.increment();
+            return Ok(());
+        }
+        if let Err(e) = versions.detect_conflict(txn_id) {
+            // A conflicted transaction can never commit (its snapshot is
+            // stale for good), so it is aborted here rather than left open:
+            // a caller that forgets the rollback would otherwise pin the
+            // merge watermark — and grow memory and the WAL — forever.
+            versions.rollback(txn_id)?;
+            self.metrics.txn_conflicts.increment();
+            if let Some(s) = span.as_mut() {
+                s.set_error("write-write conflict");
+            }
+            return Err(e);
+        }
+        let commit_ts = versions.next_commit_ts();
+        let sync = self.options.sync_on_commit;
+        let (syncs_before, bytes_before) = (wal.sync_count(), wal.bytes_appended());
+        let started = std::time::Instant::now();
+        let writes = txn.writes.len();
+        wal.log_commit(
+            txn_id,
+            commit_ts,
+            txn.writes.iter().map(|(k, w)| (k.as_slice(), w.as_value())),
+            sync,
+        )?;
+        if sync {
+            self.metrics.wal_fsync_latency.record(started.elapsed());
+        }
+        self.metrics.wal_fsyncs.add(wal.sync_count() - syncs_before);
+        self.metrics
+            .wal_bytes_written
+            .add(wal.bytes_appended() - bytes_before);
+        let actual = versions.commit(txn_id)?;
         debug_assert_eq!(actual, commit_ts, "commit timestamp drifted");
+        self.metrics.txn_commits.increment();
+        if let Some(s) = span.as_mut() {
+            s.set_attribute("writes", writes.to_string());
+            s.set_attribute("commit_ts", commit_ts.to_string());
+        }
 
-        if !self.options.sync_on_commit && inner.wal.size() >= self.options.checkpoint_bytes {
-            Self::checkpoint_locked(&mut inner)?;
+        if inner.wal.size() >= inner.next_auto_checkpoint {
+            // The commit is already durable: a failed background checkpoint
+            // must not turn it into an error. The next one retries.
+            let _ = Self::checkpoint_locked(&mut inner, &self.metrics);
         }
         Ok(())
+    }
+
+    /// Takes this database's writer turn: a mutex that read-modify-write
+    /// callers hold across `begin` .. `commit` so they never conflict with
+    /// each other.
+    ///
+    /// Snapshot isolation is optimistic — concurrent transactions that write
+    /// the same key race, and the loser gets [`Error::Conflict`]. When many
+    /// writers contend for one hot key (a counter, a table's row-id sequence)
+    /// retrying can starve; writes serialise inside the engine anyway, so
+    /// taking turns up front costs nothing and removes the conflicts. The SQL
+    /// layer holds it for autocommit statements. Readers never need it.
+    pub fn serialize_writes(&self) -> parking_lot::MutexGuard<'_, ()> {
+        self.writer_turn.lock()
     }
 
     /// Rolls transaction `txn_id` back.
     pub fn rollback(&self, txn_id: u64) -> Result<()> {
         let mut inner = self.inner.write();
-        inner.wal.append(&WalRecord::Rollback { txn_id })?;
-        inner.versions.rollback(txn_id)
+        inner.versions.rollback(txn_id)?;
+        self.metrics.txn_rollbacks.increment();
+        Ok(())
     }
 
     /// Convenience: single-statement insert in its own transaction.
     pub fn put_auto(&self, key: &[u8], value: &[u8]) -> Result<()> {
-        let txn = self.begin(false)?;
-        match self.insert(txn, key, value) {
-            Ok(()) => self.commit(txn),
-            Err(e) => {
-                let _ = self.rollback(txn);
-                Err(e)
-            }
-        }
+        self.write_batch(|batch| batch.put(key, value))
     }
 
     /// Convenience: single-statement delete in its own transaction.
     pub fn delete_auto(&self, key: &[u8]) -> Result<()> {
-        let txn = self.begin(false)?;
-        match self.delete(txn, key) {
-            Ok(()) => self.commit(txn),
-            Err(e) => {
-                let _ = self.rollback(txn);
-                Err(e)
-            }
-        }
+        self.write_batch(|batch| batch.delete(key))
     }
 
-    /// Merges committed versions into the tree, flushes, and truncates the WAL.
+    /// Runs `f` against a fresh write transaction and commits it, or rolls it
+    /// back if `f` (or the commit) fails. All writes land atomically.
+    ///
+    /// ```no_run
+    /// # fn main() -> phoenixdb::Result<()> {
+    /// # let db = phoenixdb::Database::open("d.pdb", Default::default())?;
+    /// db.write_batch(|b| {
+    ///     b.put(b"user:1", b"ada")?;
+    ///     b.put(b"user:2", b"grace")?;
+    ///     b.delete_if_exists(b"user:0")
+    /// })?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn write_batch<F>(&self, f: F) -> Result<()>
+    where
+        F: FnOnce(&mut Batch<'_>) -> Result<()>,
+    {
+        let txn = self.begin(false)?;
+        let mut batch = Batch { db: self, txn };
+        let outcome = f(&mut batch).and_then(|()| self.commit(txn));
+        if outcome.is_err() {
+            let _ = self.rollback(txn);
+        }
+        outcome
+    }
+
+    // -----------------------------------------------------------------------
+    // Checkpoints
+    // -----------------------------------------------------------------------
+
+    /// Merges committed versions into the tree, flushes, and rewrites the WAL.
     pub fn checkpoint(&self) -> Result<()> {
         let mut inner = self.inner.write();
-        Self::checkpoint_locked(&mut inner)
+        let _span = self
+            .tracing_enabled()
+            .then(|| self.tracer.span("checkpoint"));
+        Self::checkpoint_locked(&mut inner, &self.metrics)
     }
 
-    fn checkpoint_locked(inner: &mut Inner) -> Result<()> {
+    fn checkpoint_locked(inner: &mut Inner, metrics: &EngineMetrics) -> Result<()> {
+        let _timer = Timer::start(&metrics.checkpoint_latency);
         let watermark = inner.versions.merge_watermark();
-        let tree = inner.tree;
         let Inner {
-            pager, versions, ..
+            pager,
+            versions,
+            tree,
+            wal,
+            ..
         } = inner;
-        versions.merge_into_tree(&tree, pager, watermark)?;
+        let durable_meta = pager.meta();
+        if let Err(e) = versions.merge_into_tree(tree, pager, watermark) {
+            // The version store is untouched (two-phase merge); drop the
+            // half-applied pages so memory matches the durable state again.
+            pager.discard_dirty(durable_meta);
+            return Err(e);
+        }
+        let tree_ts = durable_meta.tree_ts.max(watermark);
+        // Versions a live snapshot still pins stay in the log.
+        let retained = versions.retained_commits(tree_ts);
 
         let mut meta = pager.meta();
-        meta.tree_ts = watermark;
+        meta.tree_ts = tree_ts;
         meta.next_txn_id = versions.peek_txn_id();
-        meta.last_lsn = inner.wal.lsn();
+        meta.last_lsn = wal.lsn();
         pager.set_meta(meta);
+        // On failure the merged pages stay staged (reads see them) and the log
+        // still holds everything, so the next checkpoint simply retries.
         pager.flush()?; // tree is durable...
-        inner.wal.checkpoint(watermark)?; // ...so the log can be discarded
+        wal.reset(tree_ts, &retained)?; // ...so the log can shrink
+        // Versions pinned by a long-lived reader are re-logged every time, so
+        // back off relative to what the log still holds instead of
+        // checkpointing on every commit until the reader finishes.
+        inner.next_auto_checkpoint = inner
+            .checkpoint_bytes
+            .max(inner.wal.size().saturating_mul(2));
+        metrics.checkpoints.increment();
         Ok(())
     }
 
-    /// Flushes dirty pages without truncating the WAL.
+    /// Syncs the WAL and flushes any staged pages without rewriting the log.
     pub fn flush(&self) -> Result<()> {
         let mut inner = self.inner.write();
         inner.wal.sync()?;
         inner.pager.flush()
     }
 
+    // -----------------------------------------------------------------------
+    // Scans
+    // -----------------------------------------------------------------------
+
     /// Every visible key/value pair, in ascending key order.
     pub fn scan(&self) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        let mut inner = self.inner.write();
-        let snapshot = inner.versions.current_ts();
-        let tree = inner.tree;
-        let mut merged: std::collections::BTreeMap<Vec<u8>, Vec<u8>> =
-            tree.scan(&mut inner.pager)?.into_iter().collect();
-        for (key, value) in inner.versions.keys_with_versions(snapshot) {
-            match value {
-                Some(v) => {
-                    merged.insert(key, v);
-                }
-                None => {
-                    merged.remove(&key);
-                }
-            }
-        }
-        Ok(merged.into_iter().collect())
+        let mut out = Vec::new();
+        self.scan_iter(|item| {
+            out.push(item);
+            Ok(())
+        })?;
+        Ok(out)
     }
 
     /// Streams every visible key/value pair in ascending key order.
     ///
-    /// This avoids materializing the full scan result in memory. The version
-    /// overlay is collected first because it lives in memory, then the tree is
-    /// streamed page-by-page.
+    /// The tree is streamed page by page and merged with the in-memory
+    /// versions, so nothing beyond the unmerged versions is materialised. The
+    /// callback runs under the engine's shared lock: it must not call back
+    /// into this database.
     pub fn scan_iter<F>(&self, mut f: F) -> Result<()>
     where
         F: FnMut((Vec<u8>, Vec<u8>)) -> Result<()>,
     {
-        let mut inner = self.inner.write();
-        let snapshot = inner.versions.current_ts();
-        let tree = inner.tree;
-
-        let overlay: std::collections::BTreeMap<Vec<u8>, Option<Vec<u8>>> = inner
-            .versions
-            .keys_with_versions(snapshot)
-            .into_iter()
-            .collect();
-
-        let mut overlay_writes = Vec::new();
-        let mut overlay_deletes = std::collections::BTreeSet::new();
-        for (key, value) in overlay {
-            if let Some(v) = value {
-                overlay_writes.push((key, v));
-            } else {
-                overlay_deletes.insert(key);
-            }
-        }
-        for (key, value) in overlay_writes {
-            f((key, value))?;
-        }
-        tree.scan_iter(&mut inner.pager, |(key, value)| {
-            if !overlay_deletes.contains(&key) {
-                f((key, value))?;
-            }
-            Ok(())
+        self.scan_range(Bound::Unbounded, Bound::Unbounded, |k, v| {
+            f((k, v))?;
+            Ok(true)
         })
     }
 
+    /// Streams the latest committed pairs with keys in `(lo, hi)`, ascending.
+    ///
+    /// `f` returns `Ok(true)` to continue or `Ok(false)` to stop early. Same
+    /// re-entrancy rule as [`Database::scan_iter`].
+    pub fn scan_range<F>(&self, lo: Bound<&[u8]>, hi: Bound<&[u8]>, f: F) -> Result<()>
+    where
+        F: FnMut(Vec<u8>, Vec<u8>) -> Result<bool>,
+    {
+        let _timer = Timer::start(&self.metrics.scan_latency);
+        self.metrics.scans.increment();
+        let inner = self.inner.read();
+        let snapshot = inner.versions.current_ts();
+        let plan = ScanPlan {
+            lo,
+            hi,
+            overlay: inner.versions.overlay(snapshot, lo, hi),
+        };
+        Self::merge_scan(&inner, plan, f)
+    }
+
+    /// Streams the latest committed pairs whose key starts with `prefix`.
+    pub fn scan_prefix<F>(&self, prefix: &[u8], f: F) -> Result<()>
+    where
+        F: FnMut(Vec<u8>, Vec<u8>) -> Result<bool>,
+    {
+        let end = prefix_successor(prefix);
+        let hi = match &end {
+            Some(e) => Bound::Excluded(e.as_slice()),
+            None => Bound::Unbounded,
+        };
+        let lo = if prefix.is_empty() {
+            Bound::Unbounded
+        } else {
+            Bound::Included(prefix)
+        };
+        self.scan_range(lo, hi, f)
+    }
+
+    /// Streams what transaction `txn_id` sees for keys in `(lo, hi)`: its
+    /// snapshot plus its own uncommitted writes.
+    pub fn scan_txn<F>(&self, txn_id: u64, lo: Bound<&[u8]>, hi: Bound<&[u8]>, f: F) -> Result<()>
+    where
+        F: FnMut(Vec<u8>, Vec<u8>) -> Result<bool>,
+    {
+        let _timer = Timer::start(&self.metrics.scan_latency);
+        self.metrics.scans.increment();
+        let inner = self.inner.read();
+        let plan = ScanPlan {
+            lo,
+            hi,
+            overlay: inner.versions.txn_overlay(txn_id, lo, hi)?,
+        };
+        Self::merge_scan(&inner, plan, f)
+    }
+
+    /// Collects up to `limit` pairs with keys in `(lo, hi)` (0 = no limit).
+    pub fn range(
+        &self,
+        lo: Bound<&[u8]>,
+        hi: Bound<&[u8]>,
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let mut out = Vec::new();
+        self.scan_range(lo, hi, |k, v| {
+            out.push((k, v));
+            Ok(limit == 0 || out.len() < limit)
+        })?;
+        Ok(out)
+    }
+
+    /// Merges the tree's pairs in `(lo, hi)` with the overlay, in key order:
+    /// an overlay entry replaces the tree's value for its key, and an overlay
+    /// tombstone hides it.
+    fn merge_scan<F>(inner: &Inner, plan: ScanPlan<'_>, mut f: F) -> Result<()>
+    where
+        F: FnMut(Vec<u8>, Vec<u8>) -> Result<bool>,
+    {
+        let mut overlay = plan.overlay.into_iter().peekable();
+        let mut stopped = false;
+        inner
+            .tree
+            .range_iter(&inner.pager, plan.lo, plan.hi, |key, value| {
+                // Overlay keys that sort before this tree key come first.
+                while let Some((ok, _)) = overlay.peek() {
+                    if ok.as_slice() >= key.as_slice() {
+                        break;
+                    }
+                    let (ok, ov) = overlay.next().expect("peeked");
+                    if let Some(v) = ov
+                        && !f(ok, v)?
+                    {
+                        stopped = true;
+                        return Ok(false);
+                    }
+                }
+                let emitted = match overlay.next_if(|(ok, _)| *ok == key) {
+                    Some((_, None)) => return Ok(true), // deleted in memory
+                    Some((ok, Some(v))) => f(ok, v)?,   // newer in memory
+                    None => f(key, value)?,
+                };
+                stopped = !emitted;
+                Ok(emitted)
+            })?;
+        if stopped {
+            return Ok(());
+        }
+        for (key, value) in overlay {
+            if let Some(v) = value
+                && !f(key, v)?
+            {
+                break;
+            }
+        }
+        Ok(())
+    }
+
     /// Number of visible keys.
+    ///
+    /// Counts the tree's keys and corrects for the in-memory versions, so it
+    /// never reads a value.
     pub fn len(&self) -> Result<u64> {
-        Ok(self.scan()?.len() as u64)
+        let inner = self.inner.read();
+        let mut count = inner.tree.len(&inner.pager)?;
+        let snapshot = inner.versions.current_ts();
+        for (key, value) in inner.versions.keys_with_versions(snapshot) {
+            let in_tree =
+                key.len() <= page::MAX_KEY_SIZE && inner.tree.contains(&inner.pager, &key)?;
+            match (value.is_some(), in_tree) {
+                (true, false) => count += 1,
+                (false, true) => count -= 1,
+                _ => {}
+            }
+        }
+        Ok(count)
     }
 
     /// True when the database holds no visible keys.
@@ -478,28 +749,229 @@ impl Database {
         Ok(self.len()? == 0)
     }
 
+    // -----------------------------------------------------------------------
+    // Diagnostics
+    // -----------------------------------------------------------------------
+
     /// Runtime statistics.
     pub fn stats(&self) -> Stats {
         let inner = self.inner.read();
+        let cache = inner.pager.cache_stats();
+        let meta = inner.pager.meta();
         Stats {
-            page_count: inner.pager.meta().page_count,
+            page_count: meta.page_count,
             active_txns: inner.versions.active_count(),
             pending_keys: inner.versions.pending_keys(),
             wal_bytes: inner.wal.size(),
             commit_ts: inner.versions.current_ts(),
+            tree_ts: meta.tree_ts,
+            cache_hits: cache.hits,
+            cache_misses: cache.misses,
         }
     }
 
-    /// Retains a snapshot of exported spans for tests/debugging.
-    pub fn spans(&self) -> Vec<crate::observability::tracing::SpanRecord> {
+    /// Spans recorded while tracing was enabled, oldest first (bounded ring).
+    pub fn spans(&self) -> Vec<SpanRecord> {
         self.exporter.spans()
     }
 
     /// Verifies B+Tree invariants and every page checksum.
     pub fn verify(&self) -> Result<()> {
+        self.check().map(|_| ())
+    }
+
+    /// Full structural check; see [`BTree::check`] for what is verified.
+    pub fn check(&self) -> Result<TreeReport> {
+        let inner = self.inner.read();
+        inner.tree.check(&inner.pager)
+    }
+
+    /// Adds an observed duration to the matching latency histogram.
+    ///
+    /// `op` is one of `read`/`get`, `write`/`insert`/`put`/`delete`, `scan`,
+    /// `commit` or `checkpoint`; anything else is ignored. Lets a host that
+    /// measures end-to-end latency (e.g. across an isolate hop) feed it into
+    /// the same report.
+    pub fn record_latency(&self, op: &str, micros: u64) {
+        let histo = match op {
+            "read" | "get" => &self.metrics.read_latency,
+            "write" | "insert" | "put" | "delete" => &self.metrics.write_latency,
+            "scan" => &self.metrics.scan_latency,
+            "commit" => &self.metrics.txn_commit_latency,
+            "checkpoint" => &self.metrics.checkpoint_latency,
+            _ => return,
+        };
+        histo.record_micros(micros);
+    }
+
+    /// Counts an externally performed write operation (`insert`, `put`,
+    /// `delete` or `write`); anything else is ignored.
+    pub fn record_write(&self, op: &str) {
+        if matches!(op, "insert" | "put" | "delete" | "write") {
+            self.metrics.writes.increment();
+        }
+    }
+
+    /// The live metrics registry.
+    #[must_use]
+    pub fn metrics(&self) -> &EngineMetrics {
+        self.sync_cache_metrics();
+        &self.metrics
+    }
+
+    fn sync_cache_metrics(&self) {
+        let cache = self.inner.read().pager.cache_stats();
+        self.metrics.cache_hits.raise_to(cache.hits);
+        self.metrics.cache_misses.raise_to(cache.misses);
+        self.metrics.cache_resident_pages.set(cache.resident);
+    }
+
+    /// Human-readable metrics snapshot for debugging.
+    pub fn metrics_report(&self) -> String {
+        self.sync_cache_metrics();
+        self.metrics.report()
+    }
+
+    /// Metrics in the Prometheus text exposition format.
+    pub fn metrics_prometheus(&self) -> String {
+        self.sync_cache_metrics();
+        self.metrics.prometheus()
+    }
+
+    // -----------------------------------------------------------------------
+    // Backup, restore, compaction
+    // -----------------------------------------------------------------------
+
+    /// Writes a consistent, self-contained, compacted copy of the database to
+    /// `backup_path`.
+    ///
+    /// The copy is built from one snapshot while other threads keep reading
+    /// and writing, holds no WAL and no free pages, and appears at
+    /// `backup_path` atomically (built next to it, then renamed). Refuses to
+    /// overwrite a database that is currently open.
+    pub fn backup(&self, backup_path: impl AsRef<Path>) -> Result<()> {
+        let target = backup_path.as_ref();
+        if same_file(target, &self.path) {
+            return Err(Error::invalid("cannot back a database up onto itself"));
+        }
+        let _span = self.tracing_enabled().then(|| {
+            self.tracer
+                .span("backup")
+                .with_attribute("target", target.display().to_string())
+        });
+        refuse_if_open(target)?;
+        let tmp = sidecar(target, ".tmp");
+        remove_database_files(&tmp);
+
+        let snapshot = self.begin(true)?;
+        let built = self.copy_snapshot_to(snapshot, &tmp);
+        let _ = self.rollback(snapshot);
+        if let Err(e) = built {
+            remove_database_files(&tmp);
+            return Err(e);
+        }
+        // A stale log next to the target would be replayed over the backup.
+        remove_sidecars(target);
+        std::fs::rename(&tmp, target)?;
+        fsutil::sync_parent_dir(target);
+        remove_database_files(&tmp);
+        Ok(())
+    }
+
+    /// Copies what `snapshot` sees into a brand-new database at `dest`.
+    fn copy_snapshot_to(&self, snapshot: u64, dest: &Path) -> Result<()> {
+        // Chunked so the shared lock is released between batches; the
+        // read-only snapshot keeps the view consistent throughout.
+        copy_into_new_database(dest, self.options, |lo, emit| {
+            self.scan_txn(snapshot, lo, Bound::Unbounded, emit)
+        })
+    }
+
+    /// Replaces this database's contents with the database at `backup_path`.
+    ///
+    /// The backup is fully verified first and installed atomically: a crash
+    /// midway leaves either the old contents or the backup. Requires that no
+    /// transaction is open on this handle.
+    pub fn restore(&self, backup_path: impl AsRef<Path>) -> Result<()> {
+        let source = backup_path.as_ref();
+        if same_file(source, &self.path) {
+            return Err(Error::invalid("cannot restore a database onto itself"));
+        }
+        let _span = self.tracing_enabled().then(|| {
+            self.tracer
+                .span("restore")
+                .with_attribute("source", source.display().to_string())
+        });
+        // Validate before touching anything. A backup that still has a log
+        // (not one made by `backup`) is opened once so its log is folded in.
+        let source_wal = Self::wal_path(source);
+        if std::fs::metadata(&source_wal).is_ok_and(|m| m.len() > 64) {
+            let folded = Database::open(source, Options::default())?;
+            folded.verify()?;
+        } else {
+            if std::fs::metadata(source)?.len() == 0 {
+                return Err(Error::invalid(format!(
+                    "{} is empty, not a PhoenixDB backup",
+                    source.display()
+                )));
+            }
+            let pager = Pager::open(source, 64)?;
+            self.inner.read().tree.check(&pager)?;
+        }
+
         let mut inner = self.inner.write();
-        let tree = inner.tree;
-        tree.verify(&mut inner.pager)
+        if inner.versions.active_count() > 0 {
+            return Err(Error::invalid(
+                "cannot restore while transactions are open on this handle",
+            ));
+        }
+        // Empty the log first, so a crash after the swap can never replay the
+        // old database's commits over the restored one.
+        Self::checkpoint_locked(&mut inner, &self.metrics)?;
+        inner.pager.replace_contents(source)?;
+        let meta = inner.pager.meta();
+        inner.versions = VersionStore::new(meta.tree_ts + 1, meta.next_txn_id);
+        inner.wal.reset(meta.tree_ts, &[])?;
+        inner.next_auto_checkpoint = self.options.checkpoint_bytes;
+        Ok(())
+    }
+
+    /// Rebuilds the file compactly: live data only, pages packed, free pages
+    /// returned to the filesystem. Requires that no transaction is open.
+    ///
+    /// Holds the write lock for the whole rebuild, so no commit can land
+    /// between the copy and the swap (and be lost with the old file).
+    pub fn compact(&self) -> Result<()> {
+        let mut inner = self.inner.write();
+        if inner.versions.active_count() > 0 {
+            return Err(Error::invalid(
+                "cannot compact while transactions are open on this handle",
+            ));
+        }
+        let _span = self.tracing_enabled().then(|| self.tracer.span("compact"));
+        // With no live snapshot this merges every version: the tree is the
+        // whole database.
+        Self::checkpoint_locked(&mut inner, &self.metrics)?;
+        let scratch = sidecar(&self.path, ".compact");
+        remove_database_files(&scratch);
+        let built = {
+            let source: &Inner = &inner;
+            copy_into_new_database(&scratch, self.options, |lo, emit| {
+                source
+                    .tree
+                    .range_iter(&source.pager, lo, Bound::Unbounded, emit)
+            })
+        };
+        let outcome = built.and_then(|()| {
+            inner.pager.replace_contents(&scratch)?;
+            let meta = inner.pager.meta();
+            inner.versions = VersionStore::new(meta.tree_ts + 1, meta.next_txn_id);
+            inner.wal.reset(meta.tree_ts, &[])?;
+            inner.next_auto_checkpoint = inner.checkpoint_bytes;
+            Ok(())
+        });
+        remove_database_files(&scratch);
+        outcome
     }
 
     /// Flushes and checkpoints; called by `Drop` and `phoenix_close`.
@@ -507,31 +979,170 @@ impl Database {
         self.checkpoint()
     }
 
-    /// Adds an observed duration into the engine's metrics histograms.
-    pub fn record_latency(&self, op: &str, micros: u64) {
-        let histo = match op {
-            "begin" | "commit" | "get" | "scan" => &self.metrics.read_latency,
-            _ => return,
-        };
-        histo.record_micros(micros);
+    /// Drops the handle the way a crash would: no checkpoint, no merge, no
+    /// final flush — only what already reached the WAL and the data file
+    /// survives. File handles (and the file lock) are released, so the same
+    /// process can reopen the database and exercise recovery.
+    ///
+    /// Intended for crash-recovery tests.
+    #[doc(hidden)]
+    pub fn simulate_crash(mut self) {
+        self.crashed = true;
+    }
+}
+
+/// Stages writes for [`Database::write_batch`].
+pub struct Batch<'a> {
+    db: &'a Database,
+    txn: u64,
+}
+
+impl Batch<'_> {
+    /// Stages an insert or overwrite.
+    pub fn put(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
+        self.db.insert(self.txn, key, value)
     }
 
-    /// Increments the write counter for an insert/delete operation.
-    pub fn record_write(&self, op: &str) {
-        let _ = match op {
-            "insert" => &self.metrics.writes,
-            _ => return,
-        };
+    /// Stages a delete; fails with [`Error::NotFound`] if the key is absent.
+    pub fn delete(&mut self, key: &[u8]) -> Result<()> {
+        self.db.delete(self.txn, key)
     }
 
-    /// Human-readable metrics snapshot for debugging.
-    pub fn metrics_report(&self) -> String {
-        self.metrics.report()
+    /// Stages a delete if the key exists; returns whether it did.
+    pub fn delete_if_exists(&mut self, key: &[u8]) -> Result<()> {
+        match self.db.delete(self.txn, key) {
+            Ok(()) | Err(Error::NotFound) => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Reads through the batch: sees the batch's own staged writes.
+    pub fn get(&self, key: &[u8]) -> Result<Vec<u8>> {
+        self.db.get(self.txn, key)
+    }
+
+    /// The underlying transaction id.
+    #[must_use]
+    pub fn txn_id(&self) -> u64 {
+        self.txn
+    }
+}
+
+/// Builds a new database at `dest` from a key-ordered source.
+///
+/// `scan(lo, emit)` must call `emit(key, value)` for pairs after `lo` in
+/// ascending order and stop when `emit` returns `false`; the copy pulls
+/// batches of bounded size, so neither side ever holds the whole data set.
+fn copy_into_new_database<S>(dest: &Path, options: Options, mut scan: S) -> Result<()>
+where
+    S: FnMut(Bound<&[u8]>, &mut dyn FnMut(Vec<u8>, Vec<u8>) -> Result<bool>) -> Result<()>,
+{
+    const BATCH_BYTES: usize = 8 * 1024 * 1024;
+    const BATCH_KEYS: usize = 20_000;
+    let out = Database::open(
+        dest,
+        Options {
+            sync_on_commit: false,
+            tracing: false,
+            ..options
+        },
+    )?;
+    let mut cursor: Option<Vec<u8>> = None;
+    loop {
+        let mut batch: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        let mut bytes = 0usize;
+        let lo = match &cursor {
+            Some(c) => Bound::Excluded(c.as_slice()),
+            None => Bound::Unbounded,
+        };
+        scan(lo, &mut |k, v| {
+            bytes += k.len() + v.len();
+            batch.push((k, v));
+            Ok(bytes < BATCH_BYTES && batch.len() < BATCH_KEYS)
+        })?;
+        let Some((last, _)) = batch.last() else { break };
+        cursor = Some(last.clone());
+        out.write_batch(|b| {
+            for (k, v) in &batch {
+                b.put(k, v)?;
+            }
+            Ok(())
+        })?;
+    }
+    // The checkpoint's journaled flush fsyncs the file; the log it leaves is
+    // a bare marker, so the result is self-contained.
+    out.checkpoint()?;
+    Ok(())
+}
+
+/// Smallest key greater than every key starting with `prefix`, or `None`
+/// when no such key exists (empty prefix, or all `0xFF`).
+#[must_use]
+pub fn prefix_successor(prefix: &[u8]) -> Option<Vec<u8>> {
+    let mut end = prefix.to_vec();
+    while let Some(last) = end.pop() {
+        if last < 0xFF {
+            end.push(last + 1);
+            return Some(end);
+        }
+    }
+    None
+}
+
+fn sidecar(path: &Path, suffix: &str) -> PathBuf {
+    let mut s = path.as_os_str().to_os_string();
+    s.push(suffix);
+    PathBuf::from(s)
+}
+
+/// Removes a database file and its WAL/journal sidecars, ignoring absence.
+fn remove_database_files(path: &Path) {
+    let _ = std::fs::remove_file(path);
+    remove_sidecars(path);
+}
+
+/// Removes only the WAL/journal sidecars of a database file.
+fn remove_sidecars(path: &Path) {
+    for p in [
+        Database::wal_path(path),
+        sidecar(&Database::wal_path(path), ".tmp"),
+        Pager::journal_path(path),
+    ] {
+        let _ = std::fs::remove_file(p);
+    }
+}
+
+fn same_file(a: &Path, b: &Path) -> bool {
+    match (a.canonicalize(), b.canonicalize()) {
+        (Ok(x), Ok(y)) => x == y,
+        _ => a == b,
+    }
+}
+
+/// Fails if `path` is a database some handle currently has open.
+fn refuse_if_open(path: &Path) -> Result<()> {
+    let Ok(file) = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+    else {
+        return Ok(()); // does not exist (or cannot be opened): nothing to clobber
+    };
+    match file.try_lock() {
+        Ok(()) => Ok(()),
+        Err(std::fs::TryLockError::WouldBlock) => Err(Error::Busy(format!(
+            "{} is an open database; close it before overwriting it",
+            path.display()
+        ))),
+        Err(std::fs::TryLockError::Error(_)) => Ok(()),
     }
 }
 
 impl Drop for Database {
     fn drop(&mut self) {
+        if self.crashed {
+            return;
+        }
         // Best-effort durability; a failing checkpoint must not panic in Drop
         // because that would unwind across the FFI boundary.
         let _ = self.checkpoint();
@@ -608,8 +1219,8 @@ mod tests {
             let dangling = db.begin(false).unwrap();
             db.insert(dangling, b"lost", b"no").unwrap();
             db.flush().unwrap();
-            // Leak the handle: no Drop, no checkpoint -> simulates a crash.
-            std::mem::forget(db);
+            // No checkpoint, no merge: simulates a crash.
+            db.simulate_crash();
         }
         let db = Database::open(&path, Options::default()).unwrap();
         assert_eq!(db.get_auto(b"durable").unwrap(), b"yes");
