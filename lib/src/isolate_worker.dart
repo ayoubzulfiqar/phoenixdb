@@ -3,14 +3,20 @@
 /// A single long-lived worker isolate owns the native handle. Because the
 /// handle never crosses an isolate boundary, there is no shared-memory hazard:
 /// requests and responses are plain data sent over ports.
+///
+/// The worker is supervised: if it dies (a native abort, an uncaught error),
+/// every in-flight and later call fails with a [PhoenixException] instead of
+/// waiting forever.
 library;
 
 import 'dart:async';
 import 'dart:isolate';
 import 'dart:typed_data';
 
+import 'kv.dart';
 import 'phoenixdb_base.dart';
 import 'sql_result.dart';
+import 'worker.dart';
 
 /// Operations the worker understands.
 enum _Op {
@@ -26,37 +32,55 @@ enum _Op {
   rollback,
   query,
   close,
+  scan,
+  write,
+  backup,
+  restore,
+  compact,
+  stats,
+  check,
+  metrics,
+  metricsPrometheus,
+  setTracing,
+  spans,
+}
+
+/// Arguments of a range scan.
+class _ScanArgs {
+  final Uint8List? start;
+  final Uint8List? end;
+  final bool startInclusive;
+  final bool endInclusive;
+  final int limit;
+
+  const _ScanArgs(
+    this.start,
+    this.end,
+    this.startInclusive,
+    this.endInclusive,
+    this.limit,
+  );
 }
 
 /// A request sent to the worker isolate.
 class _Request {
-  final int id;
   final _Op op;
   final Uint8List? key;
   final Uint8List? value;
   final int? txnId;
-  final bool readOnly;
-  final String? sql;
+  final bool flag;
+  final String? text;
+  final Object? args;
 
   const _Request(
-    this.id,
     this.op, {
     this.key,
     this.value,
     this.txnId,
-    this.readOnly = false,
-    this.sql,
+    this.flag = false,
+    this.text,
+    this.args,
   });
-}
-
-/// A response returned by the worker isolate.
-class _Response {
-  final int id;
-  final Object? result;
-  final String? error;
-  final int? status;
-
-  const _Response(this.id, {this.result, this.error, this.status});
 }
 
 /// Startup payload for the worker isolate.
@@ -65,82 +89,106 @@ class _Boot {
   final String path;
   final int cachePages;
   final String? libraryPath;
+  final PhoenixOptions? options;
 
-  const _Boot(this.ready, this.path, this.cachePages, this.libraryPath);
+  const _Boot(
+    this.ready,
+    this.path,
+    this.cachePages,
+    this.libraryPath,
+    this.options,
+  );
+}
+
+/// Executes one request against the worker's database.
+Object? _execute(PhoenixDatabase db, _Request r) {
+  switch (r.op) {
+    case _Op.insert:
+      db.insert(r.key!, r.value!, txnId: r.txnId);
+      return null;
+    case _Op.get:
+      return db.get(r.key!, txnId: r.txnId);
+    case _Op.delete:
+      return db.delete(r.key!, txnId: r.txnId);
+    case _Op.count:
+      return db.count();
+    case _Op.checkpoint:
+      db.checkpoint();
+      return null;
+    case _Op.flush:
+      db.flush();
+      return null;
+    case _Op.verify:
+      db.verify();
+      return null;
+    case _Op.begin:
+      return db.beginTransaction(readOnly: r.flag);
+    case _Op.commit:
+      db.commit(r.txnId!);
+      return null;
+    case _Op.rollback:
+      db.rollback(r.txnId!);
+      return null;
+    // The result crosses the isolate boundary as JSON: SqlResult is not a
+    // transferable type, and re-parsing on the far side is cheap next to the
+    // query itself.
+    case _Op.query:
+      return db
+          .query(r.text!, params: r.args as List<Object?>?, txnId: r.txnId)
+          .toJsonString();
+    case _Op.close:
+      db.close();
+      return null;
+    case _Op.scan:
+      final a = r.args! as _ScanArgs;
+      return db.scan(
+        start: a.start,
+        end: a.end,
+        startInclusive: a.startInclusive,
+        endInclusive: a.endInclusive,
+        limit: a.limit,
+        txnId: r.txnId,
+      );
+    case _Op.write:
+      db.write(r.args! as WriteBatch);
+      return null;
+    case _Op.backup:
+      db.backup(r.text!);
+      return null;
+    case _Op.restore:
+      db.restore(r.text!);
+      return null;
+    case _Op.compact:
+      db.compact();
+      return null;
+    case _Op.stats:
+      return db.stats();
+    case _Op.check:
+      return db.check();
+    case _Op.metrics:
+      return db.metricsReport();
+    case _Op.metricsPrometheus:
+      return db.metricsPrometheus();
+    case _Op.setTracing:
+      db.setTracing(r.flag);
+      return null;
+    case _Op.spans:
+      return db.spans();
+  }
 }
 
 /// Worker entry point: opens the database, then serves requests until closed.
-void _workerMain(_Boot boot) {
-  final commands = ReceivePort();
-  PhoenixDatabase db;
-  try {
-    db = PhoenixDatabase.open(
-      boot.path,
-      cachePages: boot.cachePages,
-      libraryPath: boot.libraryPath,
-    );
-  } catch (e) {
-    boot.ready.send('error: $e');
-    commands.close();
-    return;
-  }
-  boot.ready.send(commands.sendPort);
-
-  commands.listen((message) {
-    if (message is! List || message.length != 2) return;
-    final request = message[0] as _Request;
-    final reply = message[1] as SendPort;
-
-    try {
-      final Object? result = switch (request.op) {
-        _Op.insert => () {
-          db.insert(request.key!, request.value!, txnId: request.txnId);
-          return null;
-        }(),
-        _Op.get => db.get(request.key!, txnId: request.txnId),
-        _Op.delete => db.delete(request.key!, txnId: request.txnId),
-        _Op.count => db.count(),
-        _Op.checkpoint => () {
-          db.checkpoint();
-          return null;
-        }(),
-        _Op.flush => () {
-          db.flush();
-          return null;
-        }(),
-        _Op.verify => () {
-          db.verify();
-          return null;
-        }(),
-        _Op.begin => db.beginTransaction(readOnly: request.readOnly),
-        _Op.commit => () {
-          db.commit(request.txnId!);
-          return null;
-        }(),
-        _Op.rollback => () {
-          db.rollback(request.txnId!);
-          return null;
-        }(),
-        // The result crosses the isolate boundary as JSON: SqlResult is not
-        // a transferable type, and re-parsing on the far side is cheap next
-        // to the query itself.
-        _Op.query => db.query(request.sql!).toJsonString(),
-        _Op.close => () {
-          db.close();
-          return null;
-        }(),
-      };
-      reply.send(_Response(request.id, result: result));
-      if (request.op == _Op.close) {
-        commands.close();
-      }
-    } on PhoenixException catch (e) {
-      reply.send(_Response(request.id, error: e.message, status: e.status));
-    } catch (e) {
-      reply.send(_Response(request.id, error: e.toString()));
-    }
-  });
-}
+void _workerMain(_Boot boot) => serveWorker<PhoenixDatabase>(
+  boot.ready,
+  () => PhoenixDatabase.open(
+    boot.path,
+    cachePages: boot.cachePages,
+    libraryPath: boot.libraryPath,
+    options: boot.options,
+  ),
+  (db, request) => _execute(db, request! as _Request),
+  (request) => request is _Request && request.op == _Op.close,
+);
 
 /// Asynchronous PhoenixDB client backed by a dedicated worker isolate.
 ///
@@ -151,90 +199,143 @@ void _workerMain(_Boot boot) {
 /// await db.close();
 /// ```
 class AsyncPhoenixDB {
-  final SendPort _commands;
-  final ReceivePort _responses;
-  final Map<int, Completer<Object?>> _pending = {};
-  int _nextId = 1;
-  bool _closed = false;
+  final WorkerClient _worker;
 
-  AsyncPhoenixDB._(this._commands, this._responses) {
-    _responses.listen((message) {
-      if (message is! _Response) return;
-      final completer = _pending.remove(message.id);
-      if (completer == null) return;
-      if (message.error != null) {
-        completer.completeError(
-          PhoenixException(message.status ?? -1, message.error!),
-        );
-      } else {
-        completer.complete(message.result);
-      }
-    });
-  }
+  AsyncPhoenixDB._(this._worker);
 
   /// Spawns the worker isolate and opens the database at [path].
+  ///
+  /// See [PhoenixDatabase.open] for [options] and sharing semantics.
   static Future<AsyncPhoenixDB> open(
     String path, {
     int cachePages = 0,
     String? libraryPath,
-  }) async {
-    final ready = ReceivePort();
-    await Isolate.spawn(
+    PhoenixOptions? options,
+  }) async => AsyncPhoenixDB._(
+    await WorkerClient.spawn<_Boot>(
       _workerMain,
-      _Boot(ready.sendPort, path, cachePages, libraryPath),
+      (ready) => _Boot(ready, path, cachePages, libraryPath, options),
       debugName: 'phoenixdb-worker',
-    );
-    final first = await ready.first;
-    ready.close();
-    if (first is String) {
-      throw PhoenixException(-1, 'failed to open database: $first');
-    }
-    return AsyncPhoenixDB._(first as SendPort, ReceivePort());
-  }
+      what: 'database',
+    ),
+  );
 
-  /// Whether [close] has already run.
-  bool get isClosed => _closed;
+  /// Whether [close] has already run (or the worker died).
+  bool get isClosed => _worker.isClosed;
 
-  Future<Object?> _send(_Request request) {
-    if (_closed) {
-      return Future.error(const PhoenixException(-2, 'database is closed'));
-    }
-    final completer = Completer<Object?>();
-    _pending[request.id] = completer;
-    _commands.send([request, _responses.sendPort]);
-    return completer.future;
-  }
-
-  int get _id => _nextId++;
+  Future<Object?> _send(_Request request) => _worker.call(request);
 
   /// Begins a transaction and returns its id.
   Future<int> beginTransaction({bool readOnly = false}) async =>
-      await _send(_Request(_id, _Op.begin, readOnly: readOnly)) as int;
+      await _send(_Request(_Op.begin, flag: readOnly)) as int;
 
   /// Commits [txnId].
-  Future<void> commit(int txnId) =>
-      _send(_Request(_id, _Op.commit, txnId: txnId));
+  Future<void> commit(int txnId) => _send(_Request(_Op.commit, txnId: txnId));
 
   /// Rolls [txnId] back.
   Future<void> rollback(int txnId) =>
-      _send(_Request(_id, _Op.rollback, txnId: txnId));
+      _send(_Request(_Op.rollback, txnId: txnId));
 
   /// Inserts or replaces [key] with [value].
   Future<void> insert(Uint8List key, Uint8List value, {int? txnId}) =>
-      _send(_Request(_id, _Op.insert, key: key, value: value, txnId: txnId));
+      _send(_Request(_Op.insert, key: key, value: value, txnId: txnId));
 
   /// Reads [key], returning `null` when it does not exist.
   Future<Uint8List?> get(Uint8List key, {int? txnId}) async =>
-      await _send(_Request(_id, _Op.get, key: key, txnId: txnId)) as Uint8List?;
+      await _send(_Request(_Op.get, key: key, txnId: txnId)) as Uint8List?;
 
   /// Deletes [key], returning `false` when it did not exist.
   Future<bool> delete(Uint8List key, {int? txnId}) async =>
-      await _send(_Request(_id, _Op.delete, key: key, txnId: txnId)) as bool;
+      await _send(_Request(_Op.delete, key: key, txnId: txnId)) as bool;
 
   /// Number of visible keys.
-  Future<int> count() async => await _send(_Request(_id, _Op.count)) as int;
+  Future<int> count() async => await _send(_Request(_Op.count)) as int;
 
-  /// Runs a SQL statement on the worker isolate.
+  /// Pairs with keys between [start] and [end]; see [PhoenixDatabase.scan].
+  Future<List<PhoenixEntry>> scan({
+    Uint8List? start,
+    Uint8List? end,
+    bool startInclusive = true,
+    bool endInclusive = false,
+    int limit = 0,
+    int? txnId,
+  }) async =>
+      await _send(
+            _Request(
+              _Op.scan,
+              txnId: txnId,
+              args: _ScanArgs(start, end, startInclusive, endInclusive, limit),
+            ),
+          )
+          as List<PhoenixEntry>;
+
+  /// Pairs whose key starts with [prefix]; see [PhoenixDatabase.scanPrefix].
+  Future<List<PhoenixEntry>> scanPrefix(
+    Uint8List prefix, {
+    int limit = 0,
+    int? txnId,
+  }) => scan(
+    start: prefix.isEmpty ? null : prefix,
+    end: prefixSuccessor(prefix),
+    limit: limit,
+    txnId: txnId,
+  );
+
+  /// Streams pairs page by page (each page is one worker round trip).
+  ///
+  /// Like [PhoenixDatabase.entries]: nothing is held open between pages;
+  /// pass a read-only [txnId] for one consistent snapshot.
+  Stream<PhoenixEntry> entries({
+    Uint8List? start,
+    Uint8List? end,
+    Uint8List? prefix,
+    int pageSize = 256,
+    int? txnId,
+  }) async* {
+    if (pageSize <= 0) {
+      throw ArgumentError.value(pageSize, 'pageSize', 'must be positive');
+    }
+    if (prefix != null) {
+      if (start != null || end != null) {
+        throw ArgumentError('pass either prefix or start/end, not both');
+      }
+      start = prefix.isEmpty ? null : prefix;
+      end = prefixSuccessor(prefix);
+    }
+    var lo = start;
+    var inclusive = true;
+    while (true) {
+      final page = await scan(
+        start: lo,
+        end: end,
+        startInclusive: inclusive,
+        limit: pageSize,
+        txnId: txnId,
+      );
+      for (final entry in page) {
+        yield entry;
+      }
+      if (page.length < pageSize) return;
+      lo = page.last.key;
+      inclusive = false;
+    }
+  }
+
+  /// Applies every write in [batch] atomically.
+  Future<void> write(WriteBatch batch) async {
+    if (batch.isEmpty) return;
+    await _send(_Request(_Op.write, args: batch));
+  }
+
+  /// Builds a [WriteBatch] with [build] and applies it atomically.
+  Future<void> writeBatch(void Function(WriteBatch batch) build) {
+    final batch = WriteBatch();
+    build(batch);
+    return write(batch);
+  }
+
+  /// Runs a SQL statement on the worker isolate; see
+  /// [PhoenixDatabase.query] for [params] and [txnId].
   ///
   /// The parse and execution happen off the calling isolate, so a slow query
   /// never blocks a Flutter UI frame.
@@ -244,18 +345,63 @@ class AsyncPhoenixDB {
   /// final r = await db.query('SELECT name FROM users WHERE id = 1');
   /// print(r.scalar); // alice
   /// ```
-  Future<SqlResult> query(String sql) async => SqlResult.fromJson(
-    await _send(_Request(_id, _Op.query, sql: sql)) as String,
+  Future<SqlResult> query(
+    String sql, {
+    List<Object?>? params,
+    int? txnId,
+  }) async => SqlResult.fromJson(
+    await _send(
+          _Request(
+            _Op.query,
+            text: sql,
+            txnId: txnId,
+            args: params == null ? null : List<Object?>.of(params),
+          ),
+        )
+        as String,
   );
 
-  /// Merges pending versions, flushes, and truncates the WAL.
-  Future<void> checkpoint() => _send(_Request(_id, _Op.checkpoint));
+  /// Merges pending versions, flushes, and rewrites the WAL.
+  Future<void> checkpoint() => _send(_Request(_Op.checkpoint));
 
-  /// Flushes dirty pages without truncating the WAL.
-  Future<void> flush() => _send(_Request(_id, _Op.flush));
+  /// Syncs the WAL and flushes staged pages.
+  Future<void> flush() => _send(_Request(_Op.flush));
 
   /// Verifies checksums and B+Tree invariants.
-  Future<void> verify() => _send(_Request(_id, _Op.verify));
+  Future<void> verify() => _send(_Request(_Op.verify));
+
+  /// Full structural check; see [PhoenixDatabase.check].
+  Future<PhoenixTreeReport> check() async =>
+      await _send(_Request(_Op.check)) as PhoenixTreeReport;
+
+  /// Writes a consistent, compacted backup to [path].
+  Future<void> backup(String path) => _send(_Request(_Op.backup, text: path));
+
+  /// Replaces the contents with the backup at [path].
+  Future<void> restore(String path) => _send(_Request(_Op.restore, text: path));
+
+  /// Rebuilds the file with live data only.
+  Future<void> compact() => _send(_Request(_Op.compact));
+
+  /// Runtime statistics.
+  Future<PhoenixStats> stats() async =>
+      await _send(_Request(_Op.stats)) as PhoenixStats;
+
+  /// Human-readable metrics report.
+  Future<String> metricsReport() async =>
+      await _send(_Request(_Op.metrics)) as String;
+
+  /// Metrics in the Prometheus text format.
+  Future<String> metricsPrometheus() async =>
+      await _send(_Request(_Op.metricsPrometheus)) as String;
+
+  /// Turns engine span recording on or off.
+  Future<void> setTracing(bool enabled) =>
+      _send(_Request(_Op.setTracing, flag: enabled));
+
+  /// Spans recorded while tracing was on.
+  Future<List<TraceSpan>> spans() async =>
+      await _send(_Request(_Op.spans)) as List<TraceSpan>;
 
   /// Runs [body] in a transaction, committing on success and rolling back on
   /// failure. Retries [retries] times on a write-write conflict.
@@ -292,25 +438,6 @@ class AsyncPhoenixDB {
     }
   }
 
-  /// Closes the database and shuts the worker isolate down.
-  Future<void> close() async {
-    if (_closed) return;
-    try {
-      await _send(_Request(_id, _Op.close));
-    } finally {
-      _closed = true;
-      _responses.close();
-      for (final completer in _pending.values) {
-        if (!completer.isCompleted) {
-          completer.completeError(
-            const PhoenixException(
-              -1,
-              'database closed while a call was in flight',
-            ),
-          );
-        }
-      }
-      _pending.clear();
-    }
-  }
+  /// Closes the database and shuts the worker isolate down. Idempotent.
+  Future<void> close() => _worker.close(const _Request(_Op.close));
 }

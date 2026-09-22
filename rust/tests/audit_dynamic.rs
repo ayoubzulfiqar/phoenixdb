@@ -44,7 +44,7 @@ fn sync_false_commit_durability_after_crash() {
         db.insert(t, b"durable", b"yes").unwrap();
         db.commit(t).unwrap();
         db.flush().unwrap();
-        std::mem::forget(db);
+        db.simulate_crash();
     }
     let db = Database::open(&path, Options::default()).unwrap();
     assert_eq!(
@@ -230,7 +230,7 @@ fn fresh_database_survives_abrupt_close() {
     {
         let db = Database::open(&path, Options::default()).unwrap();
         db.put_auto(b"x", b"y").unwrap();
-        std::mem::forget(db);
+        db.simulate_crash();
     }
     let db = Database::open(&path, Options::default()).unwrap();
     assert_eq!(db.get_auto(b"x").unwrap(), b"y");
@@ -254,7 +254,7 @@ fn torn_wal_tail_does_not_lose_earlier_commits() {
                 handles.push(tx);
             }
         }
-        std::mem::forget(db);
+        db.simulate_crash();
     }
     let db = Database::open(&path, Options::default()).unwrap();
     for t in 0..4u64 {

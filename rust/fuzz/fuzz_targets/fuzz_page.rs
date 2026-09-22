@@ -7,7 +7,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use phoenixdb::page::{Page, PAGE_SIZE};
+use phoenixdb::page::{PAGE_SIZE, Page};
 
 fuzz_target!(|data: &[u8]| {
     // Arbitrary-length input: parsing must reject anything that is not exactly
@@ -50,7 +50,7 @@ fuzz_target!(|data: &[u8]| {
     }
 
     // Round-trip: a re-checksummed page must always parse back.
-    let mut rebuilt = Page::new(7, phoenixdb::page::PageType::Leaf);
+    let mut rebuilt = Page::new(7, phoenixdb::page::PageType::Leaf, None);
     rebuilt.set_parent(u32::from_le_bytes([data[0], data[1], data[2], data[3]]));
     rebuilt.finalize();
     let bytes = *rebuilt.as_bytes();

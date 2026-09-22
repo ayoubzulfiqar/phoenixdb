@@ -85,17 +85,22 @@ impl EncryptionKey {
         let mut key = [0u8; KEY_LEN];
         for (lane, chunk) in key.chunks_mut(8).enumerate() {
             let mut h: u64 = 0xcbf2_9ce4_8422_2325 ^ (lane as u64).wrapping_mul(0x9E37_79B9);
-            for &b in b"phoenixdb-kdf-v1" {
-                h ^= b as u64;
-                h = h.wrapping_mul(0x0000_0100_0000_01b3);
-            }
-            for &b in salt {
-                h ^= b as u64;
-                h = h.wrapping_mul(0x0000_0100_0000_01b3);
-            }
-            for &b in passphrase {
-                h ^= b as u64;
-                h = h.wrapping_mul(0x0000_0100_0000_01b3);
+            // Each input is length-prefixed: plain concatenation made
+            // (salt "ab", passphrase "c") and (salt "a", passphrase "bc")
+            // derive the same key.
+            let salt_len = (salt.len() as u64).to_le_bytes();
+            let pass_len = (passphrase.len() as u64).to_le_bytes();
+            for part in [
+                &b"phoenixdb-kdf-v2"[..],
+                &salt_len[..],
+                salt,
+                &pass_len[..],
+                passphrase,
+            ] {
+                for &b in part {
+                    h ^= b as u64;
+                    h = h.wrapping_mul(0x0000_0100_0000_01b3);
+                }
             }
             // SplitMix64 finaliser for avalanche.
             let mut z = h.wrapping_add(0x9E37_79B9_7F4A_7C15);
@@ -395,5 +400,16 @@ mod tests {
         assert!(rendered.contains("redacted"));
         assert!(!rendered.contains("ab"), "key bytes must not appear");
         assert!(!rendered.contains("171"));
+    }
+
+    #[test]
+    fn kdf_inputs_are_length_delimited() {
+        let a = EncryptionKey::derive_insecure_from_passphrase(b"c", b"ab");
+        let b = EncryptionKey::derive_insecure_from_passphrase(b"bc", b"a");
+        assert_ne!(
+            a.as_bytes(),
+            b.as_bytes(),
+            "salt/passphrase boundary must matter"
+        );
     }
 }

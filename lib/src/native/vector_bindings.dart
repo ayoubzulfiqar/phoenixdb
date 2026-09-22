@@ -126,6 +126,84 @@ typedef VectorSearchDart =
       Pointer<Size> outCount,
     );
 
+/// Native signature for `phoenix_vector_insert_batch`.
+typedef VectorInsertBatchNative =
+    Int32 Function(
+      Pointer<PhoenixVectorEngine> handle,
+      Pointer<Pointer<Utf8>> ids,
+      Size n,
+      Pointer<Float> vectors,
+      Size dim,
+    );
+
+/// Dart signature for `phoenix_vector_insert_batch`.
+typedef VectorInsertBatchDart =
+    int Function(
+      Pointer<PhoenixVectorEngine> handle,
+      Pointer<Pointer<Utf8>> ids,
+      int n,
+      Pointer<Float> vectors,
+      int dim,
+    );
+
+/// Native signature for `phoenix_vector_search_ids`.
+typedef VectorSearchIdsNative =
+    Int32 Function(
+      Pointer<PhoenixVectorEngine> handle,
+      Pointer<Float> queryPtr,
+      Size queryLen,
+      Size k,
+      Size ef,
+      Pointer<Pointer<Utf8>> ids,
+      Size nIds,
+      Pointer<Pointer<Utf8>> outIds,
+      Pointer<Float> outScores,
+      Pointer<Size> outCount,
+    );
+
+/// Dart signature for `phoenix_vector_search_ids`.
+typedef VectorSearchIdsDart =
+    int Function(
+      Pointer<PhoenixVectorEngine> handle,
+      Pointer<Float> queryPtr,
+      int queryLen,
+      int k,
+      int ef,
+      Pointer<Pointer<Utf8>> ids,
+      int nIds,
+      Pointer<Pointer<Utf8>> outIds,
+      Pointer<Float> outScores,
+      Pointer<Size> outCount,
+    );
+
+/// Native signature for `phoenix_vector_search_batch`.
+typedef VectorSearchBatchNative =
+    Int32 Function(
+      Pointer<PhoenixVectorEngine> handle,
+      Pointer<Float> queries,
+      Size nQueries,
+      Size dim,
+      Size k,
+      Size ef,
+      Pointer<Pointer<Utf8>> outIds,
+      Pointer<Float> outScores,
+      Pointer<Size> outCounts,
+    );
+
+/// Dart signature for `phoenix_vector_search_batch`.
+typedef VectorSearchBatchDart =
+    int Function(
+      Pointer<PhoenixVectorEngine> handle,
+      Pointer<Float> queries,
+      int nQueries,
+      int dim,
+      int k,
+      int ef,
+      Pointer<Pointer<Utf8>> outIds,
+      Pointer<Float> outScores,
+      Pointer<Size> outCounts,
+    );
+
 /// Native signature for `phoenix_vector_get`.
 typedef VectorGetNative =
     Int32 Function(
@@ -184,11 +262,17 @@ typedef VectorFlushDart = int Function(Pointer<PhoenixVectorEngine> handle);
 
 /// Native signature for `phoenix_vector_compact`.
 typedef VectorCompactNative =
-    Int32 Function(Pointer<PhoenixVectorEngine> handle, Pointer<Size> outReclaimed);
+    Int32 Function(
+      Pointer<PhoenixVectorEngine> handle,
+      Pointer<Size> outReclaimed,
+    );
 
 /// Dart signature for `phoenix_vector_compact`.
 typedef VectorCompactDart =
-    int Function(Pointer<PhoenixVectorEngine> handle, Pointer<Size> outReclaimed);
+    int Function(
+      Pointer<PhoenixVectorEngine> handle,
+      Pointer<Size> outReclaimed,
+    );
 
 /// Native signature for `phoenix_vector_count` and `phoenix_vector_dim`.
 typedef VectorSizeQueryNative =
@@ -269,6 +353,15 @@ class PhoenixVectorBindings {
   /// Searches for the k nearest neighbours.
   final VectorSearchDart search;
 
+  /// Inserts many vectors in one call.
+  final VectorInsertBatchDart insertBatch;
+
+  /// Exact search restricted to a set of ids.
+  final VectorSearchIdsDart searchIds;
+
+  /// Runs several searches in one call.
+  final VectorSearchBatchDart searchBatch;
+
   /// Fetches a stored vector by id.
   final VectorGetDart get;
 
@@ -339,6 +432,18 @@ class PhoenixVectorBindings {
       search = library.lookupFunction<VectorSearchNative, VectorSearchDart>(
         'phoenix_vector_search',
       ),
+      insertBatch = library
+          .lookupFunction<VectorInsertBatchNative, VectorInsertBatchDart>(
+            'phoenix_vector_insert_batch',
+          ),
+      searchIds = library
+          .lookupFunction<VectorSearchIdsNative, VectorSearchIdsDart>(
+            'phoenix_vector_search_ids',
+          ),
+      searchBatch = library
+          .lookupFunction<VectorSearchBatchNative, VectorSearchBatchDart>(
+            'phoenix_vector_search_batch',
+          ),
       get = library.lookupFunction<VectorGetNative, VectorGetDart>(
         'phoenix_vector_get',
       ),

@@ -103,6 +103,11 @@
 #define MAX_VALUE_LEN ((10 * 1024) * 1024)
 
 /**
+ * Longest identifier accepted, in bytes.
+ */
+#define MAX_IDENT_LEN 128
+
+/**
  * Stable status codes returned by every `phoenix_*` FFI entry point.
  *
  * `0` means success; every failure is negative so callers can test `< 0`.
@@ -153,6 +158,15 @@ enum PhoenixStatus
      * A structural limit was reached (page/value cannot be stored).
      */
     PHOENIX_STATUS_FULL = -9,
+    /**
+     * The caller stopped an iteration early (a scan callback returned
+     * non-zero). Not a failure of the engine.
+     */
+    PHOENIX_STATUS_ABORTED = -10,
+    /**
+     * The database file is locked by another process.
+     */
+    PHOENIX_STATUS_BUSY = -11,
 };
 #ifndef __cplusplus
 #if __STDC_VERSION__ >= 202311L
@@ -163,10 +177,16 @@ typedef int32_t PhoenixStatus;
 #endif // __cplusplus
 
 /**
+ * A collection of documents; see the module docs.
+ */
+typedef struct Collection Collection;
+
+/**
  * The embedded database handle.
  *
  * Cloning is intentionally not provided: the FFI layer owns exactly one
- * `Database` per `PhoenixDB*` and frees it in `phoenix_close`.
+ * `Database` per `PhoenixDB*` and frees it in `phoenix_close`. Share it across
+ * threads with an `Arc`.
  */
 typedef struct Database Database;
 
@@ -192,12 +212,49 @@ typedef uint64_t HandleTag;
  * Opaque database handle handed to C.
  *
  * The `tag` is the first field so a stale or foreign pointer is caught by the
- * constant-time check in [`DbHandle::validate`] before `db` is touched.
+ * constant-time check in [`PhoenixDbHandle::validate`] before `db` is
+ * touched. `db` is one strong reference (`Arc::into_raw`) to an engine that
+ * may be shared with other handles for the same file.
  */
 typedef struct {
     HandleTag tag;
-    Database *db;
+    const Database *db;
 } PhoenixDB;
+
+/**
+ * Engine options accepted by [`phoenix_open_ex`].
+ *
+ * Zero means "engine default" for every numeric field, so a zeroed struct
+ * with only `struct_size` set is valid.
+ */
+typedef struct {
+    /**
+     * `sizeof(PhoenixOptions)` as the caller was compiled with. Lets later
+     * versions append fields without breaking older callers.
+     */
+    uint32_t struct_size;
+    /**
+     * `1` fsyncs the WAL on every commit (the default); `0` hands commits to
+     * the OS only (survives an app crash, not power loss). `-1` = default.
+     */
+    int32_t sync_on_commit;
+    /**
+     * Clean-page cache capacity in pages; `0` = default.
+     */
+    uint64_t cache_pages;
+    /**
+     * WAL size that triggers an automatic checkpoint; `0` = default.
+     */
+    uint64_t checkpoint_bytes;
+    /**
+     * Non-zero records engine spans (see `phoenix_spans_json`).
+     */
+    int32_t tracing;
+    /**
+     * Leaf fill factor before a split, in `(0.5, 1.0]`; `0` = default.
+     */
+    float fill_factor_max;
+} PhoenixOptions;
 
 /**
  * An owned byte buffer returned to the caller.
@@ -219,7 +276,105 @@ typedef struct {
     uintptr_t cap;
 } PhoenixBuffer;
 
-typedef int (*ScanIterCallback)(const uint8_t*, uintptr_t, const uint8_t*, uintptr_t);
+/**
+ * Receives one key/value pair; return `0` to continue, non-zero to stop.
+ */
+typedef int (*PhoenixScanCallback)(const uint8_t*, uintptr_t, const uint8_t*, uintptr_t);
+
+/**
+ * Runtime statistics written by [`phoenix_stats`].
+ */
+typedef struct {
+    /**
+     * Pages allocated in the file.
+     */
+    uint32_t page_count;
+    /**
+     * Reserved; always zero.
+     */
+    uint32_t reserved;
+    /**
+     * Live transactions.
+     */
+    uint64_t active_txns;
+    /**
+     * Keys with versions not yet merged into the tree.
+     */
+    uint64_t pending_keys;
+    /**
+     * Current WAL size in bytes.
+     */
+    uint64_t wal_bytes;
+    /**
+     * Latest commit timestamp.
+     */
+    uint64_t commit_ts;
+    /**
+     * Every version at or below this timestamp is in the durable tree.
+     */
+    uint64_t tree_ts;
+    /**
+     * Page reads served from memory.
+     */
+    uint64_t cache_hits;
+    /**
+     * Page reads that decoded a page from the file.
+     */
+    uint64_t cache_misses;
+} PhoenixStats;
+
+/**
+ * Result of [`phoenix_check`].
+ */
+typedef struct {
+    /**
+     * Levels from the root to the leaves.
+     */
+    uint32_t depth;
+    /**
+     * Leaf pages reachable from the root.
+     */
+    uint32_t leaf_pages;
+    /**
+     * Internal pages reachable from the root.
+     */
+    uint32_t internal_pages;
+    /**
+     * Overflow pages reachable from leaf cells.
+     */
+    uint32_t overflow_pages;
+    /**
+     * Pages on the free list.
+     */
+    uint32_t free_pages;
+    /**
+     * Allocated pages neither reachable nor free (leaked by a crash).
+     */
+    uint32_t unreachable_pages;
+    /**
+     * Non-root leaves below the minimum fill factor.
+     */
+    uint32_t underfull_leaves;
+    /**
+     * Reserved; always zero.
+     */
+    uint32_t reserved;
+    /**
+     * Keys stored in the tree (excluding unmerged in-memory versions).
+     */
+    uint64_t keys;
+} PhoenixTreeReport;
+
+/**
+ * Opaque collection handle handed to C.
+ */
+typedef struct {
+    HandleTag tag;
+    /**
+     * One strong reference (`Arc::into_raw`) to a possibly shared collection.
+     */
+    const Collection *collection;
+} PhoenixCollectionHandle;
 
 /**
  * Opaque vector-engine handle handed to C.
@@ -230,7 +385,10 @@ typedef int (*ScanIterCallback)(const uint8_t*, uintptr_t, const uint8_t*, uintp
  */
 typedef struct {
     HandleTag tag;
-    VectorEngine *engine;
+    /**
+     * One strong reference (`Arc::into_raw`) to a possibly shared engine.
+     */
+    const VectorEngine *engine;
 } PhoenixVectorHandle;
 
 #ifdef __cplusplus
@@ -238,10 +396,19 @@ extern "C" {
 #endif // __cplusplus
 
 /**
+ * Number of distinct engines currently open through the C ABI (diagnostics).
+ */
+uintptr_t phoenix_open_engine_count(void);
+
+/**
  * Opens (or creates) a database.
  *
  * `path` must be a NUL-terminated UTF-8 string. On success `*out_handle`
  * receives a handle that must be released with [`phoenix_close`].
+ *
+ * Opening a path this process already has open returns a new handle to the
+ * same engine (options of the later open are ignored); every handle must be
+ * closed. A file locked by another process fails with `PHOENIX_STATUS_BUSY`.
  *
  * # Safety
  * `path` must point to a valid NUL-terminated string and `out_handle` to a
@@ -250,10 +417,24 @@ extern "C" {
 int phoenix_open(const char *path, uintptr_t cache_pages, PhoenixDB **out_handle);
 
 /**
- * Checkpoints and closes a database, freeing the handle.
+ * Opens (or creates) a database with explicit engine options.
  *
- * Passing the same handle twice is detected by the poisoned tag and reported
- * as `-2` rather than causing a double free.
+ * `options` may be null for all defaults. See [`phoenix_open`] for sharing
+ * and ownership rules.
+ *
+ * # Safety
+ * `path` must point to a valid NUL-terminated string, `options` (if non-null)
+ * to a `PhoenixOptions` of at least `options->struct_size` bytes, and
+ * `out_handle` to a writable pointer-sized location.
+ */
+int phoenix_open_ex(const char *path, const PhoenixOptions *options, PhoenixDB **out_handle);
+
+/**
+ * Closes a database handle, freeing it.
+ *
+ * When this is the last handle to its engine, the engine checkpoints and
+ * releases the file. Passing the same handle twice is detected by the
+ * poisoned tag and reported as `-2` rather than causing a double free.
  *
  * # Safety
  * `handle` must come from [`phoenix_open`] and must not be used afterwards.
@@ -387,11 +568,11 @@ int phoenix_count(PhoenixDB *handle, uint64_t *out_len);
 /**
  * ABI version of this build. Dart refuses to load a mismatched library.
  *
- * Bumped to 3 in PhoenixDB 2.1: the `phoenix_vector_*` surface was added.
- * Every earlier entry point keeps its signature, so the change is purely
- * additive, but the version is what tells Dart the vector symbols are
- * present — the loader would otherwise fail with a missing symbol at first
- * use rather than at load time.
+ * * 3 (PhoenixDB 2.1): the `phoenix_vector_*` surface was added.
+ * * 4 (PhoenixDB 4.0): `phoenix_open_ex`, range/prefix scans, write batches,
+ *   backup/restore/compact, stats, structural check, metrics text, tracing,
+ *   and the `ABORTED`/`BUSY` status codes. Every earlier entry point keeps
+ *   its signature.
  */
 uint32_t phoenix_abi_version(void);
 
@@ -441,6 +622,26 @@ int phoenix_has_sql(void);
 int phoenix_sql_query(PhoenixDB *handle, const char *sql, char **out_json);
 
 /**
+ * Executes one SQL statement with bound parameters, optionally inside the
+ * caller's transaction.
+ *
+ * * `txn_id == 0` runs the statement in its own transaction (retried
+ *   transparently on a write-write conflict). Otherwise it runs inside
+ *   `txn_id`, atomically (a failure stages nothing); committing and retrying
+ *   on `PHOENIX_STATUS_CONFLICT` are then the caller's.
+ * * `params_json` is null or a JSON array of scalars bound to `?` / `?N` in
+ *   order: `null`, booleans (as 0/1), numbers and strings. Bind user data
+ *   this way rather than splicing it into the SQL text.
+ *
+ * The result document and its ownership are as for [`phoenix_sql_query`].
+ *
+ * # Safety
+ * `handle` must be live, `sql` (and `params_json` when non-null) NUL-terminated
+ * UTF-8 strings, and `out_json` a writable pointer-sized location.
+ */
+int phoenix_sql_query_params(PhoenixDB *handle, uint64_t txn_id, const char *sql, const char *params_json, char **out_json);
+
+/**
  * Maximum key length accepted by the FFI layer, in bytes.
  */
 uintptr_t phoenix_max_key_len(void);
@@ -451,30 +652,251 @@ uintptr_t phoenix_max_key_len(void);
 uintptr_t phoenix_max_value_len(void);
 
 /**
- * Streams every visible key/value pair to `callback`.
+ * Streams every visible key/value pair to `callback`, in key order.
  *
- * The callback receives pointers into Rust-owned memory. It must not free
- * them. Return `0` to continue scanning or non-zero to abort early; the
- * first non-zero status is propagated to Dart.
+ * The callback receives pointers into Rust-owned memory that are valid only
+ * for the duration of that call; it must copy what it keeps and must not
+ * free them. It runs while the engine's shared lock is held, so it must not
+ * call back into this database. Returning non-zero stops the scan and makes
+ * this function return `PHOENIX_STATUS_ABORTED`.
  *
  * # Safety
- * `callback` must be valid for the duration of the scan.
+ * `callback` must be null or valid for the duration of the scan.
  */
-int phoenix_scan_iter(PhoenixDB *handle, ScanIterCallback callback);
+int phoenix_scan_iter(PhoenixDB *handle, PhoenixScanCallback callback);
+
+/**
+ * Collects key/value pairs with keys between two bounds into one buffer.
+ *
+ * * `txn_id == 0` reads the latest committed state; otherwise the scan sees
+ *   that transaction's snapshot and its own uncommitted writes.
+ * * `lo_mode` / `hi_mode`: `0` unbounded (pointer ignored), `1` inclusive,
+ *   `2` exclusive.
+ * * Stops after `limit` pairs, or once the buffer holds at least `max_bytes`
+ *   bytes (each `0` = no limit). To page, call again with the last key as an
+ *   exclusive lower bound.
+ *
+ * `*out` receives repeated `[u32 LE key_len][key][u32 LE value_len][value]`
+ * records in ascending key order; release it with [`phoenix_buffer_free`].
+ * No callback is involved, so this is safe to call from any thread.
+ *
+ * # Safety
+ * Bound pointers must be readable for their lengths; `out` must be writable.
+ */
+int phoenix_scan_range(PhoenixDB *handle, uint64_t txn_id, const uint8_t *lo, uintptr_t lo_len, int lo_mode, const uint8_t *hi, uintptr_t hi_len, int hi_mode, uint64_t limit, uint64_t max_bytes, PhoenixBuffer *out);
+
+/**
+ * Collects pairs whose key starts with `prefix`; otherwise identical to
+ * [`phoenix_scan_range`]. An empty prefix scans everything.
+ *
+ * # Safety
+ * `prefix` must be readable for `prefix_len` bytes; `out` must be writable.
+ */
+int phoenix_scan_prefix(PhoenixDB *handle, uint64_t txn_id, const uint8_t *prefix, uintptr_t prefix_len, uint64_t limit, uint64_t max_bytes, PhoenixBuffer *out);
+
+/**
+ * Applies a batch of writes atomically in one transaction.
+ *
+ * `ops` holds repeated records: `[u8 op][u32 LE key_len][key]` followed, for
+ * a put, by `[u32 LE value_len][value]`. Ops: `1` put, `2` delete (fails the
+ * whole batch with `NOT_FOUND` if the key is absent), `3` delete if present.
+ * The batch is validated before anything is staged; any failure rolls the
+ * whole batch back. Maximum batch size: 1 GiB.
+ *
+ * # Safety
+ * `ops` must be readable for `ops_len` bytes.
+ */
+int phoenix_write_batch(PhoenixDB *handle, const uint8_t *ops, uintptr_t ops_len);
+
+/**
+ * Writes a consistent, compacted, self-contained copy of the database to
+ * `path` while other callers keep reading and writing.
+ *
+ * # Safety
+ * `handle` must be live and `path` a NUL-terminated UTF-8 string.
+ */
+int phoenix_backup(PhoenixDB *handle, const char *path);
+
+/**
+ * Replaces the database's contents with the backup at `path`, atomically.
+ * Fails with `INVALID_ARGUMENT` while any transaction is open.
+ *
+ * # Safety
+ * `handle` must be live and `path` a NUL-terminated UTF-8 string.
+ */
+int phoenix_restore(PhoenixDB *handle, const char *path);
+
+/**
+ * Rebuilds the file with live data only, returning free pages to the
+ * filesystem. Blocks other callers for the duration.
+ *
+ * # Safety
+ * `handle` must be live.
+ */
+int phoenix_compact(PhoenixDB *handle);
+
+/**
+ * Writes runtime statistics to `*out`.
+ *
+ * # Safety
+ * `handle` must be live and `out` writable.
+ */
+int phoenix_stats(PhoenixDB *handle, PhoenixStats *out);
+
+/**
+ * Runs the full structural check and writes its report to `*out`.
+ *
+ * Returns `PHOENIX_STATUS_CORRUPTION` (with details from
+ * `phoenix_last_error`) when any invariant is violated.
+ *
+ * # Safety
+ * `handle` must be live and `out` writable.
+ */
+int phoenix_check(PhoenixDB *handle, PhoenixTreeReport *out);
+
+/**
+ * Renders the metrics registry: `format` `0` = human-readable report, `1` =
+ * Prometheus text exposition. `*out` receives a string to release with
+ * [`phoenix_string_free`].
+ *
+ * # Safety
+ * `handle` must be live and `out` writable.
+ */
+int phoenix_metrics_text(PhoenixDB *handle, int format, char **out);
 
 /**
  * Writes the engine's metrics report into `out_buf` as a NUL-terminated UTF-8
  * string.
  *
- * Returns the number of bytes written (excluding the NUL terminator) on
- * success, or a negative [`PhoenixStatus`] on failure. When `out_buf` is too
- * small, the call returns the required size as a negative error; grow the
- * buffer and retry.
+ * Returns the number of bytes written (excluding the NUL terminator), or a
+ * negative [`PhoenixStatus`]: `PHOENIX_STATUS_FULL` when `out_len` is too
+ * small (nothing is written). Prefer [`phoenix_metrics_text`], which has no
+ * size negotiation.
  *
  * # Safety
  * `handle` must be live, `out_buf` must point to `out_len` writable bytes.
  */
 intptr_t phoenix_metrics_report(PhoenixDB *handle, uint8_t *out_buf, uintptr_t out_len);
+
+/**
+ * Turns span recording on (`enabled != 0`) or off.
+ *
+ * # Safety
+ * `handle` must be live.
+ */
+int phoenix_set_tracing(PhoenixDB *handle, int enabled);
+
+/**
+ * Writes the recorded spans (oldest first, at most the last 1024) as a JSON
+ * array to `*out`; release it with [`phoenix_string_free`]. Each element is
+ * `{"name","trace_id","span_id","parent_id","duration_us","error","attributes"}`.
+ *
+ * # Safety
+ * `handle` must be live and `out` writable.
+ */
+int phoenix_spans_json(PhoenixDB *handle, char **out);
+
+/**
+ * Opens (creating if needed) the collection in directory `path`.
+ *
+ * `options_json` may be null or an object with any of `dim` (0 = no vectors
+ * / adopt the existing layout), `metric` (`"cosine"`, `"euclidean"`,
+ * `"dot_product"` or 0/1/2), `text_index`, `sync`, `m`, `ef_construction`,
+ * `ef_search`. A directory already open in this process is shared.
+ *
+ * # Safety
+ * `path` must be a NUL-terminated string, `options_json` null or one, and
+ * `out_handle` writable.
+ */
+int phoenix_collection_open(const char *path, const char *options_json, PhoenixCollectionHandle **out_handle);
+
+/**
+ * Releases a handle; the last handle for a directory closes it cleanly.
+ * Null and already-closed handles are ignored.
+ *
+ * # Safety
+ * `handle` must come from [`phoenix_collection_open`] and not be used after.
+ */
+void phoenix_collection_close(PhoenixCollectionHandle *handle);
+
+/**
+ * Inserts or replaces documents atomically; see the module docs for the
+ * wire format. `vectors` may be null when `vectors_len` (a float count) is 0.
+ *
+ * # Safety
+ * `docs_json` must be a NUL-terminated string and `vectors` readable for
+ * `vectors_len` floats.
+ */
+int phoenix_collection_upsert(PhoenixCollectionHandle *handle, const char *docs_json, const float *vectors, uintptr_t vectors_len);
+
+/**
+ * Deletes documents; `ids_json` is a JSON array of ids. `*out_deleted`
+ * (optional) receives how many existed.
+ *
+ * # Safety
+ * `ids_json` must be a NUL-terminated string; `out_deleted` null or writable.
+ */
+int phoenix_collection_delete(PhoenixCollectionHandle *handle, const char *ids_json, uint64_t *out_deleted);
+
+/**
+ * Fetches one document as JSON; `PHOENIX_STATUS_NOT_FOUND` when absent.
+ *
+ * # Safety
+ * `id` must be a NUL-terminated string and `out_json` writable.
+ */
+int phoenix_collection_get(PhoenixCollectionHandle *handle, const char *id, int with_vector, char **out_json);
+
+/**
+ * Runs a search. `request_json` is a request object (null = `{}`); the
+ * query vector is optional (`query_len == 0`). `*out_json` receives a JSON
+ * array of hits `{"id", "score", "vector_score"?, "distance"?,
+ * "text_score"?, "text"?, "metadata"?, "vector"?}`.
+ *
+ * # Safety
+ * `request_json` null or NUL-terminated; `query` readable for `query_len`
+ * floats; `out_json` writable.
+ */
+int phoenix_collection_search(PhoenixCollectionHandle *handle, const char *request_json, const float *query, uintptr_t query_len, char **out_json);
+
+/**
+ * Counts documents matching `filter_json` (null = all).
+ *
+ * # Safety
+ * `filter_json` null or NUL-terminated; `out_count` writable.
+ */
+int phoenix_collection_count(PhoenixCollectionHandle *handle, const char *filter_json, uint64_t *out_count);
+
+/**
+ * Lists documents matching `filter_json` (null = all) in id order, after
+ * `after` (null = from the start), at most `limit` (0 = all), as a JSON
+ * array. Vectors are not included.
+ *
+ * # Safety
+ * `filter_json` and `after` null or NUL-terminated; `out_json` writable.
+ */
+int phoenix_collection_list(PhoenixCollectionHandle *handle, const char *filter_json, uint64_t limit, const char *after, char **out_json);
+
+/**
+ * Writes collection statistics as a JSON object
+ * `{"documents", "text_documents", "vectors", "dim", "repaired", "metric"}`.
+ *
+ * # Safety
+ * `out_json` must be writable.
+ */
+int phoenix_collection_stats(PhoenixCollectionHandle *handle, char **out_json);
+
+/**
+ * Syncs vectors and checkpoints documents.
+ *
+ * # Safety
+ * `handle` must be a live collection handle.
+ */
+int phoenix_collection_flush(PhoenixCollectionHandle *handle);
+
+/**
+ * Number of distinct collections open in this process (diagnostics).
+ */
+uint32_t phoenix_collection_open_count(void);
 
 /**
  * Creates a vector index at `path`, or opens an existing one.
@@ -546,6 +968,44 @@ int phoenix_vector_insert(PhoenixVectorHandle *handle, const char *id, const flo
  * writable.
  */
 int phoenix_vector_search(const PhoenixVectorHandle *handle, const float *query_ptr, uintptr_t query_len, uintptr_t k, uintptr_t ef, char **out_ids, float *out_scores, uintptr_t *out_count);
+
+/**
+ * Inserts (or replaces) `n` vectors in one call and one lock acquisition.
+ *
+ * `ids` holds `n` NUL-terminated ids; `vectors` holds the vectors back to
+ * back (`n * dim` floats). The whole batch is validated before anything is
+ * written, so a bad id or vector leaves the index untouched.
+ *
+ * # Safety
+ * `ids` must hold `n` valid NUL-terminated strings and `vectors` must be
+ * readable for `n * dim` floats.
+ */
+int phoenix_vector_insert_batch(const PhoenixVectorHandle *handle, const char *const *ids, uintptr_t n, const float *vectors, uintptr_t dim);
+
+/**
+ * Exact `k`-nearest search restricted to the ids in `ids[0..n_ids]` —
+ * typically the result of a metadata filter. Unknown or removed ids are
+ * ignored. Outputs follow [`phoenix_vector_search`].
+ *
+ * # Safety
+ * As [`phoenix_vector_search`]; additionally `ids` must hold `n_ids` valid
+ * NUL-terminated strings.
+ */
+int phoenix_vector_search_ids(const PhoenixVectorHandle *handle, const float *query_ptr, uintptr_t query_len, uintptr_t k, uintptr_t ef, const char *const *ids, uintptr_t n_ids, char **out_ids, float *out_scores, uintptr_t *out_count);
+
+/**
+ * Runs `n_queries` searches in one call. `queries` holds the queries back to
+ * back (`n_queries * dim` floats). Query `i` writes up to `k` results at
+ * `out_ids[i * k..]` / `out_scores[i * k..]` and its count at
+ * `out_counts[i]`. Free each query's ids with [`phoenix_free_string_array`]
+ * using its own count.
+ *
+ * # Safety
+ * `queries` must be readable for `n_queries * dim` floats; `out_ids` and
+ * `out_scores` writable for `n_queries * k` elements; `out_counts` for
+ * `n_queries`.
+ */
+int phoenix_vector_search_batch(const PhoenixVectorHandle *handle, const float *queries, uintptr_t n_queries, uintptr_t dim, uintptr_t k, uintptr_t ef, char **out_ids, float *out_scores, uintptr_t *out_counts);
 
 /**
  * Fetches a stored vector by id, copying it into `out_vec`.

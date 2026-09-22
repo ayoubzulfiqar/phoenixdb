@@ -32,6 +32,11 @@ pub enum PhoenixStatus {
     TxnNotFound = -8,
     /// A structural limit was reached (page/value cannot be stored).
     Full = -9,
+    /// The caller stopped an iteration early (a scan callback returned
+    /// non-zero). Not a failure of the engine.
+    Aborted = -10,
+    /// The database file is locked by another process.
+    Busy = -11,
 }
 
 /// Internal error type. Converted to [`PhoenixStatus`] at the FFI boundary.
@@ -55,6 +60,10 @@ pub enum Error {
     Serialization(String),
     /// Handle has already been closed.
     Closed,
+    /// An iteration was stopped by the caller.
+    Aborted,
+    /// The database is locked by another process (or another engine handle).
+    Busy(String),
 }
 
 impl Error {
@@ -70,6 +79,8 @@ impl Error {
             Error::Full(_) => PhoenixStatus::Full,
             Error::Serialization(_) => PhoenixStatus::Corruption,
             Error::Closed => PhoenixStatus::InvalidArgument,
+            Error::Aborted => PhoenixStatus::Aborted,
+            Error::Busy(_) => PhoenixStatus::Busy,
         }
     }
 
@@ -96,6 +107,8 @@ impl fmt::Display for Error {
             Error::Full(m) => write!(f, "capacity exceeded: {m}"),
             Error::Serialization(m) => write!(f, "serialization failure: {m}"),
             Error::Closed => write!(f, "database handle is closed"),
+            Error::Aborted => write!(f, "iteration stopped by the caller"),
+            Error::Busy(m) => write!(f, "database is busy: {m}"),
         }
     }
 }

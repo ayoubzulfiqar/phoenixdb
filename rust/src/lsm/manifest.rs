@@ -90,6 +90,13 @@ pub enum ManifestEdit {
         /// Durable sequence number.
         seqno: u64,
     },
+    /// Several edits applied atomically — one frame, one CRC, one `fsync`.
+    ///
+    /// A compaction's additions and removals must land together: replaying
+    /// the additions without the removals leaves old and new tables live side
+    /// by side, and when the new table dropped a tombstone the stale old one
+    /// resurrects the deleted key.
+    Batch(Vec<ManifestEdit>),
 }
 
 /// [`TableMeta`] in a form `serde` can round-trip.
@@ -160,6 +167,8 @@ pub struct ManifestState {
     pub edits_replayed: u64,
     /// Bytes discarded from a torn tail.
     pub truncated_bytes: u64,
+    /// Length of the intact prefix: where the next edit belongs.
+    pub valid_bytes: u64,
 }
 
 /// Append-only manifest log.
@@ -170,20 +179,42 @@ pub struct Manifest {
 }
 
 impl Manifest {
+    /// Opens the manifest and cuts off everything past `valid_bytes` (a torn
+    /// tail from a crash mid-append) before anything new is appended —
+    /// otherwise the next replay stops at the garbage and never sees the edits
+    /// written after it.
+    pub fn open_truncated(path: impl AsRef<Path>, valid_bytes: u64) -> Result<Self> {
+        let mut manifest = Manifest::open(path)?;
+        if manifest.size()? > valid_bytes {
+            manifest.writer.flush()?;
+            let file = manifest.writer.get_mut();
+            file.set_len(valid_bytes)?;
+            file.sync_all()?;
+            manifest.writer.seek(SeekFrom::End(0))?;
+        }
+        Ok(manifest)
+    }
+
     /// Opens (creating if needed) the manifest at `path`, positioned to append.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent)?;
-            }
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent)?;
         }
+        let created = !path.exists();
         let file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
             .open(&path)?;
+        if created {
+            // A manifest whose directory entry is lost after a power cut
+            // would make every table look orphaned.
+            crate::fsutil::sync_parent_dir(&path);
+        }
         let mut writer = BufWriter::new(file);
         writer.seek(SeekFrom::End(0))?;
         Ok(Manifest {
@@ -241,8 +272,12 @@ impl Manifest {
 
     /// Replays the manifest at `path`, returning the live table set.
     ///
-    /// A torn tail is truncated rather than reported as an error — that is the
-    /// expected state after a crash mid-append.
+    /// A torn *tail* — an incomplete last frame, the expected state after a
+    /// crash mid-append — is tolerated and reported through
+    /// [`ManifestState::truncated_bytes`]. A bad frame with intact data after
+    /// it is not a crash artefact but corruption, and is an error: replaying
+    /// only the prefix would silently drop every later edit (and the caller
+    /// would then delete those edits' tables as orphans).
     pub fn recover(path: impl AsRef<Path>) -> Result<ManifestState> {
         let mut state = ManifestState {
             next_table_id: 1,
@@ -280,7 +315,14 @@ impl Manifest {
                 bytes[cursor + 7],
             ]);
             if len == 0 || len > MAX_RECORD_BYTES {
-                break; // corrupt length: treat the rest as torn
+                // A zero-filled or partial header at the end is a torn write;
+                // an impossible length followed by real data is corruption.
+                if bytes[cursor..].iter().all(|b| *b == 0) || bytes.len() - cursor < 16 {
+                    break;
+                }
+                return Err(Error::corrupt(format!(
+                    "manifest frame at offset {cursor} declares an impossible length {len}"
+                )));
             }
             let start = cursor + 8;
             let end = match start.checked_add(len as usize) {
@@ -288,13 +330,37 @@ impl Manifest {
                 _ => break, // truncated tail
             };
             let payload = &bytes[start..end];
-            if crc32fast::hash(payload) != crc {
-                break; // torn or corrupted frame
-            }
-            let Ok(edit) = bincode::deserialize::<ManifestEdit>(payload) else {
-                break;
+            let edit = if crc32fast::hash(payload) == crc {
+                bincode::deserialize::<ManifestEdit>(payload).ok()
+            } else {
+                None
+            };
+            let Some(edit) = edit else {
+                if end == bytes.len() {
+                    break; // the last frame is torn
+                }
+                return Err(Error::corrupt(format!(
+                    "manifest frame at offset {cursor} is corrupt and {} byte(s) follow it; \
+                     refusing to guess which tables are live",
+                    bytes.len() - end
+                )));
             };
 
+            Self::apply(&mut state, &mut live, edit);
+            state.edits_replayed += 1;
+            cursor = end;
+            good_bytes = end;
+        }
+
+        state.truncated_bytes = total - good_bytes as u64;
+        state.valid_bytes = good_bytes as u64;
+        state.tables = live;
+        Ok(state)
+    }
+
+    /// Applies one replayed edit to the live set.
+    fn apply(state: &mut ManifestState, live: &mut Vec<TableMeta>, edit: ManifestEdit) {
+        {
             match edit {
                 ManifestEdit::AddTable { meta } => {
                     let meta: TableMeta = meta.into();
@@ -310,24 +376,22 @@ impl Manifest {
                     next_table_id,
                 } => {
                     // A snapshot supersedes everything before it.
-                    live = tables.into_iter().map(TableMeta::from).collect();
+                    *live = tables.into_iter().map(TableMeta::from).collect();
                     state.next_table_id = next_table_id.max(1);
-                    for t in &live {
+                    for t in live.iter() {
                         state.next_table_id = state.next_table_id.max(t.id + 1);
                     }
                 }
                 ManifestEdit::Checkpoint { seqno } => {
                     state.checkpoint_seqno = state.checkpoint_seqno.max(seqno);
                 }
+                ManifestEdit::Batch(edits) => {
+                    for edit in edits {
+                        Self::apply(state, live, edit);
+                    }
+                }
             }
-            state.edits_replayed += 1;
-            cursor = end;
-            good_bytes = end;
         }
-
-        state.truncated_bytes = total - good_bytes as u64;
-        state.tables = live;
-        Ok(state)
     }
 
     /// Rewrites the log as one `FullSnapshot`, bounding replay time.
@@ -363,22 +427,18 @@ impl Manifest {
             fresh.sync()?;
         }
 
-        // Atomic swap. On Windows `rename` fails if the target exists, so the
-        // original is removed first; the temp file is already durable.
-        #[cfg(windows)]
-        {
-            if path.exists() {
-                std::fs::remove_file(&path)?;
-            }
-        }
+        // Atomic swap: `rename` replaces the target on every platform
+        // (MoveFileExW with REPLACE_EXISTING on Windows). Removing the target
+        // first, as this once did on Windows, opened a window in which a crash
+        // left no manifest at all — and every table then looked orphaned.
         std::fs::rename(&tmp, &path)?;
 
         // fsync the directory so the rename itself is durable, not just the
         // file contents. Without this a crash can resurrect the old manifest.
-        if let Some(dir) = path.parent() {
-            if let Ok(handle) = File::open(dir) {
-                let _ = handle.sync_all(); // best-effort: not supported everywhere
-            }
+        if let Some(dir) = path.parent()
+            && let Ok(handle) = File::open(dir)
+        {
+            let _ = handle.sync_all(); // best-effort: not supported everywhere
         }
 
         Manifest::open(&path)

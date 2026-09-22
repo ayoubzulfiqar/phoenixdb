@@ -5,6 +5,7 @@ import 'dart:convert';
 import 'dart:typed_data';
 
 import 'isolate_worker.dart';
+import 'kv.dart';
 import 'phoenixdb_base.dart';
 import 'prefs_codec.dart';
 
@@ -241,6 +242,57 @@ class PhoenixPrefs {
         }
       }
     });
+  }
+
+  /// Every stored key, sorted by its UTF-8 bytes.
+  ///
+  /// With an allow-list, only allowed keys are returned. Keys that are not
+  /// valid UTF-8 (written through the raw byte API) are skipped.
+  Future<Set<String>> getKeys() async {
+    _ensureOpen();
+    final keys = <String>{};
+    await for (final entry in _db.entries()) {
+      final key = _decodeKey(entry.key);
+      if (key != null && _allowed(key)) keys.add(key);
+    }
+    return keys;
+  }
+
+  /// Every stored preference, decoded to its natural Dart type.
+  ///
+  /// Throws [PhoenixDecodeException] if a value is not a tagged preference
+  /// (for example, bytes written through the raw [database] API).
+  Future<Map<String, Object>> getAll() async {
+    _ensureOpen();
+    final out = <String, Object>{};
+    await for (final entry in _db.entries()) {
+      final key = _decodeKey(entry.key);
+      if (key == null || !_allowed(key)) continue;
+      out[key] = PrefCodec.decodeDynamic(key, entry.value);
+    }
+    return out;
+  }
+
+  /// Removes every preference (only allowed keys, with an allow-list) in one
+  /// atomic write.
+  Future<void> clear() async {
+    _ensureOpen();
+    final batch = WriteBatch();
+    await for (final entry in _db.entries()) {
+      final key = _decodeKey(entry.key);
+      if (key != null && _allowed(key)) batch.deleteIfExists(entry.key);
+    }
+    await _db.write(batch);
+  }
+
+  bool _allowed(String key) => _allowList?.contains(key) ?? true;
+
+  static String? _decodeKey(Uint8List raw) {
+    try {
+      return utf8.decode(raw);
+    } on FormatException {
+      return null;
+    }
   }
 
   /// Number of stored entries.

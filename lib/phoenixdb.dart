@@ -40,12 +40,49 @@
 /// await index.close();
 /// ```
 ///
+/// ## Document collections and hybrid search
+///
+/// A [PhoenixCollection] keeps text, JSON metadata and embeddings together
+/// and searches them in one call — vector similarity, BM25 keywords, metadata
+/// filters, rank fusion and MMR diversification:
+///
+/// ```dart
+/// final kb = await AsyncPhoenixCollection.open('kb', dimensions: 384);
+/// await kb.upsert([
+///   Document('doc-1', text: 'PhoenixDB runs on-device',
+///       metadata: {'lang': 'en'}, vector: embedding),
+/// ]);
+/// final hits = await kb.search(
+///   vector: queryEmbedding,
+///   text: 'on-device database',
+///   filter: Filter.eq('lang', 'en'),
+///   k: 5,
+/// );
+/// await kb.close();
+/// ```
+///
+/// Retrieval-augmented generation, embeddings and LLM clients live in
+/// `package:phoenixdb/ai.dart`.
+///
+/// ## Scans, batches and maintenance
+///
+/// ```dart
+/// db.writeBatch((b) => b
+///   ..put(utf8Key('user:1'), utf8Value('ada'))
+///   ..put(utf8Key('user:2'), utf8Value('grace')));   // atomic
+/// for (final e in db.entries(prefix: utf8Key('user:'))) {
+///   print('${e.keyString} = ${e.valueString}');     // lazily paged
+/// }
+/// db.backup('snapshot.pdb');                        // consistent + compact
+/// print(db.stats());
+/// ```
+///
 /// ## Limits
 ///
 /// Keys are capped at 1 MiB and values at 10 MiB by the FFI layer; the B+Tree
-/// additionally caps keys at 1 KiB so a node always holds at least two entries.
-/// Values larger than 1 KiB spill onto overflow pages transparently. Vectors
-/// are capped at 65 536 dimensions and their ids at 128 bytes.
+/// additionally caps keys at 1 KiB so a node always holds several entries.
+/// Large values spill onto overflow pages transparently. Vectors are capped at
+/// 65 536 dimensions and their ids at 128 bytes.
 library;
 
 import 'dart:convert';
@@ -53,7 +90,27 @@ import 'dart:typed_data';
 
 export 'src/bindings.dart'
     show PhoenixStatus, PhoenixLoadException, kExpectedAbiVersion;
+export 'src/collection.dart'
+    show
+        PhoenixCollection,
+        Document,
+        Filter,
+        Fusion,
+        CollectionQuery,
+        SearchHit,
+        CollectionStats,
+        DocumentStore;
+export 'src/collection_isolate.dart' show AsyncPhoenixCollection;
 export 'src/isolate_worker.dart' show AsyncPhoenixDB;
+export 'src/kv.dart'
+    show
+        PhoenixOptions,
+        PhoenixEntry,
+        WriteBatch,
+        PhoenixStats,
+        PhoenixTreeReport,
+        TraceSpan,
+        prefixSuccessor;
 export 'src/native/vector_bindings.dart' show VectorMetric;
 export 'src/phoenix_vector_db.dart'
     show PhoenixVectorDB, VectorMatch, VectorQuery, VectorStats;

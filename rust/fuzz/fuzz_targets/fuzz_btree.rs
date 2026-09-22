@@ -80,11 +80,9 @@ fuzz_target!(|ops: Vec<Op>| {
                     continue;
                 }
                 match tree.get(&mut pager, &key) {
-                    Ok(v) => assert_eq!(
-                        Some(&v),
-                        oracle.get(&key),
-                        "value mismatch for key {key:?}"
-                    ),
+                    Ok(v) => {
+                        assert_eq!(Some(&v), oracle.get(&key), "value mismatch for key {key:?}")
+                    }
                     Err(phoenixdb::Error::NotFound) => {
                         assert!(!oracle.contains_key(&key), "lost key {key:?}")
                     }

@@ -137,6 +137,8 @@ pub struct VectorEngine {
     metric: Metric,
     options: VectorOptions,
     path: PathBuf,
+    /// Set by [`VectorEngine::simulate_crash`]: skip the save in `Drop`.
+    pub(crate) crashed: bool,
 }
 
 /// Adapts the store to the graph's [`DistanceSource`], holding one query.
@@ -202,46 +204,64 @@ impl VectorEngine {
         let options = VectorOptions { hnsw, ..options };
 
         let path = path.as_ref().to_path_buf();
-        let store = VectorStore::open(&path, dim, metric)?;
 
+        // A `.compact` file is a compaction that crashed before its atomic
+        // rename: the original store is intact and authoritative.
+        let _ = std::fs::remove_file(Self::compact_path(&path));
+
+        let mut store = VectorStore::open(&path, dim, metric)?;
         let mut ids: HashMap<String, u32> =
             HashMap::with_capacity(options.max_elements.min(1 << 20).max(store.len()));
         let mut graph = HnswGraph::new(hnsw)?;
         let mut live = 0usize;
 
+        // A snapshot describes a prefix of the store: everything up to its
+        // last save. Anything appended after that (a crash skipped the final
+        // save) is caught up incrementally instead of rebuilding the whole
+        // graph.
         let snapshot_path = Self::snapshot_path(&path);
-        let restored = Self::load_snapshot(&snapshot_path, dim, metric, store.len())?;
+        let mut next = 0u32;
+        if let Some(snapshot) = Self::load_snapshot(&snapshot_path, dim, metric, store.len())? {
+            next = snapshot.graph.len() as u32;
+            graph = snapshot.graph;
+            ids.extend(snapshot.ids);
+            live = (0..next)
+                .filter(|ordinal| !store.is_deleted(*ordinal))
+                .count();
+        }
 
-        match restored {
-            Some(snapshot) => {
-                graph = snapshot.graph;
-                for (id, ordinal) in snapshot.ids {
-                    ids.insert(id, ordinal);
+        // Replay the records the graph does not cover. Each is CRC-checked,
+        // and the first torn one ends the replay: nothing after it can have
+        // been synced (a sync would have made it durable too), so cutting the
+        // tail there never drops a durable record.
+        for ordinal in next..store.len() as u32 {
+            let record = match store.record_at(ordinal) {
+                Ok(r) => r,
+                Err(Error::Corruption(_)) => {
+                    store.truncate_to(ordinal as usize)?;
+                    break;
                 }
-                live = (0..store.len() as u32)
-                    .filter(|ordinal| !store.is_deleted(*ordinal))
-                    .count();
-            }
-            None => {
-                // No usable snapshot: replay the vector file. Each record is
-                // CRC-checked on the way in, so a torn record fails loudly
-                // here rather than silently skewing later searches.
-                for ordinal in 0..store.len() as u32 {
-                    let record = store.record_at(ordinal)?;
-                    ids.insert(record.id, ordinal);
-                    if record.deleted {
-                        continue;
-                    }
-                    live += 1;
-                    let source = StoreDistances {
-                        store: &store,
-                        metric,
-                        query: &record.vector,
-                        query_norm: record.norm,
-                    };
-                    graph.insert(ordinal, &source)?;
+                Err(e) => return Err(e),
+            };
+            if !record.deleted {
+                // A lost tombstone (unsynced before a crash) would leave two
+                // live records for one id; the newer one wins.
+                if let Some(previous) = ids.get(&record.id).copied()
+                    && !store.is_deleted(previous)
+                {
+                    store.tombstone(previous)?;
+                    live -= 1;
                 }
+                live += 1;
             }
+            ids.insert(record.id.clone(), ordinal);
+            let source = StoreDistances {
+                store: &store,
+                metric,
+                query: &record.vector,
+                query_norm: record.norm,
+            };
+            graph.insert(ordinal, &source)?;
         }
 
         Ok(VectorEngine {
@@ -255,6 +275,7 @@ impl VectorEngine {
             metric,
             options,
             path,
+            crashed: false,
         })
     }
 
@@ -266,11 +287,20 @@ impl VectorEngine {
         PathBuf::from(s)
     }
 
+    /// Path of the temporary file a compaction builds.
+    fn compact_path(vector_path: &Path) -> PathBuf {
+        let mut s = vector_path.as_os_str().to_os_string();
+        s.push(".compact");
+        PathBuf::from(s)
+    }
+
     /// Reads a snapshot, returning `None` when it is absent or unusable.
     ///
     /// A stale or mismatched snapshot is *not* an error: the vector file can
     /// always rebuild the graph, so recovering silently beats refusing to open
-    /// the index.
+    /// the index. A snapshot covering fewer records than the store holds is
+    /// usable (the rest is caught up); one covering more is not (the store was
+    /// truncated or replaced).
     fn load_snapshot(
         path: &Path,
         dim: usize,
@@ -282,7 +312,16 @@ impl VectorEngine {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(Error::Io(e)),
         };
-        let snapshot: Snapshot = match bincode::deserialize(&bytes) {
+        // Framed as [crc32 of payload][payload]; older unframed snapshots
+        // fail the check and are simply rebuilt once.
+        if bytes.len() < 4 {
+            return Ok(None);
+        }
+        let (crc, payload) = bytes.split_at(4);
+        if crc32fast::hash(payload) != u32::from_le_bytes([crc[0], crc[1], crc[2], crc[3]]) {
+            return Ok(None);
+        }
+        let snapshot: Snapshot = match bincode::deserialize(payload) {
             Ok(s) => s,
             Err(_) => return Ok(None), // corrupt snapshot: rebuild instead
         };
@@ -290,10 +329,10 @@ impl VectorEngine {
             && snapshot.version == store::VECTOR_FORMAT_VERSION
             && snapshot.dim == dim
             && snapshot.metric == metric
-            // The graph must describe exactly the records on disk. Fewer means
-            // inserts landed after the snapshot; more means the vector file was
-            // truncated. Either way the vectors win.
-            && snapshot.graph.len() == store_len;
+            // More nodes than records means the vector file was truncated or
+            // replaced: the vectors win and the graph is rebuilt.
+            && snapshot.graph.len() <= store_len
+            && snapshot.ids.iter().all(|(_, ordinal)| (*ordinal as usize) < snapshot.graph.len());
         Ok(usable.then_some(snapshot))
     }
 
@@ -403,11 +442,11 @@ impl VectorEngine {
         for (id, vector) in items {
             // Replacing: tombstone first so the graph stops returning the old
             // record the moment the new one is visible.
-            if let Some(previous) = inner.ids.get(*id).copied() {
-                if !inner.store.is_deleted(previous) {
-                    inner.store.tombstone(previous)?;
-                    inner.live -= 1;
-                }
+            if let Some(previous) = inner.ids.get(*id).copied()
+                && !inner.store.is_deleted(previous)
+            {
+                inner.store.tombstone(previous)?;
+                inner.live -= 1;
             }
 
             let norm = if self.metric.uses_norm() {
@@ -471,7 +510,142 @@ impl VectorEngine {
         } else {
             inner.graph.search(k, ef, &source)
         };
+        Ok(self.to_matches(&inner, raw))
+    }
 
+    /// Returns the `k` nearest live vectors whose id satisfies `allow`.
+    ///
+    /// Adaptive: the graph is searched with a widened beam, skipping rejected
+    /// nodes, and if that cannot fill `k` results (a selective filter) the
+    /// accepted set is scanned exactly instead — so a filter never costs
+    /// recall, only time.
+    pub fn search_filtered(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef: Option<usize>,
+        allow: &dyn Fn(&str) -> bool,
+    ) -> Result<Vec<VectorMatch>> {
+        distance::validate_vector(query, self.dim)?;
+        if k == 0 {
+            return Ok(Vec::new());
+        }
+        let inner = self.inner.read();
+        if inner.live == 0 {
+            return Ok(Vec::new());
+        }
+        let source = self.source_for(&inner, query);
+        let store = &inner.store;
+        let accept = |ordinal: u32| store.id_at(ordinal).is_some_and(|id| allow(&id));
+        let raw = self.search_accepting(&inner, &source, k, ef, &accept);
+        Ok(self.to_matches(&inner, raw))
+    }
+
+    /// Exact `k` nearest among the given ids (unknown or deleted ids are
+    /// ignored). Ideal when a metadata filter has already narrowed the
+    /// candidates: cost is `O(ids.len())` and recall is perfect.
+    ///
+    /// Large candidate sets switch to a filtered graph search, which is
+    /// cheaper once the set is a sizeable fraction of the index.
+    pub fn search_ids(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef: Option<usize>,
+        ids: &[&str],
+    ) -> Result<Vec<VectorMatch>> {
+        distance::validate_vector(query, self.dim)?;
+        if k == 0 || ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let inner = self.inner.read();
+        let ordinals: Vec<u32> = ids
+            .iter()
+            .filter_map(|id| inner.ids.get(*id).copied())
+            .filter(|o| !inner.store.is_deleted(*o))
+            .collect();
+        if ordinals.is_empty() {
+            return Ok(Vec::new());
+        }
+        let source = self.source_for(&inner, query);
+        let raw = if ordinals.len() <= BRUTE_FORCE_THRESHOLD.max(inner.live / 8) {
+            inner.graph.brute_force_among(k, &ordinals, &source)
+        } else {
+            let set: std::collections::HashSet<u32> = ordinals.iter().copied().collect();
+            self.search_accepting(&inner, &source, k, ef, &|o| set.contains(&o))
+        };
+        Ok(self.to_matches(&inner, raw))
+    }
+
+    /// Runs several queries under one lock acquisition.
+    pub fn search_batch(
+        &self,
+        queries: &[&[f32]],
+        k: usize,
+        ef: Option<usize>,
+    ) -> Result<Vec<Vec<VectorMatch>>> {
+        for q in queries {
+            distance::validate_vector(q, self.dim)?;
+        }
+        let inner = self.inner.read();
+        let mut out = Vec::with_capacity(queries.len());
+        for query in queries {
+            if k == 0 || inner.live == 0 {
+                out.push(Vec::new());
+                continue;
+            }
+            let source = self.source_for(&inner, query);
+            let raw = if inner.live <= BRUTE_FORCE_THRESHOLD {
+                inner.graph.brute_force(k, &source)
+            } else {
+                inner.graph.search(k, ef, &source)
+            };
+            out.push(self.to_matches(&inner, raw));
+        }
+        Ok(out)
+    }
+
+    /// Filtered search strategy shared by the filtered entry points.
+    fn search_accepting(
+        &self,
+        inner: &Inner,
+        source: &StoreDistances<'_>,
+        k: usize,
+        ef: Option<usize>,
+        accept: &dyn Fn(u32) -> bool,
+    ) -> Vec<(u32, f32)> {
+        if inner.live <= BRUTE_FORCE_THRESHOLD {
+            return inner.graph.brute_force_where(k, source, accept);
+        }
+        // Rejected nodes still occupy the beam, so widen it.
+        let widened = ef
+            .unwrap_or(self.options.hnsw.ef_search)
+            .max(k.saturating_mul(4))
+            .min(4096);
+        let found = inner.graph.search_where(k, Some(widened), source, accept);
+        if found.len() >= k {
+            return found;
+        }
+        // Too selective for the graph to fill `k`: the exact answer is a scan
+        // of the accepted set.
+        inner.graph.brute_force_where(k, source, accept)
+    }
+
+    fn source_for<'a>(&self, inner: &'a Inner, query: &'a [f32]) -> StoreDistances<'a> {
+        StoreDistances {
+            store: &inner.store,
+            metric: self.metric,
+            query,
+            query_norm: if self.metric.uses_norm() {
+                distance::norm(query)
+            } else {
+                0.0
+            },
+        }
+    }
+
+    /// Converts raw `(ordinal, ordering distance)` pairs into results.
+    fn to_matches(&self, inner: &Inner, raw: Vec<(u32, f32)>) -> Vec<VectorMatch> {
         let mut matches = Vec::with_capacity(raw.len());
         for (ordinal, ordering_distance) in raw {
             // A record whose id cannot be read is skipped rather than faked:
@@ -486,7 +660,19 @@ impl VectorEngine {
                 score: self.metric.score(distance),
             });
         }
-        Ok(matches)
+        matches
+    }
+
+    /// Ids of every live vector (unordered).
+    #[must_use]
+    pub fn ids(&self) -> Vec<String> {
+        let inner = self.inner.read();
+        inner
+            .ids
+            .iter()
+            .filter(|(_, o)| !inner.store.is_deleted(**o))
+            .map(|(id, _)| id.clone())
+            .collect()
     }
 
     /// Fetches a stored vector by id.
@@ -526,6 +712,10 @@ impl VectorEngine {
     /// half-written one.
     pub fn save(&self, path: Option<&Path>) -> Result<()> {
         let mut inner = self.inner.write();
+        self.save_locked(&mut inner, path)
+    }
+
+    fn save_locked(&self, inner: &mut Inner, path: Option<&Path>) -> Result<()> {
         inner.store.sync()?;
 
         let mut ids: Vec<(String, u32)> = inner
@@ -545,16 +735,19 @@ impl VectorEngine {
             graph: inner.graph.clone(),
             ids,
         };
-        let bytes = bincode::serialize(&snapshot)?;
+        let payload = bincode::serialize(&snapshot)?;
+        let mut bytes = Vec::with_capacity(payload.len() + 4);
+        bytes.extend_from_slice(&crc32fast::hash(&payload).to_le_bytes());
+        bytes.extend_from_slice(&payload);
 
         let target = match path {
             Some(p) => p.to_path_buf(),
             None => Self::snapshot_path(&self.path),
         };
-        if let Some(parent) = target.parent() {
-            if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent)?;
-            }
+        if let Some(parent) = target.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent)?;
         }
 
         let mut temporary = target.as_os_str().to_os_string();
@@ -566,13 +759,11 @@ impl VectorEngine {
             file.write_all(&bytes)?;
             file.sync_all()?;
         }
-        // Windows refuses to rename onto an existing file, so clear the way.
-        // A crash between these two steps loses the snapshot but not the
-        // vectors, and the next open rebuilds the graph.
-        if target.exists() {
-            std::fs::remove_file(&target)?;
-        }
+        // `rename` replaces the target atomically on every platform
+        // (MoveFileExW with REPLACE_EXISTING on Windows): a crash leaves the
+        // old snapshot or the new one, never neither.
         std::fs::rename(&temporary, &target)?;
+        crate::fsutil::sync_parent_dir(&target);
         Ok(())
     }
 
@@ -603,53 +794,51 @@ impl VectorEngine {
             survivors.push((record.id, record.vector, record.norm));
         }
 
-        let mut temporary = self.path.as_os_str().to_os_string();
-        temporary.push(".compact");
-        let temporary = PathBuf::from(temporary);
-        if temporary.exists() {
-            std::fs::remove_file(&temporary)?;
-        }
+        let temporary = Self::compact_path(&self.path);
+        let _ = std::fs::remove_file(&temporary);
 
         let mut rebuilt = VectorStore::open(&temporary, self.dim, self.metric)?;
         let mut graph = HnswGraph::new(self.options.hnsw)?;
         let mut ids = HashMap::with_capacity(survivors.len());
-        for (id, vector, norm) in &survivors {
-            let ordinal = rebuilt.append(id, vector, *norm, false)?;
-            let source = StoreDistances {
-                store: &rebuilt,
-                metric: self.metric,
-                query: vector,
-                query_norm: *norm,
-            };
-            graph.insert(ordinal, &source)?;
-            ids.insert(id.clone(), ordinal);
+        let built = (|| -> Result<()> {
+            for (id, vector, norm) in &survivors {
+                let ordinal = rebuilt.append(id, vector, *norm, false)?;
+                let source = StoreDistances {
+                    store: &rebuilt,
+                    metric: self.metric,
+                    query: vector,
+                    query_norm: *norm,
+                };
+                graph.insert(ordinal, &source)?;
+                ids.insert(id.clone(), ordinal);
+            }
+            rebuilt.sync()
+        })();
+        rebuilt.close();
+        if let Err(e) = built {
+            let _ = std::fs::remove_file(&temporary);
+            return Err(e);
         }
-        rebuilt.sync()?;
-        drop(rebuilt);
 
-        // The live mapping must be torn down before the file it maps can be
-        // replaced: Windows refuses to unlink or rename over a mapped file,
-        // and elsewhere the mapping would silently outlive its inode. Moving
-        // the store into a temporary binding and dropping it does exactly
-        // that, and `inner` is left holding the rebuilt index below.
-        let live = survivors.len();
-        drop(std::mem::replace(
-            &mut inner.store,
-            VectorStore::open(&temporary, self.dim, self.metric)?,
-        ));
-        std::fs::remove_file(&self.path)?;
-        // Same again for the rebuilt file, which must be unmapped before the
-        // rename moves it into place.
-        drop(std::mem::replace(
-            &mut inner.store,
-            VectorStore::open(&temporary, self.dim, self.metric)?,
-        ));
-        std::fs::rename(&temporary, &self.path)?;
-
+        // Swap: release the live store (its mapping and file lock — Windows
+        // cannot replace a mapped or open file), then atomically rename the
+        // rebuilt file over it. A crash before the rename leaves the old
+        // store (and a stray `.compact`, removed on the next open); after it,
+        // the new one. Never neither.
+        inner.store.close();
+        if let Err(e) = std::fs::rename(&temporary, &self.path) {
+            // The original is untouched: reopen it and report.
+            inner.store = VectorStore::open(&self.path, self.dim, self.metric)?;
+            let _ = std::fs::remove_file(&temporary);
+            return Err(Error::Io(e));
+        }
+        crate::fsutil::sync_parent_dir(&self.path);
         inner.store = VectorStore::open(&self.path, self.dim, self.metric)?;
         inner.graph = graph;
         inner.ids = ids;
-        inner.live = live;
+        inner.live = survivors.len();
+        // Snapshot now, so the next open does not rebuild the new graph.
+        self.save_locked(&mut inner, None)?;
         Ok(dead)
     }
 
@@ -659,8 +848,21 @@ impl VectorEngine {
     }
 }
 
+impl VectorEngine {
+    /// Drops the engine the way a crash would: no final save, so only what
+    /// the vector file and the last snapshot already hold survives. Releases
+    /// the file lock so the same process can reopen and exercise recovery.
+    #[doc(hidden)]
+    pub fn simulate_crash(mut self) {
+        self.crashed = true;
+    }
+}
+
 impl Drop for VectorEngine {
     fn drop(&mut self) {
+        if self.crashed {
+            return;
+        }
         // Best effort: a failing save must not panic in `Drop`, because that
         // would unwind across the FFI boundary.
         let _ = self.save(None);
@@ -1157,5 +1359,240 @@ mod tests {
             ["avx2+fma", "neon", "portable"].contains(&kernel),
             "unexpected kernel {kernel}"
         );
+    }
+
+    // ---- recovery, locking and filtered search -------------------------
+
+    #[test]
+    fn a_second_engine_on_the_same_file_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v.pvec");
+        let first = VectorEngine::open(&path, 4, Metric::Cosine, VectorOptions::default()).unwrap();
+        let second = VectorEngine::open(&path, 4, Metric::Cosine, VectorOptions::default());
+        assert!(matches!(second, Err(Error::Busy(_))), "got {second:?}");
+        drop(first);
+        VectorEngine::open(&path, 4, Metric::Cosine, VectorOptions::default()).unwrap();
+    }
+
+    #[test]
+    fn a_crash_after_save_catches_up_from_the_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v.pvec");
+        let points = cloud(900, 8, 11);
+        {
+            let engine =
+                VectorEngine::open(&path, 8, Metric::Euclidean, VectorOptions::default()).unwrap();
+            for (i, p) in points.iter().enumerate().take(600) {
+                engine.insert(&format!("p{i}"), p).unwrap();
+            }
+            engine.save(None).unwrap();
+            for (i, p) in points.iter().enumerate().skip(600) {
+                engine.insert(&format!("p{i}"), p).unwrap();
+            }
+            engine.remove("p3").unwrap();
+            engine.flush().unwrap();
+            engine.simulate_crash(); // no final save: the snapshot covers 600
+        }
+        let engine =
+            VectorEngine::open(&path, 8, Metric::Euclidean, VectorOptions::default()).unwrap();
+        assert_eq!(engine.len(), 899);
+        assert!(!engine.contains("p3"));
+        for i in [0usize, 599, 600, 899] {
+            if i == 899 {
+                continue;
+            }
+            let hit = &engine.search(&points[i], 1, Some(200)).unwrap()[0];
+            assert_eq!(hit.id, format!("p{i}"), "record {i} must be searchable");
+        }
+    }
+
+    #[test]
+    fn a_torn_tail_record_is_cut_off_instead_of_failing_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v.pvec");
+        {
+            let engine =
+                VectorEngine::open(&path, 4, Metric::Cosine, VectorOptions::default()).unwrap();
+            for i in 0..10 {
+                engine
+                    .insert(&format!("v{i}"), &[1.0, i as f32, 0.5, 0.25])
+                    .unwrap();
+            }
+            engine.flush().unwrap();
+            engine.simulate_crash();
+        }
+        let _ = std::fs::remove_file(VectorEngine::snapshot_path(&path));
+        // Scribble over the last record's payload: an unsynced, torn write.
+        {
+            use std::io::{Seek, SeekFrom, Write};
+            let stride = VectorStore::stride_for(4) as u64;
+            let mut f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+            f.seek(SeekFrom::Start(
+                store::HEADER_LEN as u64 + 9 * stride + stride - 4,
+            ))
+            .unwrap();
+            f.write_all(&[0xDE, 0xAD, 0xBE, 0xEF]).unwrap();
+        }
+        let engine = VectorEngine::open(&path, 4, Metric::Cosine, VectorOptions::default())
+            .expect("a torn tail must not make the index unopenable");
+        assert_eq!(engine.len(), 9);
+        assert!(!engine.contains("v9"));
+        engine.insert("v9", &[1.0, 9.0, 0.5, 0.25]).unwrap();
+        assert_eq!(engine.len(), 10);
+    }
+
+    #[test]
+    fn a_lost_tombstone_does_not_leave_two_live_copies_of_an_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v.pvec");
+        {
+            let engine =
+                VectorEngine::open(&path, 2, Metric::Euclidean, VectorOptions::default()).unwrap();
+            engine.insert("a", &[1.0, 0.0]).unwrap();
+            engine.insert("a", &[0.0, 1.0]).unwrap(); // tombstones record 0
+            engine.flush().unwrap();
+            engine.simulate_crash();
+        }
+        let _ = std::fs::remove_file(VectorEngine::snapshot_path(&path));
+        // Undo the tombstone flag, as if its write never reached the disk.
+        {
+            use std::io::{Seek, SeekFrom, Write};
+            let mut f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+            f.seek(SeekFrom::Start(store::HEADER_LEN as u64)).unwrap();
+            f.write_all(&[0]).unwrap();
+        }
+        let engine =
+            VectorEngine::open(&path, 2, Metric::Euclidean, VectorOptions::default()).unwrap();
+        assert_eq!(engine.len(), 1);
+        let hits = engine.search(&[0.0, 1.0], 5, None).unwrap();
+        assert_eq!(hits.len(), 1, "one id, one result: {hits:?}");
+        assert_eq!(
+            engine.get("a").unwrap(),
+            vec![0.0, 1.0],
+            "the newer write wins"
+        );
+    }
+
+    #[test]
+    fn a_leftover_compaction_file_is_discarded_on_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v.pvec");
+        {
+            let engine =
+                VectorEngine::open(&path, 2, Metric::Cosine, VectorOptions::default()).unwrap();
+            engine.insert("a", &[1.0, 0.0]).unwrap();
+        }
+        // A compaction that crashed before its rename.
+        std::fs::write(VectorEngine::compact_path(&path), b"half-built").unwrap();
+        let engine =
+            VectorEngine::open(&path, 2, Metric::Cosine, VectorOptions::default()).unwrap();
+        assert!(engine.contains("a"));
+        assert!(!VectorEngine::compact_path(&path).exists());
+    }
+
+    #[test]
+    fn compaction_survives_reopen_and_keeps_a_fresh_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v.pvec");
+        let points = cloud(700, 6, 5);
+        {
+            let engine =
+                VectorEngine::open(&path, 6, Metric::Cosine, VectorOptions::default()).unwrap();
+            for (i, p) in points.iter().enumerate() {
+                engine.insert(&format!("p{i}"), p).unwrap();
+            }
+            for i in (0..700).step_by(2) {
+                engine.remove(&format!("p{i}")).unwrap();
+            }
+            assert_eq!(engine.compact().unwrap(), 350);
+            assert_eq!(engine.stats().total, 350);
+            engine.simulate_crash(); // compact already saved the snapshot
+        }
+        let engine =
+            VectorEngine::open(&path, 6, Metric::Cosine, VectorOptions::default()).unwrap();
+        assert_eq!(engine.len(), 350);
+        assert_eq!(engine.search(&points[1], 1, Some(200)).unwrap()[0].id, "p1");
+    }
+
+    #[test]
+    fn filtered_search_matches_an_exact_filtered_scan() {
+        let (_d, engine) = temp_engine(16, Metric::Euclidean);
+        let points = cloud(3000, 16, 99);
+        let items: Vec<(String, &[f32])> = points
+            .iter()
+            .enumerate()
+            .map(|(i, p)| (format!("doc-{i}"), p.as_slice()))
+            .collect();
+        let refs: Vec<(&str, &[f32])> = items.iter().map(|(id, p)| (id.as_str(), *p)).collect();
+        engine.insert_many(&refs).unwrap();
+
+        let even = |id: &str| id[4..].parse::<usize>().unwrap() % 2 == 0;
+        let rare = |id: &str| id[4..].parse::<usize>().unwrap() % 300 == 7; // 10 docs
+        for (q, query) in points.iter().take(20).enumerate() {
+            for (name, filter) in [("even", &even as &dyn Fn(&str) -> bool), ("rare", &rare)] {
+                let got = engine
+                    .search_filtered(query, 10, Some(128), filter)
+                    .unwrap();
+                assert!(got.iter().all(|m| filter(&m.id)), "{name}: filter violated");
+                let mut exact: Vec<(f32, String)> = points
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| filter(&format!("doc-{i}")))
+                    .map(|(i, p)| {
+                        let d: f32 = p.iter().zip(query).map(|(a, b)| (a - b) * (a - b)).sum();
+                        (d.sqrt(), format!("doc-{i}"))
+                    })
+                    .collect();
+                exact.sort_by(|a, b| a.0.total_cmp(&b.0));
+                let want = exact.len().min(10);
+                assert_eq!(
+                    got.len(),
+                    want,
+                    "{name} q{q}: a filter must not cost results"
+                );
+                if name == "rare" {
+                    // Selective filters take the exact path: identical answer.
+                    let ids: Vec<&str> = got.iter().map(|m| m.id.as_str()).collect();
+                    let exact_ids: Vec<&str> =
+                        exact.iter().take(want).map(|e| e.1.as_str()).collect();
+                    assert_eq!(ids, exact_ids);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn search_ids_is_exact_over_the_subset() {
+        let (_d, engine) = temp_engine(8, Metric::Cosine);
+        let points = cloud(1200, 8, 3);
+        for (i, p) in points.iter().enumerate() {
+            engine.insert(&format!("p{i}"), p).unwrap();
+        }
+        engine.remove("p5").unwrap();
+        let subset = ["p1", "p5", "p9", "p700", "nope"];
+        let hits = engine.search_ids(&points[9], 10, None, &subset).unwrap();
+        let ids: Vec<&str> = hits.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids.len(), 3, "deleted and unknown ids are skipped: {ids:?}");
+        assert_eq!(ids[0], "p9");
+        assert!(
+            engine
+                .search_ids(&points[0], 3, None, &[])
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn batch_search_matches_single_searches() {
+        let (_d, engine) = temp_engine(8, Metric::DotProduct);
+        let points = cloud(800, 8, 21);
+        for (i, p) in points.iter().enumerate() {
+            engine.insert(&format!("p{i}"), p).unwrap();
+        }
+        let queries: Vec<&[f32]> = points.iter().take(5).map(Vec::as_slice).collect();
+        let batch = engine.search_batch(&queries, 4, Some(100)).unwrap();
+        for (q, got) in queries.iter().zip(&batch) {
+            assert_eq!(got, &engine.search(q, 4, Some(100)).unwrap());
+        }
     }
 }

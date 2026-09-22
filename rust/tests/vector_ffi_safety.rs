@@ -561,8 +561,9 @@ fn limits_and_capability_flags_are_reported() {
     assert_eq!(phoenix_vector_max_k(), 4096);
     assert_eq!(phoenix_vector_max_id_len(), 128);
     assert_eq!(phoenixdb::ffi::phoenix_has_vector(), 1);
-    // The vector surface is ABI v3; the Dart loader matches this exactly.
-    assert_eq!(phoenixdb::ffi::phoenix_abi_version(), 3);
+    // The vector surface arrived in ABI v3 and every later ABI keeps it; the
+    // exact current version is pinned by ffi_safety.rs.
+    assert!(phoenixdb::ffi::phoenix_abi_version() >= 3);
 
     let kernel = unsafe { CStr::from_ptr(phoenix_vector_kernel()) }
         .to_string_lossy()
@@ -587,4 +588,184 @@ fn replacing_an_id_through_the_ffi_does_not_duplicate_it() {
     assert_eq!(status, OK);
     assert_eq!(results.len(), 1);
     assert!(results[0].1.abs() < 1e-5, "the replacement must be current");
+}
+
+// ---------------------------------------------------------------------------
+// ABI v4 additions: shared engines, subset search, batch search
+// ---------------------------------------------------------------------------
+
+fn init_at(path: &std::path::Path, dim: usize, metric: u8) -> (i32, *mut PhoenixVectorHandle) {
+    let c_path = CString::new(path.to_str().unwrap()).unwrap();
+    let mut handle: *mut PhoenixVectorHandle = ptr::null_mut();
+    let status = unsafe { phoenix_vector_init(c_path.as_ptr(), dim, metric, 0, &mut handle) };
+    (status, handle)
+}
+
+fn contains(h: *mut PhoenixVectorHandle, id: &CString) -> i32 {
+    let mut out = -1i32;
+    assert_eq!(
+        unsafe { phoenix_vector_contains(h, id.as_ptr(), &mut out) },
+        OK
+    );
+    out
+}
+
+#[test]
+fn a_second_init_of_the_same_file_shares_the_engine() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("shared.pvec");
+    let (s1, a) = init_at(&path, 3, COSINE);
+    let (s2, b) = init_at(&path, 3, COSINE);
+    assert_eq!((s1, s2), (OK, OK));
+    let id = CString::new("x").unwrap();
+    let v = [1.0f32, 0.0, 0.0];
+    assert_eq!(
+        unsafe { phoenix_vector_insert(a, id.as_ptr(), v.as_ptr(), 3) },
+        OK
+    );
+    assert_eq!(contains(b, &id), 1);
+
+    // A mismatched geometry is refused rather than silently reinterpreted.
+    let (s3, c) = init_at(&path, 4, COSINE);
+    assert_eq!(s3, INVALID);
+    assert!(c.is_null());
+    let (s4, _) = init_at(&path, 3, EUCLIDEAN);
+    assert_eq!(s4, INVALID);
+
+    unsafe { phoenix_vector_free(a) };
+    assert_eq!(contains(b, &id), 1, "b still works");
+    unsafe { phoenix_vector_free(b) };
+    let (s5, d) = init_at(&path, 3, COSINE);
+    assert_eq!(s5, OK);
+    assert_eq!(contains(d, &id), 1, "saved on last free");
+    unsafe { phoenix_vector_free(d) };
+}
+
+#[test]
+fn search_ids_restricts_results_to_the_subset() {
+    let h = Harness::new(2, EUCLIDEAN);
+    for i in 0..50 {
+        assert_eq!(h.insert(&format!("p{i}"), &[i as f32, 0.0]), OK);
+    }
+    let names: Vec<CString> = ["p10", "p40", "p41", "missing"]
+        .iter()
+        .map(|s| CString::new(*s).unwrap())
+        .collect();
+    let ptrs: Vec<*const std::os::raw::c_char> = names.iter().map(|c| c.as_ptr()).collect();
+    let mut ids = vec![ptr::null_mut(); 5];
+    let mut scores = vec![0f32; 5];
+    let mut count = 0usize;
+    let q = [39.0f32, 0.0];
+    let rc = unsafe {
+        phoenix_vector_search_ids(
+            h.handle,
+            q.as_ptr(),
+            2,
+            5,
+            0,
+            ptrs.as_ptr(),
+            ptrs.len(),
+            ids.as_mut_ptr(),
+            scores.as_mut_ptr(),
+            &mut count,
+        )
+    };
+    assert_eq!(rc, OK);
+    assert_eq!(count, 3);
+    let got: Vec<String> = ids[..count]
+        .iter()
+        .map(|p| unsafe { CStr::from_ptr(*p) }.to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(got, ["p40", "p41", "p10"]);
+    unsafe { phoenix_free_string_array(ids.as_mut_ptr(), count) };
+}
+
+#[test]
+fn batch_search_writes_each_query_to_its_own_slot() {
+    let h = Harness::new(2, EUCLIDEAN);
+    for i in 0..20 {
+        assert_eq!(h.insert(&format!("p{i}"), &[i as f32, 0.0]), OK);
+    }
+    let queries = [0.0f32, 0.0, 19.0, 0.0, 10.2, 0.0];
+    let k = 2;
+    let mut ids = vec![ptr::null_mut(); 3 * k];
+    let mut scores = vec![0f32; 3 * k];
+    let mut counts = vec![0usize; 3];
+    let rc = unsafe {
+        phoenix_vector_search_batch(
+            h.handle,
+            queries.as_ptr(),
+            3,
+            2,
+            k,
+            0,
+            ids.as_mut_ptr(),
+            scores.as_mut_ptr(),
+            counts.as_mut_ptr(),
+        )
+    };
+    assert_eq!(rc, OK);
+    assert_eq!(counts, [2, 2, 2]);
+    let first = |slot: usize| {
+        unsafe { CStr::from_ptr(ids[slot * k]) }
+            .to_string_lossy()
+            .into_owned()
+    };
+    assert_eq!(first(0), "p0");
+    assert_eq!(first(1), "p19");
+    assert_eq!(first(2), "p10");
+    for (slot, count) in counts.iter().enumerate() {
+        unsafe { phoenix_free_string_array(ids.as_mut_ptr().add(slot * k), *count) };
+    }
+    // Wrong width is rejected.
+    let rc = unsafe {
+        phoenix_vector_search_batch(
+            h.handle,
+            queries.as_ptr(),
+            2,
+            3,
+            k,
+            0,
+            ids.as_mut_ptr(),
+            scores.as_mut_ptr(),
+            counts.as_mut_ptr(),
+        )
+    };
+    assert_eq!(rc, INVALID);
+}
+
+#[test]
+fn insert_batch_validates_everything_before_writing() {
+    let h = Harness::new(2, EUCLIDEAN);
+    let names: Vec<CString> = (0..4)
+        .map(|i| CString::new(format!("b{i}")).unwrap())
+        .collect();
+    let ptrs: Vec<*const std::os::raw::c_char> = names.iter().map(|c| c.as_ptr()).collect();
+    let flat = [0.0f32, 0.0, 1.0, 0.0, 2.0, 0.0, 3.0, 0.0];
+    assert_eq!(
+        unsafe { phoenix_vector_insert_batch(h.handle, ptrs.as_ptr(), 4, flat.as_ptr(), 2) },
+        OK
+    );
+    let mut count = 0usize;
+    assert_eq!(unsafe { phoenix_vector_count(h.handle, &mut count) }, OK);
+    assert_eq!(count, 4);
+
+    // One non-finite component rejects the whole batch.
+    let bad = [5.0f32, 0.0, f32::NAN, 0.0];
+    let more: Vec<CString> = ["c0", "c1"]
+        .iter()
+        .map(|s| CString::new(*s).unwrap())
+        .collect();
+    let more_ptrs: Vec<*const std::os::raw::c_char> = more.iter().map(|c| c.as_ptr()).collect();
+    assert_eq!(
+        unsafe { phoenix_vector_insert_batch(h.handle, more_ptrs.as_ptr(), 2, bad.as_ptr(), 2) },
+        INVALID
+    );
+    assert_eq!(unsafe { phoenix_vector_count(h.handle, &mut count) }, OK);
+    assert_eq!(count, 4, "nothing from a rejected batch is written");
+    assert_eq!(
+        unsafe { phoenix_vector_insert_batch(h.handle, ptrs.as_ptr(), 4, flat.as_ptr(), 3) },
+        INVALID,
+        "wrong dimension"
+    );
 }

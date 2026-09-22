@@ -46,6 +46,12 @@ abstract final class PhoenixStatus {
 
   /// A structural capacity limit was reached.
   static const int full = -9;
+
+  /// The caller stopped an iteration early. Not an engine failure.
+  static const int aborted = -10;
+
+  /// The database file is locked by another process.
+  static const int busy = -11;
 }
 
 /// Opaque database handle. Only ever held as a `Pointer<PhoenixDB>`.
@@ -256,38 +262,57 @@ typedef SqlQueryDart =
       Pointer<Pointer<Utf8>> outJson,
     );
 
+/// Native signature for `phoenix_sql_query_params`.
+typedef SqlQueryParamsNative =
+    Int32 Function(
+      Pointer<PhoenixDB> handle,
+      Uint64 txnId,
+      Pointer<Utf8> sql,
+      Pointer<Utf8> paramsJson,
+      Pointer<Pointer<Utf8>> outJson,
+    );
+
+/// Dart signature for `phoenix_sql_query_params`.
+typedef SqlQueryParamsDart =
+    int Function(
+      Pointer<PhoenixDB> handle,
+      int txnId,
+      Pointer<Utf8> sql,
+      Pointer<Utf8> paramsJson,
+      Pointer<Pointer<Utf8>> outJson,
+    );
+
 /// Native signature for `phoenix_has_sql`.
 typedef HasSqlNative = Int32 Function();
 
 /// Dart signature for `phoenix_has_sql`.
 typedef HasSqlDart = int Function();
 
+/// Native signature for `phoenix_scan_iter`.
 typedef ScanIterNative =
     Int32 Function(
       Pointer<PhoenixDB> handle,
       Pointer<NativeFunction<NativeScanIterCallback>> callback,
     );
 
+/// Dart signature for `phoenix_scan_iter`.
 typedef ScanIterDart =
     int Function(
       Pointer<PhoenixDB> handle,
       Pointer<NativeFunction<NativeScanIterCallback>> callback,
     );
 
+/// Scan callback: return 0 to continue, non-zero to stop.
+///
+/// The return type is part of the C ABI. Declaring it `Void` (as versions
+/// before 4.0 did) made Rust read an undefined register as the "stop" flag,
+/// so scans could end early at random.
 typedef NativeScanIterCallback =
-    Void Function(
+    Int32 Function(
       Pointer<Uint8> key,
       Size keyLen,
       Pointer<Uint8> value,
       Size valueLen,
-    );
-
-typedef ScanIterCallbackDart =
-    Void Function(
-      Pointer<Uint8> key,
-      int keyLen,
-      Pointer<Uint8> value,
-      int valueLen,
     );
 
 /// Native signature for `phoenix_metrics_report`.
@@ -300,11 +325,232 @@ typedef MetricsReportNative =
 
 /// Dart signature for `phoenix_metrics_report`.
 typedef MetricsReportDart =
+    int Function(Pointer<PhoenixDB> handle, Pointer<Uint8> outBuf, int outLen);
+
+// ---------------------------------------------------------------------------
+// ABI v4
+// ---------------------------------------------------------------------------
+
+/// Engine options for `phoenix_open_ex`. Mirrors `PhoenixOptions` in C.
+final class PhoenixOptionsStruct extends Struct {
+  /// `sizeof(PhoenixOptions)`; lets the native side reject a stale layout.
+  @Uint32()
+  external int structSize;
+
+  /// `1` fsync per commit, `0` OS-buffered commits, `-1` default.
+  @Int32()
+  external int syncOnCommit;
+
+  /// Page cache capacity in pages; `0` = default.
+  @Uint64()
+  external int cachePages;
+
+  /// WAL size that triggers an automatic checkpoint; `0` = default.
+  @Uint64()
+  external int checkpointBytes;
+
+  /// Non-zero records engine spans.
+  @Int32()
+  external int tracing;
+
+  /// Leaf fill factor in `(0.5, 1.0]`; `0` = default.
+  @Float()
+  external double fillFactorMax;
+}
+
+/// Runtime statistics. Mirrors `PhoenixStats` in C.
+final class PhoenixStatsStruct extends Struct {
+  /// Pages allocated in the file.
+  @Uint32()
+  external int pageCount;
+
+  /// Reserved.
+  @Uint32()
+  external int reserved;
+
+  /// Live transactions.
+  @Uint64()
+  external int activeTxns;
+
+  /// Keys with unmerged in-memory versions.
+  @Uint64()
+  external int pendingKeys;
+
+  /// WAL size in bytes.
+  @Uint64()
+  external int walBytes;
+
+  /// Latest commit timestamp.
+  @Uint64()
+  external int commitTs;
+
+  /// Timestamp durably reflected in the tree.
+  @Uint64()
+  external int treeTs;
+
+  /// Page reads served from memory.
+  @Uint64()
+  external int cacheHits;
+
+  /// Page reads that decoded a page from the file.
+  @Uint64()
+  external int cacheMisses;
+}
+
+/// Structural check result. Mirrors `PhoenixTreeReport` in C.
+final class PhoenixTreeReportStruct extends Struct {
+  /// Tree height.
+  @Uint32()
+  external int depth;
+
+  /// Leaf pages.
+  @Uint32()
+  external int leafPages;
+
+  /// Internal pages.
+  @Uint32()
+  external int internalPages;
+
+  /// Overflow pages.
+  @Uint32()
+  external int overflowPages;
+
+  /// Free-list pages.
+  @Uint32()
+  external int freePages;
+
+  /// Allocated but unreachable pages.
+  @Uint32()
+  external int unreachablePages;
+
+  /// Leaves below the minimum fill factor.
+  @Uint32()
+  external int underfullLeaves;
+
+  /// Reserved.
+  @Uint32()
+  external int reserved;
+
+  /// Keys in the tree.
+  @Uint64()
+  external int keys;
+}
+
+/// Native signature for `phoenix_open_ex`.
+typedef OpenExNative =
+    Int32 Function(
+      Pointer<Utf8> path,
+      Pointer<PhoenixOptionsStruct> options,
+      Pointer<Pointer<PhoenixDB>> outHandle,
+    );
+
+/// Dart signature for `phoenix_open_ex`.
+typedef OpenExDart =
+    int Function(
+      Pointer<Utf8> path,
+      Pointer<PhoenixOptionsStruct> options,
+      Pointer<Pointer<PhoenixDB>> outHandle,
+    );
+
+/// Native signature for `phoenix_scan_range`.
+typedef ScanRangeNative =
+    Int32 Function(
+      Pointer<PhoenixDB> handle,
+      Uint64 txnId,
+      Pointer<Uint8> lo,
+      Size loLen,
+      Int32 loMode,
+      Pointer<Uint8> hi,
+      Size hiLen,
+      Int32 hiMode,
+      Uint64 limit,
+      Uint64 maxBytes,
+      Pointer<PhoenixBuffer> out,
+    );
+
+/// Dart signature for `phoenix_scan_range`.
+typedef ScanRangeDart =
     int Function(
       Pointer<PhoenixDB> handle,
-      Pointer<Uint8> outBuf,
-      int outLen,
+      int txnId,
+      Pointer<Uint8> lo,
+      int loLen,
+      int loMode,
+      Pointer<Uint8> hi,
+      int hiLen,
+      int hiMode,
+      int limit,
+      int maxBytes,
+      Pointer<PhoenixBuffer> out,
     );
+
+/// Native signature for `phoenix_write_batch`.
+typedef WriteBatchNative =
+    Int32 Function(Pointer<PhoenixDB> handle, Pointer<Uint8> ops, Size opsLen);
+
+/// Dart signature for `phoenix_write_batch`.
+typedef WriteBatchDart =
+    int Function(Pointer<PhoenixDB> handle, Pointer<Uint8> ops, int opsLen);
+
+/// Native signature for path-taking maintenance calls (backup, restore).
+typedef PathOpNative =
+    Int32 Function(Pointer<PhoenixDB> handle, Pointer<Utf8> path);
+
+/// Dart signature for path-taking maintenance calls (backup, restore).
+typedef PathOpDart =
+    int Function(Pointer<PhoenixDB> handle, Pointer<Utf8> path);
+
+/// Native signature for `phoenix_stats`.
+typedef StatsNative =
+    Int32 Function(Pointer<PhoenixDB> handle, Pointer<PhoenixStatsStruct> out);
+
+/// Dart signature for `phoenix_stats`.
+typedef StatsDart =
+    int Function(Pointer<PhoenixDB> handle, Pointer<PhoenixStatsStruct> out);
+
+/// Native signature for `phoenix_check`.
+typedef CheckNative =
+    Int32 Function(
+      Pointer<PhoenixDB> handle,
+      Pointer<PhoenixTreeReportStruct> out,
+    );
+
+/// Dart signature for `phoenix_check`.
+typedef CheckDart =
+    int Function(
+      Pointer<PhoenixDB> handle,
+      Pointer<PhoenixTreeReportStruct> out,
+    );
+
+/// Native signature for `phoenix_metrics_text`.
+typedef MetricsTextNative =
+    Int32 Function(
+      Pointer<PhoenixDB> handle,
+      Int32 format,
+      Pointer<Pointer<Utf8>> out,
+    );
+
+/// Dart signature for `phoenix_metrics_text`.
+typedef MetricsTextDart =
+    int Function(
+      Pointer<PhoenixDB> handle,
+      int format,
+      Pointer<Pointer<Utf8>> out,
+    );
+
+/// Native signature for `phoenix_set_tracing`.
+typedef SetTracingNative = Int32 Function(Pointer<PhoenixDB> handle, Int32 on);
+
+/// Dart signature for `phoenix_set_tracing`.
+typedef SetTracingDart = int Function(Pointer<PhoenixDB> handle, int on);
+
+/// Native signature for `phoenix_spans_json`.
+typedef SpansJsonNative =
+    Int32 Function(Pointer<PhoenixDB> handle, Pointer<Pointer<Utf8>> out);
+
+/// Dart signature for `phoenix_spans_json`.
+typedef SpansJsonDart =
+    int Function(Pointer<PhoenixDB> handle, Pointer<Pointer<Utf8>> out);
 
 // ---------------------------------------------------------------------------
 // Library loading
@@ -312,11 +558,12 @@ typedef MetricsReportDart =
 
 /// ABI version this Dart package was written against.
 ///
-/// Bumped to 3 in PhoenixDB 2.1, which adds the `phoenix_vector_*` k-NN
-/// surface. The change is additive — every v2 entry point keeps its signature
-/// — but the version guard is exact, so a stale native library is reported at
-/// load time rather than as a missing-symbol crash on the first search.
-const int kExpectedAbiVersion = 3;
+/// 3 (PhoenixDB 2.1) added the `phoenix_vector_*` k-NN surface; 4 (4.0) adds
+/// `phoenix_open_ex`, range/prefix scans, write batches, backup/restore/
+/// compact, stats, the structural check, metrics text and tracing. Each bump
+/// is additive, but the guard is exact, so a stale native library is reported
+/// at load time rather than as a missing-symbol crash on first use.
+const int kExpectedAbiVersion = 4;
 
 /// Thrown when the native library cannot be located or is incompatible.
 class PhoenixLoadException implements Exception {
@@ -585,6 +832,10 @@ class PhoenixBindings {
   /// Executes one SQL statement, yielding a JSON result document.
   final SqlQueryDart sqlQuery;
 
+  /// Executes one SQL statement with bound parameters, optionally in a
+  /// caller's transaction.
+  final SqlQueryParamsDart sqlQueryParams;
+
   /// Whether the native build includes the SQL layer.
   final HasSqlDart hasSql;
 
@@ -599,6 +850,39 @@ class PhoenixBindings {
 
   /// Reads the engine's metrics report into a caller-provided buffer.
   final MetricsReportDart metricsReport;
+
+  /// Opens a database with explicit engine options.
+  final OpenExDart openEx;
+
+  /// Collects a page of key/value pairs between two bounds.
+  final ScanRangeDart scanRange;
+
+  /// Applies an encoded batch of writes atomically.
+  final WriteBatchDart writeBatch;
+
+  /// Writes a compacted, self-contained backup.
+  final PathOpDart backup;
+
+  /// Replaces the contents with a backup.
+  final PathOpDart restore;
+
+  /// Rebuilds the file compactly.
+  final MaintenanceDart compact;
+
+  /// Runtime statistics.
+  final StatsDart stats;
+
+  /// Full structural check.
+  final CheckDart check;
+
+  /// Metrics as text (report or Prometheus).
+  final MetricsTextDart metricsText;
+
+  /// Turns span recording on or off.
+  final SetTracingDart setTracing;
+
+  /// Recorded spans as JSON.
+  final SpansJsonDart spansJson;
 
   /// Pointer to `phoenix_buffer_free`, for use with [NativeFinalizer].
   final Pointer<NativeFunction<BufferFreeNative>> bufferFreePtr;
@@ -653,6 +937,10 @@ class PhoenixBindings {
       sqlQuery = library.lookupFunction<SqlQueryNative, SqlQueryDart>(
         'phoenix_sql_query',
       ),
+      sqlQueryParams = library
+          .lookupFunction<SqlQueryParamsNative, SqlQueryParamsDart>(
+            'phoenix_sql_query_params',
+          ),
       hasSql = library.lookupFunction<HasSqlNative, HasSqlDart>(
         'phoenix_has_sql',
       ),
@@ -665,8 +953,38 @@ class PhoenixBindings {
       scanIter = library.lookupFunction<ScanIterNative, ScanIterDart>(
         'phoenix_scan_iter',
       ),
-      metricsReport = library.lookupFunction<MetricsReportNative, MetricsReportDart>(
-        'phoenix_metrics_report',
+      metricsReport = library
+          .lookupFunction<MetricsReportNative, MetricsReportDart>(
+            'phoenix_metrics_report',
+          ),
+      openEx = library.lookupFunction<OpenExNative, OpenExDart>(
+        'phoenix_open_ex',
+      ),
+      scanRange = library.lookupFunction<ScanRangeNative, ScanRangeDart>(
+        'phoenix_scan_range',
+      ),
+      writeBatch = library.lookupFunction<WriteBatchNative, WriteBatchDart>(
+        'phoenix_write_batch',
+      ),
+      backup = library.lookupFunction<PathOpNative, PathOpDart>(
+        'phoenix_backup',
+      ),
+      restore = library.lookupFunction<PathOpNative, PathOpDart>(
+        'phoenix_restore',
+      ),
+      compact = library.lookupFunction<MaintenanceNative, MaintenanceDart>(
+        'phoenix_compact',
+      ),
+      stats = library.lookupFunction<StatsNative, StatsDart>('phoenix_stats'),
+      check = library.lookupFunction<CheckNative, CheckDart>('phoenix_check'),
+      metricsText = library.lookupFunction<MetricsTextNative, MetricsTextDart>(
+        'phoenix_metrics_text',
+      ),
+      setTracing = library.lookupFunction<SetTracingNative, SetTracingDart>(
+        'phoenix_set_tracing',
+      ),
+      spansJson = library.lookupFunction<SpansJsonNative, SpansJsonDart>(
+        'phoenix_spans_json',
       ),
       bufferFreePtr = library.lookup<NativeFunction<BufferFreeNative>>(
         'phoenix_buffer_free',
@@ -678,47 +996,69 @@ class PhoenixBindings {
   /// Pass [path] to bypass the search entirely. Throws [PhoenixLoadException]
   /// when nothing loadable is found or when the native ABI version does not
   /// match [kExpectedAbiVersion].
+  ///
+  /// The ABI version is checked before any other symbol is bound, so a stale
+  /// library is reported as a version mismatch rather than as a confusing
+  /// missing-symbol error, and the search moves past a stale library to the
+  /// next candidate instead of giving up on the first one it finds.
   factory PhoenixBindings.load({String? path}) {
     final name = path ?? defaultLibraryName;
 
     // iOS links the Rust archive statically into the app executable, so there
     // is no separate library file to open; the symbols live in the process.
     if (path == null && Platform.isIOS) {
-      final bindings = PhoenixBindings._(DynamicLibrary.process());
-      final version = bindings.abiVersion();
-      if (version != kExpectedAbiVersion) {
-        throw PhoenixLoadException(
-          'ABI mismatch: native reports $version, package expects '
-          '$kExpectedAbiVersion. Rebuild the native library.',
-        );
-      }
-      return bindings;
+      final lib = DynamicLibrary.process();
+      _requireAbi(lib, 'the app executable');
+      return PhoenixBindings._(lib);
     }
 
     final attempts = path != null ? <String>[path] : _searchPaths(name);
     final failures = <String>[];
+    PhoenixLoadException? mismatch;
 
     for (final candidate in attempts) {
+      final DynamicLibrary lib;
       try {
-        final lib = DynamicLibrary.open(candidate);
-        final bindings = PhoenixBindings._(lib);
-        final version = bindings.abiVersion();
-        if (version != kExpectedAbiVersion) {
-          throw PhoenixLoadException(
-            'ABI mismatch in "$candidate": native reports $version, '
-            'package expects $kExpectedAbiVersion. Rebuild the native library.',
-          );
-        }
-        return bindings;
-      } on PhoenixLoadException {
-        rethrow;
+        lib = DynamicLibrary.open(candidate);
       } catch (e) {
         failures.add('  $candidate: $e');
+        continue;
       }
+      try {
+        _requireAbi(lib, '"$candidate"');
+      } on PhoenixLoadException catch (e) {
+        mismatch ??= e; // remember the first stale library, keep looking
+        failures.add('  $candidate: ${e.message}');
+        continue;
+      }
+      return PhoenixBindings._(lib);
+    }
+    if (mismatch != null) {
+      throw PhoenixLoadException(
+        '${mismatch.message}\nSearched:\n${failures.join('\n')}',
+      );
     }
     throw PhoenixLoadException(
       'Could not load $name. Run build.sh (or build.ps1) to compile the '
       'native library. Attempts:\n${failures.join('\n')}',
     );
+  }
+
+  /// Fails unless [lib] reports exactly [kExpectedAbiVersion].
+  static void _requireAbi(DynamicLibrary lib, String where) {
+    final int version;
+    try {
+      version = lib.lookupFunction<AbiVersionNative, AbiVersionDart>(
+        'phoenix_abi_version',
+      )();
+    } catch (e) {
+      throw PhoenixLoadException('$where is not a PhoenixDB library: $e');
+    }
+    if (version != kExpectedAbiVersion) {
+      throw PhoenixLoadException(
+        'ABI mismatch in $where: native reports $version, package expects '
+        '$kExpectedAbiVersion. Rebuild the native library.',
+      );
+    }
   }
 }

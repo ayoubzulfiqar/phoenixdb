@@ -12,12 +12,23 @@
 //!
 //! # Durability protocol
 //!
-//! 1. `Begin` … `Insert`/`Delete` … `Commit` are appended.
-//! 2. [`Wal::commit`] appends the `Commit` record **and calls `sync_all`**, so a
-//!    transaction is durable the instant the call returns.
-//! 3. Only a committed transaction is replayed by [`Wal::recover`]; records
-//!    belonging to a transaction with no `Commit` are discarded.
-//! 4. After the tree is flushed, [`Wal::checkpoint`] truncates the log.
+//! 1. A transaction's writes are staged in memory and logged **at commit**:
+//!    [`Wal::log_commit`] appends every `Insert`/`Delete` followed by one
+//!    `Commit`, then flushes and (optionally) calls `sync_data`, so a
+//!    transaction is durable the instant the call returns. Nothing is logged
+//!    for a transaction that never commits, so a checkpoint can never strand
+//!    the first half of an in-flight transaction.
+//! 2. Only a committed transaction is replayed by [`Wal::recover`]; records
+//!    belonging to a transaction with no `Commit` are discarded (older logs
+//!    that still contain `Begin`/`Rollback` records remain readable).
+//! 3. After the tree is flushed, [`Wal::reset`] rewrites the log so that it
+//!    holds only a `Checkpoint` marker plus every committed version the tree
+//!    does not yet contain. The rewrite goes through a temporary file and an
+//!    atomic rename, so a crash at any point leaves either the old or the new
+//!    log — never a log missing committed work.
+//! 4. [`Wal::recover`] reports where the last intact frame ends; the engine
+//!    truncates a torn tail before appending, so fresh commits are never
+//!    written behind garbage that would hide them from the next recovery.
 
 use crate::error::{Error, Result};
 use serde::{Deserialize, Serialize};
@@ -72,6 +83,54 @@ pub enum WalRecord {
     },
 }
 
+/// Borrowed mirror of [`WalRecord`] with an identical bincode encoding.
+///
+/// Serde encodes `&[u8]` and `Vec<u8>` the same way, and the variants are
+/// declared in the same order, so logging a commit never has to clone its
+/// keys and values just to serialise them. `borrowed_encoding_matches_owned`
+/// pins the equivalence.
+#[derive(Serialize)]
+enum WalRecordRef<'a> {
+    #[allow(dead_code)]
+    Begin {
+        txn_id: u64,
+    },
+    Insert {
+        txn_id: u64,
+        key: &'a [u8],
+        value: &'a [u8],
+    },
+    Delete {
+        txn_id: u64,
+        key: &'a [u8],
+    },
+    Commit {
+        txn_id: u64,
+        commit_ts: u64,
+    },
+    #[allow(dead_code)]
+    Rollback {
+        txn_id: u64,
+    },
+    Checkpoint {
+        tree_ts: u64,
+    },
+}
+
+/// One write of a committing transaction: `Some(value)` puts, `None` deletes.
+pub type LoggedWrite<'a> = (&'a [u8], Option<&'a [u8]>);
+
+/// A committed transaction to be re-logged by [`Wal::reset`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetainedCommit {
+    /// Transaction id the records are filed under.
+    pub txn_id: u64,
+    /// Original commit timestamp.
+    pub commit_ts: u64,
+    /// `(key, Some(value))` for a put, `(key, None)` for a delete.
+    pub writes: Vec<(Vec<u8>, Option<Vec<u8>>)>,
+}
+
 impl WalRecord {
     /// Transaction this record belongs to, if any.
     #[must_use]
@@ -107,15 +166,25 @@ pub struct Recovery {
     pub max_commit_ts: u64,
     /// Frames discarded because of a torn or corrupt tail.
     pub truncated_bytes: u64,
+    /// Length of the intact prefix of the log: where the next frame belongs.
+    pub valid_bytes: u64,
+    /// Highest `Checkpoint { tree_ts }` marker seen, if any.
+    pub checkpoint_ts: Option<u64>,
 }
 
 /// Append-only write-ahead log.
 pub struct Wal {
     path: PathBuf,
-    writer: BufWriter<File>,
-    /// Bytes appended since the last checkpoint.
+    /// `None` only transiently inside [`Wal::reset`] while the log file is
+    /// being swapped; every public method sees `Some`.
+    writer: Option<BufWriter<File>>,
+    /// Bytes currently in the log (intact prefix plus everything appended).
     bytes_written: u64,
     lsn: u64,
+    /// `fsync` calls issued, for metrics.
+    syncs: u64,
+    /// Bytes appended since open, for metrics.
+    appended: u64,
 }
 
 impl Wal {
@@ -132,16 +201,48 @@ impl Wal {
         writer.seek(SeekFrom::End(0))?;
         Ok(Wal {
             path: path.to_path_buf(),
-            writer,
+            writer: Some(writer),
             bytes_written: len,
             lsn: 0,
+            syncs: 0,
+            appended: 0,
         })
     }
 
-    /// Current log sequence number (records appended since open).
+    /// Opens the log and discards everything past `valid_bytes`.
+    ///
+    /// Pass [`Recovery::valid_bytes`]: a torn tail left by a crash must be cut
+    /// off before anything new is appended, otherwise the next recovery stops
+    /// at the garbage and never sees the commits written after it.
+    pub fn open_truncated(path: &Path, valid_bytes: u64) -> Result<Self> {
+        let mut wal = Wal::open(path)?;
+        if wal.bytes_written > valid_bytes {
+            let writer = wal.writer()?;
+            writer.flush()?;
+            let file = writer.get_mut();
+            file.set_len(valid_bytes)?;
+            file.sync_all()?;
+            writer.seek(SeekFrom::End(0))?;
+            wal.bytes_written = valid_bytes;
+        }
+        Ok(wal)
+    }
+
+    fn writer(&mut self) -> Result<&mut BufWriter<File>> {
+        self.writer.as_mut().ok_or(Error::Closed)
+    }
+
+    /// Current log sequence number (records appended, continuing from
+    /// [`Wal::set_lsn`]).
     #[must_use]
     pub fn lsn(&self) -> u64 {
         self.lsn
+    }
+
+    /// Seeds the LSN counter, e.g. from the last LSN recorded in the meta page,
+    /// so sequence numbers keep increasing across restarts.
+    pub fn set_lsn(&mut self, lsn: u64) {
+        self.lsn = self.lsn.max(lsn);
     }
 
     /// Bytes currently in the log.
@@ -150,29 +251,52 @@ impl Wal {
         self.bytes_written
     }
 
+    /// Number of `fsync` calls issued since open.
+    #[must_use]
+    pub fn sync_count(&self) -> u64 {
+        self.syncs
+    }
+
+    /// Bytes appended since open.
+    #[must_use]
+    pub fn bytes_appended(&self) -> u64 {
+        self.appended
+    }
+
     /// Path of the log file.
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
     }
 
-    /// Appends a record **without** syncing. Returns its LSN.
-    pub fn append(&mut self, record: &WalRecord) -> Result<u64> {
-        let payload = bincode::serialize(record)?;
+    fn append_payload(&mut self, payload: &[u8]) -> Result<u64> {
         if payload.len() as u64 > MAX_RECORD_BYTES as u64 {
             return Err(Error::Full(format!(
                 "WAL record of {} bytes exceeds the {MAX_RECORD_BYTES}-byte limit",
                 payload.len()
             )));
         }
-        let crc = crc32fast::hash(&payload);
-        self.writer
-            .write_all(&(payload.len() as u32).to_le_bytes())?;
-        self.writer.write_all(&crc.to_le_bytes())?;
-        self.writer.write_all(&payload)?;
-        self.bytes_written += 8 + payload.len() as u64;
+        let crc = crc32fast::hash(payload);
+        let writer = self.writer()?;
+        writer.write_all(&(payload.len() as u32).to_le_bytes())?;
+        writer.write_all(&crc.to_le_bytes())?;
+        writer.write_all(payload)?;
+        let framed = 8 + payload.len() as u64;
+        self.bytes_written += framed;
+        self.appended += framed;
         self.lsn += 1;
         Ok(self.lsn)
+    }
+
+    fn append_ref(&mut self, record: &WalRecordRef<'_>) -> Result<u64> {
+        let payload = bincode::serialize(record)?;
+        self.append_payload(&payload)
+    }
+
+    /// Appends a record **without** syncing. Returns its LSN.
+    pub fn append(&mut self, record: &WalRecord) -> Result<u64> {
+        let payload = bincode::serialize(record)?;
+        self.append_payload(&payload)
     }
 
     /// Appends `Commit` and forces it to stable storage.
@@ -185,26 +309,143 @@ impl Wal {
         Ok(lsn)
     }
 
-    /// Flushes user-space buffers and calls `sync_all`.
+    /// Logs a whole transaction — every write, then its `Commit` record.
+    ///
+    /// With `sync == true` the log is `fsync`ed before returning, so the
+    /// transaction survives power loss. With `sync == false` the records are
+    /// only handed to the operating system: they survive a crash of the host
+    /// process but may be lost if the machine itself goes down.
+    ///
+    /// If an append fails midway the log holds writes without a `Commit`,
+    /// which recovery ignores, so a failed call never half-commits.
+    pub fn log_commit<'a>(
+        &mut self,
+        txn_id: u64,
+        commit_ts: u64,
+        writes: impl IntoIterator<Item = LoggedWrite<'a>>,
+        sync: bool,
+    ) -> Result<u64> {
+        for (key, value) in writes {
+            match value {
+                Some(value) => self.append_ref(&WalRecordRef::Insert { txn_id, key, value })?,
+                None => self.append_ref(&WalRecordRef::Delete { txn_id, key })?,
+            };
+        }
+        let lsn = self.append_ref(&WalRecordRef::Commit { txn_id, commit_ts })?;
+        if sync {
+            self.sync()?;
+        } else {
+            self.writer()?.flush()?;
+        }
+        Ok(lsn)
+    }
+
+    /// Flushes user-space buffers and calls `sync_data`.
     pub fn sync(&mut self) -> Result<()> {
-        self.writer.flush()?;
-        self.writer.get_ref().sync_all()?;
+        let writer = self.writer()?;
+        writer.flush()?;
+        writer.get_ref().sync_data()?;
+        self.syncs += 1;
         Ok(())
     }
 
     /// Records a checkpoint and truncates the log.
     ///
-    /// Only call this once the tree is durable on disk; the log is the sole
-    /// record of committed work until then.
+    /// Only call this once the tree is durable on disk **and** holds every
+    /// committed version; when some committed versions are still only in
+    /// memory (a live snapshot pinned the merge watermark) use [`Wal::reset`].
     pub fn checkpoint(&mut self, tree_ts: u64) -> Result<()> {
-        self.writer.flush()?;
-        let file = self.writer.get_mut();
-        file.set_len(0)?;
-        file.seek(SeekFrom::Start(0))?;
-        file.sync_all()?;
-        self.bytes_written = 0;
-        self.append(&WalRecord::Checkpoint { tree_ts })?;
-        self.sync()
+        self.reset(tree_ts, &[])
+    }
+
+    /// Replaces the log with a `Checkpoint { tree_ts }` marker followed by the
+    /// `retained` commits — committed versions newer than `tree_ts` that the
+    /// flushed tree does not contain yet.
+    ///
+    /// With nothing to retain, truncating in place is safe: every committed
+    /// write is already in the durable tree, so a crash mid-truncate loses
+    /// nothing. Otherwise the new log is built in a sibling temporary file,
+    /// `fsync`ed and atomically renamed over the old one, so a crash leaves
+    /// either log intact and recovery never misses a committed write.
+    pub fn reset(&mut self, tree_ts: u64, retained: &[RetainedCommit]) -> Result<()> {
+        self.writer()?.flush()?;
+        if retained.is_empty() {
+            let file = self.writer()?.get_mut();
+            file.set_len(0)?;
+            file.seek(SeekFrom::Start(0))?;
+            file.sync_all()?;
+            self.bytes_written = 0;
+            self.append_ref(&WalRecordRef::Checkpoint { tree_ts })?;
+            return self.sync();
+        }
+
+        let tmp_path = {
+            let mut s = self.path.as_os_str().to_os_string();
+            s.push(".tmp");
+            PathBuf::from(s)
+        };
+        let tmp = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&tmp_path)?;
+        let mut fresh = Wal {
+            path: tmp_path.clone(),
+            writer: Some(BufWriter::new(tmp)),
+            bytes_written: 0,
+            lsn: self.lsn,
+            syncs: 0,
+            appended: 0,
+        };
+        let built = (|| -> Result<()> {
+            fresh.append_ref(&WalRecordRef::Checkpoint { tree_ts })?;
+            for commit in retained {
+                fresh.log_commit(
+                    commit.txn_id,
+                    commit.commit_ts,
+                    commit
+                        .writes
+                        .iter()
+                        .map(|(k, v)| (k.as_slice(), v.as_deref())),
+                    false,
+                )?;
+            }
+            fresh.sync()
+        })();
+        drop(fresh.writer.take());
+        if let Err(e) = built {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(e);
+        }
+
+        // Windows refuses to rename over a file that is still open, so the old
+        // handle is released first. Until the rename lands the old log is
+        // untouched and still describes the database completely.
+        drop(self.writer.take());
+        let renamed = std::fs::rename(&tmp_path, &self.path);
+        // Reopen whatever now lives at the log path: the new log, or the old
+        // one if the rename failed. Either way the handle stays usable.
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&self.path)?;
+        let len = file.metadata()?.len();
+        let mut writer = BufWriter::new(file);
+        writer.seek(SeekFrom::End(0))?;
+        self.writer = Some(writer);
+        self.bytes_written = len;
+        if let Err(e) = renamed {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(Error::Io(e));
+        }
+        crate::fsutil::sync_parent_dir(&self.path);
+        self.lsn = fresh.lsn;
+        self.syncs += fresh.syncs;
+        self.appended += fresh.appended;
+        Ok(())
     }
 
     /// Scans the log and returns the redo set for committed transactions.
@@ -262,6 +503,7 @@ impl Wal {
             good_bytes = end;
         }
         recovery.truncated_bytes = total - good_bytes as u64;
+        recovery.valid_bytes = good_bytes as u64;
 
         // Pass 1: which transactions committed, and when?
         let mut commits: HashMap<u64, u64> = HashMap::new();
@@ -274,6 +516,10 @@ impl Wal {
                 }
                 WalRecord::Rollback { txn_id } => {
                     rolled_back.insert(*txn_id);
+                }
+                WalRecord::Checkpoint { tree_ts } => {
+                    recovery.checkpoint_ts =
+                        Some(recovery.checkpoint_ts.map_or(*tree_ts, |t| t.max(*tree_ts)));
                 }
                 _ => {}
             }
@@ -400,7 +646,7 @@ mod tests {
             .unwrap();
             wal.commit(1, 5).unwrap();
             // Simulate a half-written frame.
-            let f = wal.writer.get_mut();
+            let f = wal.writer.as_mut().unwrap().get_mut();
             f.write_all(&[40u8, 0, 0, 0, 1, 2, 3, 4, 9, 9]).unwrap();
             f.sync_all().unwrap();
         }
@@ -462,5 +708,181 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let rec = Wal::recover(&dir.path().join("nope.log")).unwrap();
         assert!(rec.committed.is_empty());
+    }
+
+    #[test]
+    fn borrowed_encoding_matches_owned() {
+        let cases = [
+            (
+                WalRecord::Insert {
+                    txn_id: 7,
+                    key: b"key".to_vec(),
+                    value: vec![1, 2, 3, 255],
+                },
+                WalRecordRef::Insert {
+                    txn_id: 7,
+                    key: b"key",
+                    value: &[1, 2, 3, 255],
+                },
+            ),
+            (
+                WalRecord::Delete {
+                    txn_id: u64::MAX,
+                    key: vec![0; 40],
+                },
+                WalRecordRef::Delete {
+                    txn_id: u64::MAX,
+                    key: &[0; 40],
+                },
+            ),
+            (
+                WalRecord::Commit {
+                    txn_id: 3,
+                    commit_ts: 9,
+                },
+                WalRecordRef::Commit {
+                    txn_id: 3,
+                    commit_ts: 9,
+                },
+            ),
+            (
+                WalRecord::Checkpoint { tree_ts: 11 },
+                WalRecordRef::Checkpoint { tree_ts: 11 },
+            ),
+            (
+                WalRecord::Begin { txn_id: 5 },
+                WalRecordRef::Begin { txn_id: 5 },
+            ),
+            (
+                WalRecord::Rollback { txn_id: 5 },
+                WalRecordRef::Rollback { txn_id: 5 },
+            ),
+        ];
+        for (owned, borrowed) in cases {
+            assert_eq!(
+                bincode::serialize(&owned).unwrap(),
+                bincode::serialize(&borrowed).unwrap(),
+                "encoding drifted for {owned:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn log_commit_is_replayed_as_one_transaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("w.log");
+        {
+            let mut wal = Wal::open(&path).unwrap();
+            wal.log_commit(
+                4,
+                12,
+                [
+                    (&b"a"[..], Some(&b"1"[..])),
+                    (&b"b"[..], None),
+                    (&b"c"[..], Some(&b""[..])),
+                ],
+                true,
+            )
+            .unwrap();
+            assert_eq!(wal.sync_count(), 1);
+        }
+        let rec = Wal::recover(&path).unwrap();
+        assert_eq!(rec.committed.len(), 1);
+        assert_eq!(rec.committed[0].0, 12);
+        assert_eq!(
+            rec.committed[0].1,
+            vec![
+                RecoveredOp::Insert(b"a".to_vec(), b"1".to_vec()),
+                RecoveredOp::Delete(b"b".to_vec()),
+                RecoveredOp::Insert(b"c".to_vec(), Vec::new()),
+            ]
+        );
+        assert_eq!(rec.valid_bytes, std::fs::metadata(&path).unwrap().len());
+    }
+
+    #[test]
+    fn unsynced_commit_still_reaches_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("w.log");
+        let mut wal = Wal::open(&path).unwrap();
+        wal.log_commit(1, 1, [(&b"k"[..], Some(&b"v"[..]))], false)
+            .unwrap();
+        assert_eq!(wal.sync_count(), 0);
+        // Not fsynced, but flushed to the OS: a reader sees it immediately.
+        let rec = Wal::recover(&path).unwrap();
+        assert_eq!(rec.committed.len(), 1);
+    }
+
+    #[test]
+    fn reset_keeps_retained_commits_and_marks_the_checkpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("w.log");
+        let mut wal = Wal::open(&path).unwrap();
+        for ts in 1..=20u64 {
+            wal.log_commit(ts, ts, [(&b"k"[..], Some(&[ts as u8][..]))], false)
+                .unwrap();
+        }
+        let retained = vec![
+            RetainedCommit {
+                txn_id: 100,
+                commit_ts: 19,
+                writes: vec![(b"k".to_vec(), Some(vec![19]))],
+            },
+            RetainedCommit {
+                txn_id: 101,
+                commit_ts: 20,
+                writes: vec![(b"k".to_vec(), None), (b"z".to_vec(), Some(vec![1]))],
+            },
+        ];
+        wal.reset(18, &retained).unwrap();
+        // The handle keeps working after the swap.
+        wal.log_commit(102, 21, [(&b"n"[..], Some(&b"new"[..]))], true)
+            .unwrap();
+        drop(wal);
+
+        let rec = Wal::recover(&path).unwrap();
+        assert_eq!(rec.checkpoint_ts, Some(18));
+        let stamps: Vec<u64> = rec.committed.iter().map(|(ts, _)| *ts).collect();
+        assert_eq!(
+            stamps,
+            vec![19, 20, 21],
+            "only retained + new commits survive"
+        );
+        assert_eq!(
+            rec.committed[1].1,
+            vec![
+                RecoveredOp::Delete(b"k".to_vec()),
+                RecoveredOp::Insert(b"z".to_vec(), vec![1]),
+            ]
+        );
+        assert!(!dir.path().join("w.log.tmp").exists());
+    }
+
+    #[test]
+    fn open_truncated_drops_a_torn_tail_so_later_commits_survive() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("w.log");
+        {
+            let mut wal = Wal::open(&path).unwrap();
+            wal.log_commit(1, 1, [(&b"a"[..], Some(&b"1"[..]))], true)
+                .unwrap();
+            let f = wal.writer.as_mut().unwrap().get_mut();
+            f.write_all(&[200u8, 0, 0, 0, 1, 2, 3]).unwrap(); // torn frame
+            f.sync_all().unwrap();
+        }
+        let rec = Wal::recover(&path).unwrap();
+        assert_eq!(rec.truncated_bytes, 7);
+        {
+            let mut wal = Wal::open_truncated(&path, rec.valid_bytes).unwrap();
+            wal.log_commit(2, 2, [(&b"b"[..], Some(&b"2"[..]))], true)
+                .unwrap();
+        }
+        let rec = Wal::recover(&path).unwrap();
+        assert_eq!(rec.truncated_bytes, 0);
+        assert_eq!(
+            rec.committed.len(),
+            2,
+            "the commit after the tear must replay"
+        );
     }
 }

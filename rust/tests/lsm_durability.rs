@@ -46,7 +46,8 @@ fn flushed_data_is_readable_after_reopen() {
                 format!("key{i:04}").into_bytes(),
                 format!("value{i}").into_bytes(),
                 i as u64 + 1,
-            );
+            )
+            .unwrap();
         }
         e.rotate();
         e.flush_one().unwrap();
@@ -72,7 +73,8 @@ fn level_placement_survives_reopen() {
         for batch in 0..3u32 {
             for i in 0..20u32 {
                 let k = format!("k{batch}{i:03}");
-                e.put(k.into_bytes(), b"v".to_vec(), (batch * 100 + i) as u64 + 1);
+                e.put(k.into_bytes(), b"v".to_vec(), (batch * 100 + i) as u64 + 1)
+                    .unwrap();
             }
             e.rotate();
             e.flush_one().unwrap();
@@ -105,10 +107,10 @@ fn tombstones_survive_reopen() {
     let dir = tempfile::tempdir().unwrap();
     {
         let mut e = LsmEngine::open(dir.path(), tiny_options()).unwrap();
-        e.put(b"gone".to_vec(), b"value".to_vec(), 1);
+        e.put(b"gone".to_vec(), b"value".to_vec(), 1).unwrap();
         e.rotate();
         e.flush_one().unwrap();
-        e.delete(b"gone".to_vec(), 5);
+        e.delete(b"gone".to_vec(), 5).unwrap();
         e.rotate();
         e.flush_one().unwrap();
     }
@@ -126,7 +128,8 @@ fn multiple_reopens_are_stable() {
     let dir = tempfile::tempdir().unwrap();
     for round in 0..5u64 {
         let mut e = LsmEngine::open(dir.path(), tiny_options()).unwrap();
-        e.put(format!("r{round}").into_bytes(), b"v".to_vec(), round + 1);
+        e.put(format!("r{round}").into_bytes(), b"v".to_vec(), round + 1)
+            .unwrap();
         e.rotate();
         e.flush_one().unwrap();
         // Everything written in earlier rounds must still be visible.
@@ -148,7 +151,7 @@ fn checkpoint_seqno_persists() {
     {
         let mut e = LsmEngine::open(dir.path(), tiny_options()).unwrap();
         assert_eq!(e.checkpoint_seqno(), 0);
-        e.put(b"k".to_vec(), b"v".to_vec(), 42);
+        e.put(b"k".to_vec(), b"v".to_vec(), 42).unwrap();
         e.rotate();
         e.flush_one().unwrap();
         assert_eq!(e.checkpoint_seqno(), 42, "flush advances the checkpoint");
@@ -165,7 +168,7 @@ fn an_orphaned_sstable_is_reclaimed_on_open() {
     let dir = tempfile::tempdir().unwrap();
     {
         let mut e = LsmEngine::open(dir.path(), tiny_options()).unwrap();
-        e.put(b"k".to_vec(), b"v".to_vec(), 1);
+        e.put(b"k".to_vec(), b"v".to_vec(), 1).unwrap();
         e.rotate();
         e.flush_one().unwrap();
     }
@@ -185,7 +188,8 @@ fn a_torn_manifest_tail_is_truncated_not_fatal() {
     {
         let mut e = LsmEngine::open(dir.path(), tiny_options()).unwrap();
         for i in 0..3u32 {
-            e.put(format!("k{i}").into_bytes(), b"v".to_vec(), i as u64 + 1);
+            e.put(format!("k{i}").into_bytes(), b"v".to_vec(), i as u64 + 1)
+                .unwrap();
             e.rotate();
             e.flush_one().unwrap();
         }
@@ -219,7 +223,7 @@ fn a_referenced_but_corrupt_table_is_a_hard_error() {
     let dir = tempfile::tempdir().unwrap();
     {
         let mut e = LsmEngine::open(dir.path(), tiny_options()).unwrap();
-        e.put(b"k".to_vec(), b"v".to_vec(), 1);
+        e.put(b"k".to_vec(), b"v".to_vec(), 1).unwrap();
         e.rotate();
         e.flush_one().unwrap();
     }
@@ -366,4 +370,165 @@ fn manifest_survives_a_large_number_of_edits() {
     let state = Manifest::recover(&path).unwrap();
     assert_eq!(state.tables.len(), 2000);
     assert_eq!(state.next_table_id, 2001);
+}
+
+// ---------------------------------------------------------------------------
+// Regressions for the 4.0 audit: each of these lost data before the fix.
+// ---------------------------------------------------------------------------
+
+fn put_and_flush(e: &mut LsmEngine, key: &[u8], value: &[u8], seqno: u64) {
+    e.put(key.to_vec(), value.to_vec(), seqno).unwrap();
+    e.rotate();
+    e.flush_one().unwrap();
+}
+
+#[test]
+fn edits_after_a_torn_manifest_tail_survive_the_next_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let mut e = LsmEngine::open(dir.path(), tiny_options()).unwrap();
+        put_and_flush(&mut e, b"a", b"1", 1);
+    }
+    // A crash mid-append leaves a partial frame at the end of the manifest.
+    let manifest = dir.path().join(MANIFEST_FILE);
+    let mut bytes = std::fs::read(&manifest).unwrap();
+    bytes.extend_from_slice(&[0x40, 0, 0, 0, 9, 9]);
+    std::fs::write(&manifest, bytes).unwrap();
+    {
+        let mut e = LsmEngine::open(dir.path(), tiny_options()).unwrap();
+        put_and_flush(&mut e, b"b", b"2", 2); // appended after the tear...
+    }
+    // ...must be visible after another reopen (and its table not deleted).
+    let e = LsmEngine::open(dir.path(), tiny_options()).unwrap();
+    assert_eq!(e.get(b"a", 10).unwrap(), Some(Some(b"1".to_vec())));
+    assert_eq!(e.get(b"b", 10).unwrap(), Some(Some(b"2".to_vec())));
+}
+
+#[test]
+fn mid_file_manifest_corruption_is_an_error_not_a_wipe() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let mut e = LsmEngine::open(dir.path(), tiny_options()).unwrap();
+        for (i, k) in [b"a", b"b", b"c"].iter().enumerate() {
+            put_and_flush(&mut e, *k, b"v", i as u64 + 1);
+        }
+    }
+    let tables_before = std::fs::read_dir(dir.path())
+        .unwrap()
+        .filter(|e| {
+            e.as_ref()
+                .unwrap()
+                .path()
+                .extension()
+                .is_some_and(|x| x == "sst")
+        })
+        .count();
+    assert_eq!(tables_before, 3);
+    // Flip one byte inside the first frame's payload.
+    let manifest = dir.path().join(MANIFEST_FILE);
+    let mut bytes = std::fs::read(&manifest).unwrap();
+    bytes[10] ^= 0xFF;
+    std::fs::write(&manifest, bytes).unwrap();
+
+    assert!(
+        LsmEngine::open(dir.path(), tiny_options()).is_err(),
+        "a corrupt manifest must not open as an empty store"
+    );
+    let tables_after = std::fs::read_dir(dir.path())
+        .unwrap()
+        .filter(|e| {
+            e.as_ref()
+                .unwrap()
+                .path()
+                .extension()
+                .is_some_and(|x| x == "sst")
+        })
+        .count();
+    assert_eq!(tables_after, 3, "no table may be deleted as an 'orphan'");
+}
+
+#[test]
+fn a_compaction_commits_as_one_manifest_edit() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut e = LsmEngine::open(dir.path(), tiny_options()).unwrap();
+    put_and_flush(&mut e, b"k", b"old", 1);
+    put_and_flush(&mut e, b"k", b"new", 2);
+    let edits_before = Manifest::recover(dir.path().join(MANIFEST_FILE))
+        .unwrap()
+        .edits_replayed;
+    e.compact_once(10).unwrap().expect("L0 is over its trigger");
+    let after = Manifest::recover(dir.path().join(MANIFEST_FILE)).unwrap();
+    assert_eq!(
+        after.edits_replayed,
+        edits_before + 1,
+        "adds and removes must land in a single atomic edit"
+    );
+    assert_eq!(e.get(b"k", 10).unwrap(), Some(Some(b"new".to_vec())));
+}
+
+#[test]
+fn oversized_values_are_rejected_before_they_can_brick_the_engine() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut e = LsmEngine::open(dir.path(), tiny_options()).unwrap();
+    let huge = vec![0u8; 64 * 1024 * 1024 + 1];
+    assert!(e.put(b"k".to_vec(), huge, 1).is_err());
+    put_and_flush(&mut e, b"ok", b"v", 2);
+    drop(e);
+    LsmEngine::open(dir.path(), tiny_options()).expect("still opens");
+}
+
+#[test]
+fn reopening_with_fewer_levels_keeps_deep_tables() {
+    let dir = tempfile::tempdir().unwrap();
+    let deep = LsmOptions {
+        levels: LevelConfig {
+            max_levels: 7,
+            ..tiny_options().levels
+        },
+        ..tiny_options()
+    };
+    // Place a table at L5 directly through the manifest.
+    {
+        let mut e = LsmEngine::open(dir.path(), deep).unwrap();
+        put_and_flush(&mut e, b"deep", b"v", 1);
+    }
+    let path = dir.path().join(MANIFEST_FILE);
+    let state = Manifest::recover(&path).unwrap();
+    let mut moved = state.tables[0].clone();
+    moved.level = 5;
+    Manifest::compact(&path, &[moved], state.next_table_id, state.checkpoint_seqno).unwrap();
+
+    // Reopen with max_levels 4 and force many manifest edits.
+    let mut e = LsmEngine::open(dir.path(), tiny_options()).unwrap();
+    for i in 0..300u64 {
+        e.set_checkpoint(i + 10).unwrap();
+        if i % 50 == 0 {
+            put_and_flush(&mut e, format!("k{i}").as_bytes(), b"x", 1000 + i);
+            let _ = e.compact_until_stable(0, 8);
+        }
+    }
+    drop(e);
+    let e = LsmEngine::open(dir.path(), tiny_options()).unwrap();
+    assert_eq!(e.get(b"deep", 10).unwrap(), Some(Some(b"v".to_vec())));
+}
+
+#[test]
+fn invalid_level_configs_are_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    for levels in [
+        LevelConfig {
+            max_levels: 1,
+            ..tiny_options().levels
+        },
+        LevelConfig {
+            l0_compaction_trigger: 0,
+            ..tiny_options().levels
+        },
+    ] {
+        let options = LsmOptions {
+            levels,
+            ..tiny_options()
+        };
+        assert!(LsmEngine::open(dir.path(), options).is_err());
+    }
 }

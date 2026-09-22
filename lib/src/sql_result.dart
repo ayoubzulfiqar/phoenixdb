@@ -21,7 +21,7 @@ class SqlResult {
   /// Result rows, each parallel to [columns]. Empty unless [isRows].
   ///
   /// Cells are `String`, `int`, `double`, or `null`, preserving the type the
-  /// value was stored with.
+  /// value was stored with (a stored `3.0` arrives as the double `3.0`).
   final List<List<Object?>> rows;
 
   /// Rows inserted, updated, or deleted. Zero for a `SELECT`.
@@ -54,11 +54,16 @@ class SqlResult {
         if (rawColumns is! List || rawRows is! List) {
           throw FormatException('malformed rows result', source);
         }
+        final rows = <List<Object?>>[];
+        for (final r in rawRows) {
+          if (r is! List) {
+            throw FormatException('malformed row in rows result', source);
+          }
+          rows.add(r.cast<Object?>().toList(growable: false));
+        }
         return SqlResult._(
           columns: rawColumns.map((c) => '$c').toList(growable: false),
-          rows: rawRows
-              .map((r) => (r as List).cast<Object?>().toList(growable: false))
-              .toList(growable: false),
+          rows: List.unmodifiable(rows),
           affected: 0,
           detail: null,
         );

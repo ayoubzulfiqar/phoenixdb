@@ -12,7 +12,15 @@
 //! levels, which Bloom filters and per-table key ranges make cheap for the
 //! common "key is absent from this level" case.
 //!
-//! PhoenixDB runs both. Writes land in the LSM; the B+Tree remains the
+//! # Status
+//!
+//! This is a **standalone engine**: [`crate::Database`] does not route writes
+//! through it yet, and it is not exposed over the C ABI or to Dart. It is
+//! designed to sit in front of the B+Tree as described below, and is kept
+//! correct and tested for that integration — but today the storage engine
+//! behind `Database` is the B+Tree with its MVCC overlay and WAL alone.
+//!
+//! In the hybrid design, writes land in the LSM; the B+Tree remains the
 //! authoritative store for data that has been checkpointed through it. A read
 //! consults the levels newest-first and falls through to the tree only when no
 //! LSM level answers definitively:

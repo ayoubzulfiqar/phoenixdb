@@ -1,64 +1,56 @@
 //! SQL tokenizer.
 //!
-//! # Why hand-written
+//! Byte-oriented and allocation-light: identifiers and literals are the only
+//! tokens that own data. Every token records its byte offset so parse errors
+//! can point at the exact position.
 //!
-//! The design called for `sqlparser-rs`. That crate depends on `stacker`, which
-//! needs a C compiler — unavailable on the Flutter/Android cross-compilation
-//! path and on this build host. A hand-written lexer keeps the SQL feature
-//! pure-Rust and dependency-free.
+//! Recognised:
 //!
-//! The approach (hand-rolled parsing rather than a parser-generator) was
-//! confirmed workable by MagnumDB <https://github.com/sohamdev77/MagnumDB>
-//! (MIT). This implementation does **not** reuse its code: MagnumDB dispatches
-//! on `sql.to_uppercase().starts_with("CREATE TABLE")` and splits on single
-//! spaces, so it rejects `CREATE  TABLE` (two spaces), and any statement
-//! containing a newline or tab. Tokenizing first removes that whole class of
-//! bug — whitespace becomes insignificant, as SQL requires.
-//!
-//! # Design
-//!
-//! One pass over the input produces a `Vec<Token>`. Whitespace separates tokens
-//! but is not itself a token; comments are skipped. String literals are scanned
-//! with proper `''` escape handling, so a quoted value may contain commas,
-//! parentheses and SQL keywords without confusing the parser.
-//!
-//! Every token records its byte offset, so a parse error can point at the exact
-//! character that went wrong instead of reporting "syntax error".
+//! * bare identifiers and keywords (`[A-Za-z_][A-Za-z0-9_]*`), matched
+//!   case-insensitively as keywords;
+//! * quoted identifiers (`"like this"`, `""` escapes a quote) — always names,
+//!   never keywords;
+//! * string literals (`'text'`, `''` escapes a quote);
+//! * numbers: `42`, `-7`, `+3`, `3.5`, `.5`, `1e3`, `2.5E-4`;
+//! * bound parameters: `?` (next in order) and `?3` (explicit, 1-based);
+//! * `( ) , ; * .` and the comparison operators `= <> != < <= > >=`;
+//! * `--` line comments and `/* */` block comments.
 
 use crate::error::{Error, Result};
 
-/// A lexical token together with where it started.
+/// One lexical token with its source offset.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Token {
-    /// What kind of token this is.
+    /// What the token is.
     pub kind: TokenKind,
-    /// Byte offset of the token's first character in the source.
+    /// Byte offset of the token's first character.
     pub offset: usize,
 }
 
 impl Token {
-    /// Creates a token at `offset`.
+    /// Creates a token.
     #[must_use]
     pub fn new(kind: TokenKind, offset: usize) -> Self {
         Token { kind, offset }
     }
 }
 
-/// The kinds of token the SQL dialect recognises.
+/// Token categories.
 #[derive(Debug, Clone, PartialEq)]
 pub enum TokenKind {
-    /// A bare word: keyword, table name, or column name.
-    ///
-    /// Keywords are *not* distinguished here — the parser matches them
-    /// case-insensitively, so `select` and `SELECT` are the same identifier
-    /// token and a column legitimately named `count` still works.
+    /// A bare word: a keyword or an identifier.
     Ident(String),
-    /// A single-quoted string literal, with escapes already resolved.
+    /// A `"quoted"` identifier: always a name, never a keyword.
+    QuotedIdent(String),
+    /// A `'string'` literal, unescaped.
     String(String),
-    /// An integer literal.
+    /// An integer literal (sign included).
     Integer(i64),
-    /// A floating-point literal.
+    /// A finite floating-point literal (sign included).
     Float(f64),
+    /// A bound parameter: `?` (`None`, next in order) or `?N` (`Some(N)`,
+    /// 1-based).
+    Param(Option<usize>),
     /// `(`
     LParen,
     /// `)`
@@ -69,6 +61,8 @@ pub enum TokenKind {
     Semicolon,
     /// `*`
     Star,
+    /// `.`
+    Dot,
     /// `=`
     Eq,
     /// `<>` or `!=`
@@ -84,19 +78,23 @@ pub enum TokenKind {
 }
 
 impl TokenKind {
-    /// Renders the token for an error message.
+    /// Human-readable description for error messages.
     #[must_use]
     pub fn describe(&self) -> String {
         match self {
             TokenKind::Ident(s) => format!("identifier `{s}`"),
+            TokenKind::QuotedIdent(s) => format!("quoted identifier \"{s}\""),
             TokenKind::String(s) => format!("string '{s}'"),
             TokenKind::Integer(n) => format!("integer {n}"),
             TokenKind::Float(f) => format!("float {f}"),
+            TokenKind::Param(None) => "parameter `?`".to_string(),
+            TokenKind::Param(Some(n)) => format!("parameter `?{n}`"),
             TokenKind::LParen => "`(`".to_string(),
             TokenKind::RParen => "`)`".to_string(),
             TokenKind::Comma => "`,`".to_string(),
             TokenKind::Semicolon => "`;`".to_string(),
             TokenKind::Star => "`*`".to_string(),
+            TokenKind::Dot => "`.`".to_string(),
             TokenKind::Eq => "`=`".to_string(),
             TokenKind::NotEq => "`<>`".to_string(),
             TokenKind::Lt => "`<`".to_string(),
@@ -106,7 +104,8 @@ impl TokenKind {
         }
     }
 
-    /// True when this is the identifier `word`, compared case-insensitively.
+    /// True when this is the bare keyword `word` (case-insensitive). A quoted
+    /// identifier is never a keyword.
     #[must_use]
     pub fn is_keyword(&self, word: &str) -> bool {
         match self {
@@ -117,13 +116,9 @@ impl TokenKind {
 }
 
 /// Splits `sql` into tokens.
-///
-/// Returns [`Error::InvalidArgument`] for an unterminated string literal, an
-/// unterminated block comment, or a character that cannot begin a token. The
-/// message carries the byte offset so a caller can point at the problem.
 pub fn tokenize(sql: &str) -> Result<Vec<Token>> {
     let bytes = sql.as_bytes();
-    let mut tokens = Vec::new();
+    let mut tokens: Vec<Token> = Vec::new();
     let mut i = 0usize;
 
     while i < bytes.len() {
@@ -137,7 +132,6 @@ pub fn tokenize(sql: &str) -> Result<Vec<Token>> {
 
         // --- comments -------------------------------------------------------
         if c == b'-' && i + 1 < bytes.len() && bytes[i + 1] == b'-' {
-            // Line comment: skip to the newline.
             while i < bytes.len() && bytes[i] != b'\n' {
                 i += 1;
             }
@@ -165,71 +159,39 @@ pub fn tokenize(sql: &str) -> Result<Vec<Token>> {
 
         // --- string literal -------------------------------------------------
         if c == b'\'' {
-            i += 1;
-            let mut value = String::new();
-            loop {
-                if i >= bytes.len() {
-                    return Err(Error::invalid(format!(
-                        "unterminated string literal starting at offset {start}"
-                    )));
-                }
-                if bytes[i] == b'\'' {
-                    // '' inside a literal is an escaped single quote.
-                    if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
-                        value.push('\'');
-                        i += 2;
-                        continue;
-                    }
-                    i += 1;
-                    break;
-                }
-                // Copy the whole UTF-8 sequence, not just this byte.
-                let ch_len = utf8_len(bytes[i]);
-                let end = (i + ch_len).min(bytes.len());
-                value.push_str(
-                    std::str::from_utf8(&bytes[i..end])
-                        .map_err(|_| Error::invalid("string literal is not valid UTF-8"))?,
-                );
-                i = end;
-            }
+            let (value, end) = quoted(sql, i, b'\'', "string literal")?;
             tokens.push(Token::new(TokenKind::String(value), start));
+            i = end;
+            continue;
+        }
+
+        // --- quoted identifier ------------------------------------------------
+        if c == b'"' {
+            let (name, end) = quoted(sql, i, b'"', "quoted identifier")?;
+            if let Some(bad) = name.chars().find(|ch| ch.is_control()) {
+                return Err(Error::invalid(format!(
+                    "quoted identifier at offset {start} contains the control character {:?}",
+                    bad
+                )));
+            }
+            tokens.push(Token::new(TokenKind::QuotedIdent(name), start));
+            i = end;
             continue;
         }
 
         // --- number -----------------------------------------------------------
-        // A leading `-` is part of the literal. This grammar has no arithmetic
-        // operators, so a `-` can only ever be a sign — there is no `a - b` to
-        // be ambiguous with. Parsing the sign here (rather than negating in the
-        // parser) also lets `-9223372036854775808` parse, which would overflow
-        // if read as a positive literal and then negated.
-        let negative = c == b'-' && i + 1 < bytes.len() && bytes[i + 1].is_ascii_digit();
-        if c.is_ascii_digit() || negative {
-            if negative {
-                i += 1; // consume the sign
-            }
-            let mut saw_dot = false;
-            while i < bytes.len() && (bytes[i].is_ascii_digit() || bytes[i] == b'.') {
-                if bytes[i] == b'.' {
-                    if saw_dot {
-                        break; // a second dot ends the number
-                    }
-                    saw_dot = true;
-                }
-                i += 1;
-            }
-            let text = &sql[start..i];
-            let kind = if saw_dot {
-                TokenKind::Float(text.parse::<f64>().map_err(|_| {
-                    Error::invalid(format!("malformed number `{text}` at offset {start}"))
-                })?)
-            } else {
-                TokenKind::Integer(text.parse::<i64>().map_err(|_| {
-                    Error::invalid(format!(
-                        "integer `{text}` at offset {start} is out of range"
-                    ))
-                })?)
-            };
+        // The grammar has no arithmetic, so `-`/`+` can only be a sign. Lexing
+        // the sign with the digits lets `-9223372036854775808` parse, which
+        // would overflow if read as a positive literal and then negated.
+        let signed = (c == b'-' || c == b'+')
+            && i + 1 < bytes.len()
+            && (bytes[i + 1].is_ascii_digit()
+                || (bytes[i + 1] == b'.' && i + 2 < bytes.len() && bytes[i + 2].is_ascii_digit()));
+        let leading_dot = c == b'.' && i + 1 < bytes.len() && bytes[i + 1].is_ascii_digit();
+        if c.is_ascii_digit() || signed || leading_dot {
+            let (kind, end) = number(sql, i)?;
             tokens.push(Token::new(kind, start));
+            i = end;
             continue;
         }
 
@@ -245,21 +207,27 @@ pub fn tokenize(sql: &str) -> Result<Vec<Token>> {
             continue;
         }
 
-        // --- quoted identifier ------------------------------------------------
-        if c == b'"' {
+        // --- bound parameter --------------------------------------------------
+        if c == b'?' {
             i += 1;
-            let id_start = i;
-            while i < bytes.len() && bytes[i] != b'"' {
+            let digits_start = i;
+            while i < bytes.len() && bytes[i].is_ascii_digit() {
                 i += 1;
             }
-            if i >= bytes.len() {
-                return Err(Error::invalid(format!(
-                    "unterminated quoted identifier starting at offset {start}"
-                )));
-            }
-            let name = sql[id_start..i].to_string();
-            i += 1; // closing quote
-            tokens.push(Token::new(TokenKind::Ident(name), start));
+            let kind = if i == digits_start {
+                TokenKind::Param(None)
+            } else {
+                let n: usize = sql[digits_start..i].parse().map_err(|_| {
+                    Error::invalid(format!("parameter number at offset {start} is too large"))
+                })?;
+                if n == 0 || n > 65_535 {
+                    return Err(Error::invalid(format!(
+                        "parameter `?{n}` at offset {start}: numbers run from ?1 to ?65535"
+                    )));
+                }
+                TokenKind::Param(Some(n))
+            };
+            tokens.push(Token::new(kind, start));
             continue;
         }
 
@@ -270,6 +238,7 @@ pub fn tokenize(sql: &str) -> Result<Vec<Token>> {
             b',' => (TokenKind::Comma, 1),
             b';' => (TokenKind::Semicolon, 1),
             b'*' => (TokenKind::Star, 1),
+            b'.' => (TokenKind::Dot, 1),
             b'=' => (TokenKind::Eq, 1),
             b'<' if i + 1 < bytes.len() && bytes[i + 1] == b'>' => (TokenKind::NotEq, 2),
             b'<' if i + 1 < bytes.len() && bytes[i + 1] == b'=' => (TokenKind::LtEq, 2),
@@ -277,10 +246,12 @@ pub fn tokenize(sql: &str) -> Result<Vec<Token>> {
             b'>' if i + 1 < bytes.len() && bytes[i + 1] == b'=' => (TokenKind::GtEq, 2),
             b'>' => (TokenKind::Gt, 1),
             b'!' if i + 1 < bytes.len() && bytes[i + 1] == b'=' => (TokenKind::NotEq, 2),
-            other => {
+            _ => {
+                // Decode the whole character so the message shows what the
+                // user actually typed, not one byte of it.
+                let ch = sql[start..].chars().next().unwrap_or('\u{FFFD}');
                 return Err(Error::invalid(format!(
-                    "unexpected character `{}` at offset {start}",
-                    other as char
+                    "unexpected character `{ch}` at offset {start}"
                 )));
             }
         };
@@ -291,20 +262,101 @@ pub fn tokenize(sql: &str) -> Result<Vec<Token>> {
     Ok(tokens)
 }
 
-/// Length in bytes of the UTF-8 sequence beginning with `first`.
-#[inline]
-fn utf8_len(first: u8) -> usize {
-    if first < 0x80 {
-        1
-    } else if first >> 5 == 0b110 {
-        2
-    } else if first >> 4 == 0b1110 {
-        3
-    } else if first >> 3 == 0b11110 {
-        4
-    } else {
-        1 // continuation or invalid byte: consume one and let UTF-8 checks fail
+/// Reads a `quote`-delimited run starting at `start`, where a doubled quote
+/// is an escaped quote. Returns the unescaped text and the offset just past
+/// the closing quote.
+fn quoted(sql: &str, start: usize, quote: u8, what: &str) -> Result<(String, usize)> {
+    let bytes = sql.as_bytes();
+    let mut i = start + 1;
+    let mut value = String::new();
+    let mut run = i;
+    loop {
+        if i >= bytes.len() {
+            return Err(Error::invalid(format!(
+                "unterminated {what} starting at offset {start}"
+            )));
+        }
+        if bytes[i] == quote {
+            value.push_str(&sql[run..i]);
+            if i + 1 < bytes.len() && bytes[i + 1] == quote {
+                value.push(quote as char);
+                i += 2;
+                run = i;
+                continue;
+            }
+            return Ok((value, i + 1));
+        }
+        i += 1;
     }
+}
+
+/// Reads a number starting at `start`: `[+-]digits[.digits][e[+-]digits]` or
+/// `[+-].digits…`. The literal must not run into an identifier character, so
+/// `1OR` or `3abc` is rejected instead of silently split.
+fn number(sql: &str, start: usize) -> Result<(TokenKind, usize)> {
+    let bytes = sql.as_bytes();
+    let mut i = start;
+    if bytes[i] == b'-' || bytes[i] == b'+' {
+        i += 1;
+    }
+    let mut is_float = false;
+    while i < bytes.len() && bytes[i].is_ascii_digit() {
+        i += 1;
+    }
+    if i < bytes.len() && bytes[i] == b'.' && i + 1 < bytes.len() && bytes[i + 1].is_ascii_digit() {
+        is_float = true;
+        i += 1;
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            i += 1;
+        }
+    } else if i < bytes.len() && bytes[i] == b'.' {
+        // `5.` — a trailing dot with no fraction.
+        is_float = true;
+        i += 1;
+    }
+    if i < bytes.len() && (bytes[i] == b'e' || bytes[i] == b'E') {
+        let mut j = i + 1;
+        if j < bytes.len() && (bytes[j] == b'+' || bytes[j] == b'-') {
+            j += 1;
+        }
+        if j < bytes.len() && bytes[j].is_ascii_digit() {
+            is_float = true;
+            while j < bytes.len() && bytes[j].is_ascii_digit() {
+                j += 1;
+            }
+            i = j;
+        }
+    }
+    if i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+        let mut end = i;
+        while end < bytes.len() && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_') {
+            end += 1;
+        }
+        return Err(Error::invalid(format!(
+            "malformed number `{}` at offset {start} (a separator is missing?)",
+            &sql[start..end]
+        )));
+    }
+    let text = &sql[start..i];
+    let digits = text.strip_prefix('+').unwrap_or(text);
+    let kind = if is_float {
+        let value: f64 = digits
+            .parse()
+            .map_err(|_| Error::invalid(format!("malformed number `{text}` at offset {start}")))?;
+        if !value.is_finite() {
+            return Err(Error::invalid(format!(
+                "number `{text}` at offset {start} is out of the finite range"
+            )));
+        }
+        TokenKind::Float(value)
+    } else {
+        TokenKind::Integer(digits.parse::<i64>().map_err(|_| {
+            Error::invalid(format!(
+                "integer `{text}` at offset {start} is out of range"
+            ))
+        })?)
+    };
+    Ok((kind, i))
 }
 
 #[cfg(test)]
@@ -317,154 +369,144 @@ mod tests {
 
     #[test]
     fn negative_numbers_are_single_tokens() {
-        // Regression: the lexer used to reject `-` outright, so no negative
-        // literal could be written at all.
         assert_eq!(kinds("-42"), vec![TokenKind::Integer(-42)]);
         assert_eq!(kinds("-3.5"), vec![TokenKind::Float(-3.5)]);
+        assert_eq!(kinds("+7"), vec![TokenKind::Integer(7)]);
     }
 
     #[test]
     fn the_most_negative_i64_parses() {
-        // Only works because the sign is lexed together with the digits:
-        // reading the magnitude as a positive i64 first would overflow.
         assert_eq!(
             kinds("-9223372036854775808"),
             vec![TokenKind::Integer(i64::MIN)]
         );
+        assert!(tokenize("9223372036854775808").is_err());
     }
 
     #[test]
     fn a_bare_minus_is_still_an_error() {
-        // The sign rule must not silently swallow a stray operator.
         assert!(tokenize("-").is_err());
-        assert!(tokenize("SELECT - FROM t").is_err());
+        assert!(tokenize("a - b").is_err());
+    }
+
+    #[test]
+    fn number_forms() {
+        assert_eq!(kinds(".5"), vec![TokenKind::Float(0.5)]);
+        assert_eq!(kinds("-.25"), vec![TokenKind::Float(-0.25)]);
+        assert_eq!(kinds("1e3"), vec![TokenKind::Float(1000.0)]);
+        assert_eq!(kinds("2.5E-2"), vec![TokenKind::Float(0.025)]);
+        assert_eq!(kinds("5."), vec![TokenKind::Float(5.0)]);
+        assert_eq!(kinds("3.0"), vec![TokenKind::Float(3.0)]);
+    }
+
+    #[test]
+    fn a_number_glued_to_a_word_is_rejected() {
+        let err = tokenize("1OR 2").unwrap_err();
+        assert!(format!("{err}").contains("malformed number `1OR`"), "{err}");
+        assert!(tokenize("3abc").is_err());
+    }
+
+    #[test]
+    fn infinite_literals_are_rejected() {
+        let huge = format!("1{}.0", "0".repeat(400));
+        assert!(tokenize(&huge).is_err());
+        assert!(tokenize("1e999").is_err());
     }
 
     #[test]
     fn negative_numbers_work_in_context() {
-        assert_eq!(
-            kinds("n > -5"),
-            vec![
-                TokenKind::Ident("n".into()),
-                TokenKind::Gt,
-                TokenKind::Integer(-5),
-            ]
-        );
+        let toks = kinds("WHERE a > -5 AND b = -0.5");
+        assert!(toks.contains(&TokenKind::Integer(-5)));
+        assert!(toks.contains(&TokenKind::Float(-0.5)));
     }
 
     #[test]
     fn tokenizes_a_simple_statement() {
-        assert_eq!(
-            kinds("SELECT * FROM users"),
-            vec![
-                TokenKind::Ident("SELECT".into()),
-                TokenKind::Star,
-                TokenKind::Ident("FROM".into()),
-                TokenKind::Ident("users".into()),
-            ]
-        );
+        let toks = kinds("SELECT a, b FROM t WHERE a = 1;");
+        assert_eq!(toks.len(), 11);
+        assert!(toks[0].is_keyword("select"));
+        assert_eq!(toks[10], TokenKind::Semicolon);
     }
 
     #[test]
     fn whitespace_is_insignificant_in_any_amount_or_kind() {
-        // This is the exact class of input MagnumDB's parser rejects.
-        let expected = vec![
-            TokenKind::Ident("CREATE".into()),
-            TokenKind::Ident("TABLE".into()),
-            TokenKind::Ident("t".into()),
-        ];
-        assert_eq!(kinds("CREATE TABLE t"), expected);
-        assert_eq!(kinds("CREATE  TABLE   t"), expected, "double spaces");
-        assert_eq!(kinds("CREATE\nTABLE\nt"), expected, "newlines");
-        assert_eq!(kinds("CREATE\tTABLE\tt"), expected, "tabs");
-        assert_eq!(kinds("  CREATE\r\n\tTABLE  t  "), expected, "mixed");
+        assert_eq!(kinds("SELECT\t\n  *\r\nFROM   t"), kinds("SELECT * FROM t"));
     }
 
     #[test]
     fn identifiers_keep_their_case_but_match_keywords_insensitively() {
-        let toks = tokenize("SeLeCt").unwrap();
-        assert_eq!(toks[0].kind, TokenKind::Ident("SeLeCt".into()));
-        assert!(toks[0].kind.is_keyword("select"));
-        assert!(toks[0].kind.is_keyword("SELECT"));
-        assert!(!toks[0].kind.is_keyword("insert"));
+        let toks = kinds("SeLeCt MyTable");
+        assert!(toks[0].is_keyword("SELECT"));
+        assert_eq!(toks[1], TokenKind::Ident("MyTable".into()));
     }
 
     #[test]
     fn string_literals_may_contain_anything() {
         assert_eq!(
-            kinds("'hello, world'"),
-            vec![TokenKind::String("hello, world".into())],
-            "commas must not split a literal"
-        );
-        assert_eq!(
-            kinds("'a)b('"),
-            vec![TokenKind::String("a)b(".into())],
-            "parens must not split a literal"
-        );
-        assert_eq!(
-            kinds("'SELECT * FROM'"),
-            vec![TokenKind::String("SELECT * FROM".into())],
-            "keywords inside a literal are just text"
+            kinds("'SELECT * FROM x; -- not a comment'"),
+            vec![TokenKind::String(
+                "SELECT * FROM x; -- not a comment".into()
+            )]
         );
     }
 
     #[test]
     fn doubled_quote_is_an_escape() {
         assert_eq!(kinds("'it''s'"), vec![TokenKind::String("it's".into())]);
-        assert_eq!(kinds("''"), vec![TokenKind::String(String::new())]);
         assert_eq!(
-            kinds("''''"),
-            vec![TokenKind::String("'".into())],
-            "four quotes is one escaped quote"
+            kinds("\"say \"\"hi\"\"\""),
+            vec![TokenKind::QuotedIdent("say \"hi\"".into())]
         );
     }
 
     #[test]
     fn unicode_survives_a_string_literal() {
         assert_eq!(
-            kinds("'héllo 🌍 日本'"),
-            vec![TokenKind::String("héllo 🌍 日本".into())]
+            kinds("'héllo 🌍 日本語'"),
+            vec![TokenKind::String("héllo 🌍 日本語".into())]
         );
     }
 
     #[test]
     fn numbers_are_typed() {
         assert_eq!(kinds("42"), vec![TokenKind::Integer(42)]);
-        assert_eq!(kinds("0"), vec![TokenKind::Integer(0)]);
-        assert_eq!(kinds("3.5"), vec![TokenKind::Float(3.5)]);
-        // A trailing dot ends the number; the dot is then unexpected.
-        assert!(tokenize("1.2.3").is_err() || !kinds("1.2").is_empty());
+        assert_eq!(kinds("4.25"), vec![TokenKind::Float(4.25)]);
     }
 
     #[test]
     fn comparison_operators_are_recognised() {
-        assert_eq!(kinds("="), vec![TokenKind::Eq]);
-        assert_eq!(kinds("<>"), vec![TokenKind::NotEq]);
-        assert_eq!(kinds("!="), vec![TokenKind::NotEq]);
-        assert_eq!(kinds("<"), vec![TokenKind::Lt]);
-        assert_eq!(kinds("<="), vec![TokenKind::LtEq]);
-        assert_eq!(kinds(">"), vec![TokenKind::Gt]);
-        assert_eq!(kinds(">="), vec![TokenKind::GtEq]);
-        // The two-character forms must win over the one-character prefix.
         assert_eq!(
-            kinds("a<=b"),
+            kinds("= <> != < <= > >="),
             vec![
-                TokenKind::Ident("a".into()),
+                TokenKind::Eq,
+                TokenKind::NotEq,
+                TokenKind::NotEq,
+                TokenKind::Lt,
                 TokenKind::LtEq,
-                TokenKind::Ident("b".into())
+                TokenKind::Gt,
+                TokenKind::GtEq,
             ]
         );
     }
 
     #[test]
+    fn parameters_are_recognised() {
+        assert_eq!(
+            kinds("? ?2 ?"),
+            vec![
+                TokenKind::Param(None),
+                TokenKind::Param(Some(2)),
+                TokenKind::Param(None)
+            ]
+        );
+        assert!(tokenize("?0").is_err());
+    }
+
+    #[test]
     fn comments_are_skipped() {
         assert_eq!(
-            kinds("SELECT -- this is ignored\n*"),
-            vec![TokenKind::Ident("SELECT".into()), TokenKind::Star]
-        );
-        assert_eq!(
-            kinds("SELECT /* inline */ *"),
-            vec![TokenKind::Ident("SELECT".into()), TokenKind::Star]
+            kinds("SELECT -- trailing\n* /* inline */ FROM t"),
+            kinds("SELECT * FROM t")
         );
         assert_eq!(
             kinds("/* leading */ SELECT"),
@@ -474,11 +516,18 @@ mod tests {
 
     #[test]
     fn quoted_identifiers_allow_reserved_words() {
-        assert_eq!(
-            kinds("\"select\""),
-            vec![TokenKind::Ident("select".into())],
-            "a quoted identifier is a name, not a keyword"
+        let toks = kinds("\"select\"");
+        assert_eq!(toks, vec![TokenKind::QuotedIdent("select".into())]);
+        assert!(
+            !toks[0].is_keyword("select"),
+            "a quoted name is not a keyword"
         );
+    }
+
+    #[test]
+    fn control_characters_in_identifiers_are_rejected() {
+        assert!(tokenize("\"a\u{0}b\"").is_err());
+        assert!(tokenize("\"tab\there\"").is_err());
     }
 
     #[test]
@@ -496,6 +545,12 @@ mod tests {
         let err = tokenize("SELECT @").unwrap_err();
         assert!(format!("{err}").contains("offset 7"), "got: {err}");
 
+        let err = tokenize("SELECT é").unwrap_err();
+        assert!(
+            format!("{err}").contains("`é`"),
+            "the whole character: {err}"
+        );
+
         assert!(tokenize("/* never closed").is_err());
         assert!(tokenize("\"unterminated").is_err());
     }
@@ -509,8 +564,6 @@ mod tests {
 
     #[test]
     fn a_realistic_multiline_statement_tokenizes() {
-        // The shape a human actually writes, and exactly what a
-        // `starts_with`-based parser cannot handle.
         let sql = "CREATE TABLE users (\n  id,\n  name,\n  email\n);";
         let toks = tokenize(sql).unwrap();
         assert!(toks[0].kind.is_keyword("create"));

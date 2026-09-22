@@ -185,6 +185,31 @@ impl LevelManifest {
         self.next_table_id = self.next_table_id.max(id);
     }
 
+    /// Number of levels that currently exist (at least `config.max_levels`,
+    /// more if an earlier configuration used deeper levels).
+    #[must_use]
+    pub fn level_count(&self) -> u32 {
+        self.levels.len() as u32
+    }
+
+    /// Every live table, level by level.
+    #[must_use]
+    pub fn all_tables(&self) -> Vec<TableMeta> {
+        self.levels.iter().flatten().cloned().collect()
+    }
+
+    /// True when some level below `level` holds a table overlapping
+    /// `[min, max]` — data an output at `level` still shadows, so its
+    /// tombstones must be kept.
+    #[must_use]
+    pub fn has_data_below(&self, level: u32, min: &[u8], max: &[u8]) -> bool {
+        (level + 1..self.levels.len() as u32).any(|l| {
+            self.level(l)
+                .iter()
+                .any(|t| t.min_key.as_slice() <= max && t.max_key.as_slice() >= min)
+        })
+    }
+
     /// Tables at `level`, or an empty slice when the level does not exist.
     #[must_use]
     pub fn level(&self, level: u32) -> &[TableMeta] {
@@ -401,11 +426,11 @@ pub fn merge_runs(
         }
 
         // Duplicate (key, seqno) from an older run: the first one already won.
-        if let Some(last) = out.last() {
-            if last.0 == ik {
-                stats.versions_dropped += 1;
-                continue;
-            }
+        if let Some(last) = out.last()
+            && last.0 == ik
+        {
+            stats.versions_dropped += 1;
+            continue;
         }
 
         if ik.seqno <= retain_floor {

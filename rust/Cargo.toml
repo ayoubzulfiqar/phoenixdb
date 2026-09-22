@@ -1,11 +1,11 @@
 [package]
 name = "phoenixdb"
-version = "2.1.0"
+version = "4.0.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.89"
 authors = ["PhoenixDB Authors"]
 license = "BSD-3-Clause"
-description = "ACID-compliant embedded key/value engine (hybrid LSM + B+Tree, MVCC, WAL) with HNSW vector search and a C ABI"
+description = "ACID-compliant embedded key/value engine (B+Tree, MVCC, WAL) with SQL, HNSW vector search and a C ABI"
 repository = "https://github.com/phoenixdb/phoenixdb"
 readme = "README.md"
 publish = false
@@ -24,9 +24,10 @@ default = []
 # the crate still cross-compiles to every mobile target without a C toolchain.
 encryption = ["dep:aes-gcm"]
 
-# Structured-value indexing and the JSON path extractor used by secondary
-# indexes.
-json = ["dep:serde_json"]
+# Kept for compatibility: JSON support (SQL bound parameters, document
+# metadata) is now always compiled in, because `serde_json` is pure Rust and
+# cross-compiles to every target this package ships to.
+json = []
 
 # Minimal SQL front end (lexer, parser, AST). Hand-written: the `sqlparser`
 # crate depends on `stacker`, which needs a C compiler and therefore breaks
@@ -74,7 +75,7 @@ aes-gcm = { version = "0.10", optional = true, default-features = false, feature
     "aes",
     "alloc",
 ] }
-serde_json = { version = "1", optional = true }
+serde_json = "1"
 prometheus = { version = "0.13", optional = true, default-features = false }
 tokio = { version = "1", optional = true, default-features = false, features = [
     "rt",

@@ -279,15 +279,15 @@ const LANES: usize = 8;
 #[inline]
 fn dot_portable(a: &[f32], b: &[f32]) -> f32 {
     let mut acc = [0f32; LANES];
-    let mut a_chunks = a.chunks_exact(LANES);
-    let mut b_chunks = b.chunks_exact(LANES);
-    for (x, y) in a_chunks.by_ref().zip(b_chunks.by_ref()) {
-        for ((slot, &xv), &yv) in acc.iter_mut().zip(x.iter()).zip(y.iter()) {
+    let (a_chunks, a_rest) = a.as_chunks::<LANES>();
+    let (b_chunks, b_rest) = b.as_chunks::<LANES>();
+    for (x, y) in a_chunks.iter().zip(b_chunks) {
+        for ((slot, &xv), &yv) in acc.iter_mut().zip(x).zip(y) {
             *slot = xv.mul_add(yv, *slot);
         }
     }
     let mut total: f32 = acc.iter().sum();
-    for (&x, &y) in a_chunks.remainder().iter().zip(b_chunks.remainder()) {
+    for (&x, &y) in a_rest.iter().zip(b_rest) {
         total = x.mul_add(y, total);
     }
     total
@@ -296,16 +296,16 @@ fn dot_portable(a: &[f32], b: &[f32]) -> f32 {
 #[inline]
 fn squared_l2_portable(a: &[f32], b: &[f32]) -> f32 {
     let mut acc = [0f32; LANES];
-    let mut a_chunks = a.chunks_exact(LANES);
-    let mut b_chunks = b.chunks_exact(LANES);
-    for (x, y) in a_chunks.by_ref().zip(b_chunks.by_ref()) {
-        for ((slot, &xv), &yv) in acc.iter_mut().zip(x.iter()).zip(y.iter()) {
+    let (a_chunks, a_rest) = a.as_chunks::<LANES>();
+    let (b_chunks, b_rest) = b.as_chunks::<LANES>();
+    for (x, y) in a_chunks.iter().zip(b_chunks) {
+        for ((slot, &xv), &yv) in acc.iter_mut().zip(x).zip(y) {
             let d = xv - yv;
             *slot = d.mul_add(d, *slot);
         }
     }
     let mut total: f32 = acc.iter().sum();
-    for (&x, &y) in a_chunks.remainder().iter().zip(b_chunks.remainder()) {
+    for (&x, &y) in a_rest.iter().zip(b_rest) {
         let d = x - y;
         total = d.mul_add(d, total);
     }

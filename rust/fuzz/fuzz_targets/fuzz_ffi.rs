@@ -8,6 +8,7 @@
 
 use arbitrary::Arbitrary;
 use libfuzzer_sys::fuzz_target;
+use phoenixdb::PhoenixStatus;
 use phoenixdb::ffi::*;
 use std::ffi::CString;
 use std::ptr;
@@ -43,6 +44,23 @@ enum Call {
     },
 }
 
+/// A status is acceptable when it is success or a *handled* failure. A caught
+/// panic (-7) means the engine hit a bug, and corruption (-4) cannot come from
+/// valid API calls on a healthy file: both must fail the fuzz run.
+fn check(status: i32) {
+    assert!(status <= 0, "status must be 0 or negative, got {status}");
+    assert_ne!(
+        status,
+        PhoenixStatus::Panic as i32,
+        "a panic crossed the FFI guard"
+    );
+    assert_ne!(
+        status,
+        PhoenixStatus::Corruption as i32,
+        "valid calls reported corruption"
+    );
+}
+
 fuzz_target!(|calls: Vec<Call>| {
     if calls.len() > 128 {
         return;
@@ -75,7 +93,11 @@ fuzz_target!(|calls: Vec<Call>| {
                 let key_ptr = if null_key { ptr::null() } else { key.as_ptr() };
                 // Deliberately claim a length far larger than the allocation:
                 // validation must reject it before any read occurs.
-                let key_len = if lie_about_len { usize::MAX / 2 } else { key.len() };
+                let key_len = if lie_about_len {
+                    usize::MAX / 2
+                } else {
+                    key.len()
+                };
                 let status = unsafe {
                     phoenix_insert(
                         handle,
@@ -86,7 +108,7 @@ fuzz_target!(|calls: Vec<Call>| {
                         value.len(),
                     )
                 };
-                assert!(status <= 0, "status must be 0 or negative, got {status}");
+                check(status);
             }
             Call::Get { key, null_out } => {
                 let mut buf = PhoenixBuffer {
@@ -95,9 +117,8 @@ fuzz_target!(|calls: Vec<Call>| {
                     cap: 0,
                 };
                 let out = if null_out { ptr::null_mut() } else { &mut buf };
-                let status =
-                    unsafe { phoenix_get(handle, last_txn, key.as_ptr(), key.len(), out) };
-                assert!(status <= 0);
+                let status = unsafe { phoenix_get(handle, last_txn, key.as_ptr(), key.len(), out) };
+                check(status);
                 if !null_out {
                     unsafe { phoenix_buffer_free(&mut buf) };
                     // Freeing twice must be harmless.
@@ -106,9 +127,8 @@ fuzz_target!(|calls: Vec<Call>| {
             }
             Call::Delete { key, null_key } => {
                 let key_ptr = if null_key { ptr::null() } else { key.as_ptr() };
-                let status =
-                    unsafe { phoenix_delete(handle, last_txn, key_ptr, key.len()) };
-                assert!(status <= 0);
+                let status = unsafe { phoenix_delete(handle, last_txn, key_ptr, key.len()) };
+                check(status);
             }
             Call::Begin => {
                 let mut txn: u64 = 0;
@@ -118,29 +138,36 @@ fuzz_target!(|calls: Vec<Call>| {
             }
             Call::Commit { txn } => {
                 let status = unsafe { phoenix_commit_txn(handle, txn) };
-                assert!(status <= 0);
+                check(status);
                 if txn == last_txn {
                     last_txn = 0;
                 }
             }
             Call::Rollback { txn } => {
                 let status = unsafe { phoenix_rollback_txn(handle, txn) };
-                assert!(status <= 0);
+                check(status);
                 if txn == last_txn {
                     last_txn = 0;
                 }
             }
             Call::Checkpoint => {
-                assert!(unsafe { phoenix_checkpoint(handle) } <= 0);
+                check(unsafe { phoenix_checkpoint(handle) });
             }
             Call::Verify => {
                 let status = unsafe { phoenix_verify(handle) };
-                assert!(status <= 0, "verify reported corruption: {status}");
+                assert_eq!(
+                    status, 0,
+                    "verify must pass on a file only valid calls touched"
+                );
             }
             Call::Count { null_out } => {
                 let mut count: u64 = 0;
-                let out = if null_out { ptr::null_mut() } else { &mut count };
-                assert!(unsafe { phoenix_count(handle, out) } <= 0);
+                let out = if null_out {
+                    ptr::null_mut()
+                } else {
+                    &mut count
+                };
+                check(unsafe { phoenix_count(handle, out) });
             }
         }
         // Drain any recorded error so the thread-local does not grow unbounded.

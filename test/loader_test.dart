@@ -62,10 +62,11 @@ void main() {
       expect(b.abiVersion(), kExpectedAbiVersion);
     });
 
-    test('the expected ABI version is 3', () {
+    test('the expected ABI version is 4', () {
       // Kept in lockstep with tests/ffi_safety.rs. Bumped 2 -> 3 when the
-      // `phoenix_vector_*` k-NN surface was added.
-      expect(kExpectedAbiVersion, 3);
+      // `phoenix_vector_*` k-NN surface was added, 3 -> 4 for open_ex, range
+      // scans, batches, backup, stats, check and tracing.
+      expect(kExpectedAbiVersion, 4);
     });
 
     test('limits are positive and ordered', () {

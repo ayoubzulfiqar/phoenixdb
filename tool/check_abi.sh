@@ -13,12 +13,13 @@
 #   tool/check_abi.sh --shipped     check everything in the package layout
 set -euo pipefail
 
-# Symbols that must be present in an ABI v3 library.
+# Symbols that must be present in an ABI v4 library.
 #
-# One per surface, deliberately: `phoenix_open` is the v1 core,
-# `phoenix_sql_query`/`phoenix_has_sql` are v2, and the vector entries are v3.
-# A library missing any of them is stale for a different reason, and naming all
-# four makes the failure message say which.
+# A few per surface, deliberately: `phoenix_open` is the v1 core,
+# `phoenix_sql_query`/`phoenix_has_sql` are v2, the vector entries are v3, and
+# `phoenix_open_ex`/`phoenix_scan_range`/`phoenix_write_batch` are v4. A
+# library missing any of them is stale for a different reason, and naming them
+# all makes the failure message say which.
 REQUIRED=(
   phoenix_open
   phoenix_sql_query
@@ -27,6 +28,17 @@ REQUIRED=(
   phoenix_vector_search
   phoenix_free_string_array
   phoenix_has_vector
+  phoenix_open_ex
+  phoenix_scan_range
+  phoenix_write_batch
+  phoenix_backup
+  phoenix_vector_insert_batch
+  phoenix_vector_search_ids
+  phoenix_sql_query_params
+  phoenix_collection_open
+  phoenix_collection_upsert
+  phoenix_collection_search
+  phoenix_collection_close
 )
 
 if [[ "${1:-}" == "--shipped" ]]; then
