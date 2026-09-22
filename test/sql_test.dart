@@ -39,7 +39,7 @@ void main() {
 
     test('the ABI version matches what the package expects', () {
       // A stale DLL is the likeliest cause of a confusing crash later.
-      expect(kExpectedAbiVersion, 3);
+      expect(db.abiVersion, kExpectedAbiVersion);
     });
   });
 
