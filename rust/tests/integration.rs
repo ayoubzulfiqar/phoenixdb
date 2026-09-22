@@ -55,7 +55,7 @@ fn acid_durability_after_simulated_crash() {
                 .unwrap();
         }
         // No close/checkpoint: recovery must replay the WAL.
-        std::mem::forget(db);
+        db.simulate_crash();
     }
     let db = Database::open(&path, Options::default()).unwrap();
     assert_eq!(db.len().unwrap(), 64);
