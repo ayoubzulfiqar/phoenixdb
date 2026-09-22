@@ -30,7 +30,7 @@
 //! orphaned file (harmless, reclaimed on next open) rather than a manifest
 //! entry pointing at a partial table.
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::lsm::compaction::{CompactionStats, LevelConfig, LevelManifest, merge_runs};
 use crate::lsm::manifest::{
     COMPACT_AFTER_EDITS, MANIFEST_FILE, Manifest, ManifestEdit, SerializableMeta,
@@ -105,6 +105,14 @@ impl LsmEngine {
     /// 3. Delete orphaned `.sst` files: debris from a crash between writing a
     ///    table and committing its manifest edit.
     pub fn open(dir: impl AsRef<Path>, options: LsmOptions) -> Result<Self> {
+        if options.levels.max_levels < 2 {
+            return Err(Error::invalid("LSM max_levels must be at least 2"));
+        }
+        if options.levels.l0_compaction_trigger == 0 {
+            return Err(Error::invalid(
+                "LSM l0_compaction_trigger must be at least 1",
+            ));
+        }
         let dir = dir.as_ref().to_path_buf();
         std::fs::create_dir_all(&dir)?;
         let manifest_path = dir.join(MANIFEST_FILE);
@@ -125,12 +133,15 @@ impl LsmEngine {
         // id the log still remembers.
         manifest.reserve_table_id(state.next_table_id);
 
-        // Reclaim debris from an interrupted flush or compaction.
+        // Reclaim debris from an interrupted flush or compaction. Safe
+        // because replay reached a clean end (mid-file corruption is an
+        // error above), so every table the log references is known.
         for orphan in Manifest::orphaned_files(&dir, &state.tables)? {
             let _ = std::fs::remove_file(orphan);
         }
 
-        let mut log = Manifest::open(&manifest_path)?;
+        // Cut a torn tail off before anything is appended behind it.
+        let mut log = Manifest::open_truncated(&manifest_path, state.valid_bytes)?;
         // Bound future replay time.
         if state.edits_replayed > COMPACT_AFTER_EDITS {
             log = Manifest::compact(
@@ -207,15 +218,22 @@ impl LsmEngine {
     /// Records `key = value` at `seqno`, rotating the MemTable when full.
     ///
     /// The caller must already have made the corresponding WAL record durable.
-    pub fn put(&mut self, key: Vec<u8>, value: Vec<u8>, seqno: u64) {
+    /// Keys and values are limited to what an SSTable can store; accepting a
+    /// larger one would make every later flush — and open — fail.
+    pub fn put(&mut self, key: Vec<u8>, value: Vec<u8>, seqno: u64) -> Result<()> {
+        check_entry_field(key.len(), "key")?;
+        check_entry_field(value.len(), "value")?;
         self.active.insert(key, value, seqno);
         self.maybe_rotate();
+        Ok(())
     }
 
     /// Records a tombstone for `key` at `seqno`.
-    pub fn delete(&mut self, key: Vec<u8>, seqno: u64) {
+    pub fn delete(&mut self, key: Vec<u8>, seqno: u64) -> Result<()> {
+        check_entry_field(key.len(), "key")?;
         self.active.delete(key, seqno);
         self.maybe_rotate();
+        Ok(())
     }
 
     /// Freezes the active MemTable when it exceeds its budget.
@@ -283,24 +301,39 @@ impl LsmEngine {
         if self.frozen.is_empty() {
             return Ok(None);
         }
-        let mut mem = self.frozen.remove(0);
+        // The MemTable stays frozen (and readable) until the table is fully
+        // committed: a failed write or a full disk must not lose its data.
+        let mem = &self.frozen[0];
         let highest = mem.max_seqno().unwrap_or(0);
         let id = self.manifest.allocate_table_id();
         let path = self.table_path(id);
 
-        let mut writer = SSTableWriter::create(&path, mem.distinct_key_count())?;
-        for (ik, slot) in mem.drain() {
-            writer.append(&ik, &slot)?;
-        }
-        // finish() fsyncs the table before we publish it anywhere.
-        let meta = writer.finish(id, 0)?;
+        let written = (|| -> Result<(TableMeta, SSTable)> {
+            let mut writer = SSTableWriter::create(&path, mem.distinct_key_count())?;
+            for (ik, slot) in mem.iter() {
+                writer.append(ik, slot)?;
+            }
+            // finish() fsyncs the table before we publish it anywhere.
+            let meta = writer.finish(id, 0)?;
+            // Open (and verify) before committing: a manifest entry must
+            // never point at a table that cannot be read back.
+            let table = SSTable::open(&path, id, 0)?;
+            Ok((meta, table))
+        })();
+        let (meta, table) = match written {
+            Ok(done) => done,
+            Err(e) => {
+                let _ = std::fs::remove_file(&path);
+                return Err(e);
+            }
+        };
 
         // Commit point: after this returns, the table survives a crash.
         self.log.append(&ManifestEdit::AddTable {
             meta: SerializableMeta::from(&meta),
         })?;
 
-        let table = SSTable::open(&path, id, 0)?;
+        self.frozen.remove(0);
         self.open_tables.insert(id, table);
         self.manifest.add_table(meta.clone());
         self.flushes += 1;
@@ -340,7 +373,25 @@ impl LsmEngine {
             }
         }
 
-        let drop_tombstones = job.is_bottom_most(self.manifest.config());
+        // A tombstone may only be dropped at the configured bottom level (it
+        // otherwise still shadows the store beneath the LSM) *and* when no
+        // deeper level — left over from a larger earlier `max_levels` — still
+        // holds an older version of its key.
+        let inputs = job.all_inputs();
+        let min_key = inputs
+            .iter()
+            .map(|t| t.min_key.as_slice())
+            .min()
+            .unwrap_or(&[]);
+        let max_key = inputs
+            .iter()
+            .map(|t| t.max_key.as_slice())
+            .max()
+            .unwrap_or(&[]);
+        let drop_tombstones = job.is_bottom_most(self.manifest.config())
+            && !self
+                .manifest
+                .has_data_below(job.target_level, min_key, max_key);
         let (merged, stats) = merge_runs(runs, retain_floor, drop_tombstones)?;
 
         // Write the merged run as a single new table at the target level.
@@ -358,20 +409,30 @@ impl LsmEngine {
             outputs.push(meta);
         }
 
-        // Commit the whole swap — additions before removals — so a crash
-        // mid-sequence can drop tables but never lose their contents: replaying
-        // an AddTable without its matching RemoveTable leaves the old and new
-        // tables both live, which is redundant but correct.
-        for out in &outputs {
-            self.log.append(&ManifestEdit::AddTable {
+        // Commit the whole swap as ONE edit. Separate AddTable/RemoveTable
+        // edits could be split by a crash, leaving old and new tables live
+        // together — and when the output dropped a tombstone, the stale input
+        // then resurrected the deleted key.
+        let mut swap: Vec<ManifestEdit> = outputs
+            .iter()
+            .map(|out| ManifestEdit::AddTable {
                 meta: SerializableMeta::from(out),
-            })?;
-        }
-        for input in job.all_inputs() {
-            self.log.append(&ManifestEdit::RemoveTable {
-                level: input.level,
-                id: input.id,
-            })?;
+            })
+            .collect();
+        swap.extend(
+            job.all_inputs()
+                .into_iter()
+                .map(|input| ManifestEdit::RemoveTable {
+                    level: input.level,
+                    id: input.id,
+                }),
+        );
+        if let Err(e) = self.log.append(&ManifestEdit::Batch(swap)) {
+            for out in &outputs {
+                self.open_tables.remove(&out.id);
+                let _ = std::fs::remove_file(self.table_path(out.id));
+            }
+            return Err(e);
         }
 
         // Retire the inputs: manifest first, then the files themselves.
@@ -400,9 +461,10 @@ impl LsmEngine {
         if self.log.edits_written() < COMPACT_AFTER_EDITS {
             return Ok(());
         }
-        let live: Vec<TableMeta> = (0..self.options.levels.max_levels)
-            .flat_map(|l| self.manifest.level(l).iter().cloned())
-            .collect();
+        // Every level that exists, not just the configured ones: a store
+        // opened with a smaller max_levels than it was built with still has
+        // tables below, and leaving them out of the snapshot deleted them.
+        let live: Vec<TableMeta> = self.manifest.all_tables();
         self.log = Manifest::compact(
             self.dir.join(MANIFEST_FILE),
             &live,
@@ -438,6 +500,18 @@ impl std::fmt::Debug for LsmEngine {
             .field("stats", &self.stats())
             .finish()
     }
+}
+
+/// Largest key or value an SSTable can store (its reader rejects more).
+const MAX_LSM_FIELD: usize = 64 * 1024 * 1024;
+
+fn check_entry_field(len: usize, what: &str) -> Result<()> {
+    if len > MAX_LSM_FIELD {
+        return Err(Error::invalid(format!(
+            "LSM {what} of {len} bytes exceeds the {MAX_LSM_FIELD}-byte limit"
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -480,7 +554,7 @@ mod tests {
     fn put_and_get_through_the_memtable() {
         let d = tempfile::tempdir().unwrap();
         let mut e = engine(d.path(), LsmOptions::default());
-        e.put(b"k".to_vec(), b"v".to_vec(), 1);
+        e.put(b"k".to_vec(), b"v".to_vec(), 1).unwrap();
         assert_eq!(e.get(b"k", 1).unwrap(), Some(Some(b"v".to_vec())));
         // Unknown key: the LSM has no opinion, so the caller falls through.
         assert_eq!(e.get(b"nope", 1).unwrap(), None);
@@ -495,7 +569,8 @@ mod tests {
                 format!("k{i:04}").into_bytes(),
                 format!("v{i}").into_bytes(),
                 i as u64 + 1,
-            );
+            )
+            .unwrap();
         }
         e.rotate();
         let meta = e.flush_one().unwrap().expect("a table was written");
@@ -528,7 +603,8 @@ mod tests {
                 format!("key{i:04}").into_bytes(),
                 vec![b'x'; 64],
                 i as u64 + 1,
-            );
+            )
+            .unwrap();
         }
         assert!(
             e.needs_flush(),
@@ -543,11 +619,11 @@ mod tests {
         // MemTable. The delete must win, and must stop the search.
         let d = tempfile::tempdir().unwrap();
         let mut e = engine(d.path(), LsmOptions::default());
-        e.put(b"k".to_vec(), b"original".to_vec(), 1);
+        e.put(b"k".to_vec(), b"original".to_vec(), 1).unwrap();
         e.rotate();
         e.flush_one().unwrap();
 
-        e.delete(b"k".to_vec(), 5);
+        e.delete(b"k".to_vec(), 5).unwrap();
         assert_eq!(
             e.get(b"k", 5).unwrap(),
             Some(None),
@@ -561,11 +637,11 @@ mod tests {
     fn newer_flushed_table_shadows_an_older_one() {
         let d = tempfile::tempdir().unwrap();
         let mut e = engine(d.path(), LsmOptions::default());
-        e.put(b"k".to_vec(), b"v1".to_vec(), 1);
+        e.put(b"k".to_vec(), b"v1".to_vec(), 1).unwrap();
         e.rotate();
         e.flush_one().unwrap();
 
-        e.put(b"k".to_vec(), b"v2".to_vec(), 10);
+        e.put(b"k".to_vec(), b"v2".to_vec(), 10).unwrap();
         e.rotate();
         e.flush_one().unwrap();
 
@@ -586,7 +662,8 @@ mod tests {
                 format!("a{i:03}").into_bytes(),
                 format!("v{i}").into_bytes(),
                 i as u64 + 1,
-            );
+            )
+            .unwrap();
         }
         e.rotate();
         e.flush_one().unwrap();
@@ -595,7 +672,8 @@ mod tests {
                 format!("b{i:03}").into_bytes(),
                 format!("w{i}").into_bytes(),
                 i as u64 + 100,
-            );
+            )
+            .unwrap();
         }
         e.rotate();
         e.flush_one().unwrap();
@@ -627,7 +705,7 @@ mod tests {
         let mut e = engine(d.path(), tiny_options());
         // Same key written in three separate flushed tables.
         for (n, seq) in [(b"v1", 1u64), (b"v2", 2), (b"v3", 3)] {
-            e.put(b"hot".to_vec(), n.to_vec(), seq);
+            e.put(b"hot".to_vec(), n.to_vec(), seq).unwrap();
             e.rotate();
             e.flush_one().unwrap();
         }
@@ -645,7 +723,8 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let mut e = engine(d.path(), tiny_options());
         for i in 0..10u32 {
-            e.put(format!("k{i}").into_bytes(), b"v".to_vec(), i as u64 + 1);
+            e.put(format!("k{i}").into_bytes(), b"v".to_vec(), i as u64 + 1)
+                .unwrap();
             e.rotate();
             e.flush_one().unwrap();
         }
@@ -674,7 +753,7 @@ mod tests {
     fn compact_once_is_a_noop_when_every_level_is_in_budget() {
         let d = tempfile::tempdir().unwrap();
         let mut e = engine(d.path(), LsmOptions::default());
-        e.put(b"k".to_vec(), b"v".to_vec(), 1);
+        e.put(b"k".to_vec(), b"v".to_vec(), 1).unwrap();
         e.rotate();
         e.flush_one().unwrap();
         assert!(e.compact_once(10).unwrap().is_none());
@@ -689,7 +768,8 @@ mod tests {
                 format!("k{i:03}").into_bytes(),
                 vec![b'z'; 32],
                 i as u64 + 1,
-            );
+            )
+            .unwrap();
             e.rotate();
             e.flush_one().unwrap();
         }
@@ -713,7 +793,8 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let mut e = engine(d.path(), LsmOptions::default());
         for i in 0..3u32 {
-            e.put(format!("k{i}").into_bytes(), b"v".to_vec(), i as u64 + 1);
+            e.put(format!("k{i}").into_bytes(), b"v".to_vec(), i as u64 + 1)
+                .unwrap();
             e.rotate();
         }
         assert_eq!(e.stats().frozen_count, 3);
@@ -737,10 +818,10 @@ mod tests {
     fn deletes_survive_compaction_above_the_bottom_level() {
         let d = tempfile::tempdir().unwrap();
         let mut e = engine(d.path(), tiny_options());
-        e.put(b"k".to_vec(), b"value".to_vec(), 1);
+        e.put(b"k".to_vec(), b"value".to_vec(), 1).unwrap();
         e.rotate();
         e.flush_one().unwrap();
-        e.delete(b"k".to_vec(), 2);
+        e.delete(b"k".to_vec(), 2).unwrap();
         e.rotate();
         e.flush_one().unwrap();
 
