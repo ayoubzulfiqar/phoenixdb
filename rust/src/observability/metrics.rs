@@ -74,6 +74,21 @@ impl Counter {
     pub fn reset(&self) -> u64 {
         self.value.swap(0, Ordering::Relaxed)
     }
+
+    /// Overwrites the value. Can move the counter backwards; for mirroring a
+    /// monotonic source use [`Counter::raise_to`].
+    #[inline]
+    pub fn set(&self, v: u64) {
+        self.value.store(v, Ordering::Relaxed);
+    }
+
+    /// Raises the value to `v` if it is lower — for mirroring another
+    /// monotonic counter. Two racing mirrors can never store an older value
+    /// over a newer one, so a Prometheus `_total` never appears to reset.
+    #[inline]
+    pub fn raise_to(&self, v: u64) {
+        self.value.fetch_max(v, Ordering::Relaxed);
+    }
 }
 
 /// A value that can go up or down.
@@ -166,7 +181,8 @@ impl Histogram {
         idx.min(HISTOGRAM_BUCKETS - 1)
     }
 
-    /// Inclusive upper bound of bucket `i`, in microseconds.
+    /// Exclusive upper bound of bucket `i`, in microseconds (bucket `i`
+    /// holds samples below this value; the top bucket is unbounded).
     #[must_use]
     pub fn bucket_upper_bound(i: usize) -> u64 {
         if i >= HISTOGRAM_BUCKETS - 1 {
@@ -179,7 +195,13 @@ impl Histogram {
     pub fn record_micros(&self, micros: u64) {
         self.buckets[Self::bucket_for(micros)].fetch_add(1, Ordering::Relaxed);
         self.count.fetch_add(1, Ordering::Relaxed);
-        self.sum_micros.fetch_add(micros, Ordering::Relaxed);
+        // Saturate rather than wrap: one absurd sample (`u64::MAX` through the
+        // public API) must not turn the sum — and the mean — into garbage.
+        let _ = self
+            .sum_micros
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |s| {
+                Some(s.saturating_add(micros))
+            });
         let _ = self
             .min_micros
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |m| {
@@ -239,7 +261,11 @@ impl Histogram {
     /// most one bucket width (2x).
     #[must_use]
     pub fn quantile_micros(&self, q: f64) -> u64 {
-        let total = self.count();
+        // Work from one snapshot of the buckets: reading `count` separately
+        // races concurrent recorders (it can run ahead of the bucket sum),
+        // which made the loop fall through and report the maximum.
+        let buckets = self.buckets();
+        let total: u64 = buckets.iter().sum();
         if total == 0 {
             return 0;
         }
@@ -247,8 +273,8 @@ impl Histogram {
         // Rank of the sample we want, 1-based.
         let target = ((total as f64) * q).ceil().max(1.0) as u64;
         let mut cumulative = 0u64;
-        for i in 0..HISTOGRAM_BUCKETS {
-            cumulative += self.buckets[i].load(Ordering::Relaxed);
+        for (i, &n) in buckets.iter().enumerate() {
+            cumulative += n;
             if cumulative >= target {
                 // Never report above the true maximum.
                 return Self::bucket_upper_bound(i).min(self.max_micros().max(1));
@@ -376,6 +402,18 @@ pub struct EngineMetrics {
     pub writes: Counter,
     /// Read latency.
     pub read_latency: Histogram,
+    /// Latency of staging one write (insert or delete) in a transaction.
+    pub write_latency: Histogram,
+    /// Latency of a full or range scan, end to end.
+    pub scan_latency: Histogram,
+    /// Scans served.
+    pub scans: Counter,
+
+    // ---- checkpoints ----
+    /// Checkpoints completed (merge + atomic flush + WAL reset).
+    pub checkpoints: Counter,
+    /// Wall-clock time per checkpoint.
+    pub checkpoint_latency: Histogram,
 
     // ---- raft ----
     /// Leader commit index minus this node's applied index.
@@ -468,11 +506,20 @@ impl EngineMetrics {
             self.txn_commit_latency.p99_micros(),
         ));
         s.push_str(&format!(
-            "query  reads={} writes={} read_p50={}us read_p99={}us\n",
+            "query  reads={} writes={} scans={} read_p50={}us read_p99={}us write_p99={}us scan_p99={}us\n",
             self.reads.get(),
             self.writes.get(),
+            self.scans.get(),
             self.read_latency.p50_micros(),
             self.read_latency.p99_micros(),
+            self.write_latency.p99_micros(),
+            self.scan_latency.p99_micros(),
+        ));
+        s.push_str(&format!(
+            "ckpt   checkpoints={} p50={}us p99={}us\n",
+            self.checkpoints.get(),
+            self.checkpoint_latency.p50_micros(),
+            self.checkpoint_latency.p99_micros(),
         ));
         s.push_str(&format!(
             "raft   commit_lag={} appended={} elections={}\n",
@@ -561,6 +608,18 @@ impl EngineMetrics {
             "Writes applied",
             self.writes.get(),
         );
+        counter(
+            &mut s,
+            "phoenixdb_scans_total",
+            "Scans served",
+            self.scans.get(),
+        );
+        counter(
+            &mut s,
+            "phoenixdb_checkpoints_total",
+            "Checkpoints completed",
+            self.checkpoints.get(),
+        );
 
         gauge(
             &mut s,
@@ -600,6 +659,17 @@ impl EngineMetrics {
                 &self.txn_commit_latency,
             ),
             ("phoenixdb_read_micros", "Read latency", &self.read_latency),
+            (
+                "phoenixdb_write_micros",
+                "Write staging latency",
+                &self.write_latency,
+            ),
+            ("phoenixdb_scan_micros", "Scan latency", &self.scan_latency),
+            (
+                "phoenixdb_checkpoint_micros",
+                "Checkpoint latency",
+                &self.checkpoint_latency,
+            ),
         ] {
             s.push_str(&format!("# HELP {name} {help}\n# TYPE {name} summary\n"));
             s.push_str(&format!("{name}{{quantile=\"0.5\"}} {}\n", h.p50_micros()));
@@ -870,5 +940,25 @@ mod tests {
         }
         assert_eq!(m.reads.get(), 8000, "counter lost updates under contention");
         assert_eq!(m.read_latency.count(), 8000);
+    }
+
+    #[test]
+    fn an_absurd_sample_saturates_instead_of_wrapping() {
+        let h = Histogram::new();
+        h.record_micros(10);
+        h.record_micros(u64::MAX);
+        h.record_micros(10);
+        assert_eq!(h.sum_micros(), u64::MAX, "saturated, not wrapped to ~19");
+        assert_eq!(h.count(), 3);
+    }
+
+    #[test]
+    fn mirrored_counters_never_move_backwards() {
+        let c = Counter::new();
+        c.raise_to(10);
+        c.raise_to(7); // a stale mirror arriving late
+        assert_eq!(c.get(), 10);
+        c.raise_to(12);
+        assert_eq!(c.get(), 12);
     }
 }
