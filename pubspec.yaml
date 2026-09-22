@@ -6,9 +6,9 @@ name: phoenixdb
 # The CI `pubspec description length` step enforces this on every push.
 description: >-
   ACID-compliant embedded database for Dart and Flutter, written in Rust with
-  dart:ffi. B+Tree storage, MVCC transactions, a write-ahead log, HNSW vector
-  search and optional SQL.
-version: 3.9.6
+  dart:ffi: MVCC key/value storage, SQL, HNSW vector search, hybrid document
+  search and RAG.
+version: 4.0.0
 repository: https://github.com/ayoubzulfiqar/phoenixdb
 issue_tracker: https://github.com/ayoubzulfiqar/phoenixdb/issues
 documentation: https://github.com/ayoubzulfiqar/phoenixdb#readme
