@@ -5,10 +5,13 @@
 //! * Lower-cases with full Unicode case mapping.
 //! * Splits on anything that is not alphanumeric, so it works for every
 //!   space-separated script (Latin, Cyrillic, Greek, Arabic, Devanagari, ...).
-//! * Han, Hiragana, Katakana and Hangul are written without spaces, so runs of
-//!   those characters are indexed as overlapping **bigrams** (and a lone
-//!   character as a unigram) — the standard dictionary-free approach, which
-//!   makes CJK text searchable at all.
+//! * Han, Hiragana and Katakana are written without spaces between words (and
+//!   Hangul, while space-separated, forms compounds the same way), so runs of
+//!   those characters are indexed as overlapping **bigrams plus each
+//!   character on its own** — the standard dictionary-free approach, which
+//!   makes CJK text searchable at all. The unigrams cost extra postings but
+//!   are what lets a one-character query match a longer word: without them,
+//!   searching 猫 would miss 子猫.
 //! * Drops a small set of English stopwords and applies a conservative plural
 //!   stemmer (the Harman "S" stemmer), so `databases` matches `database`
 //!   without the aggressive conflations of Porter-style stemming.
@@ -80,14 +83,13 @@ pub fn tokenize(text: &str) -> Vec<String> {
         }
     };
     let flush_cjk = |cjk: &mut Vec<char>, out: &mut Vec<String>| {
-        match cjk.len() {
-            0 => {}
-            1 => out.push(cjk[0].to_string()),
-            _ => {
-                for pair in cjk.windows(2) {
-                    out.push(pair.iter().collect());
-                }
-            }
+        // Unigrams *and* bigrams: the bigrams carry word-ish meaning, the
+        // unigrams keep a single-character query answerable.
+        for c in cjk.iter() {
+            out.push(c.to_string());
+        }
+        for pair in cjk.windows(2) {
+            out.push(pair.iter().collect());
         }
         cjk.clear();
     };
@@ -122,10 +124,14 @@ pub fn term_frequencies(text: &str) -> (HashMap<String, u32>, u32) {
 }
 
 /// Inverse document frequency (the BM25+ smoothed form, never negative).
+///
+/// `doc_freq` is clamped to `docs`: a posting list longer than the document
+/// count means the counters drifted, and an unclamped ratio would go negative
+/// and start *rewarding* common terms.
 #[must_use]
 pub fn idf(docs: u64, doc_freq: u64) -> f32 {
     let n = docs as f32;
-    let df = doc_freq as f32;
+    let df = doc_freq.min(docs) as f32;
     (1.0 + (n - df + 0.5) / (df + 0.5)).ln()
 }
 
@@ -163,13 +169,33 @@ mod tests {
     }
 
     #[test]
-    fn cjk_is_indexed_as_bigrams() {
-        assert_eq!(tokenize("東京都"), ["東京", "京都"]);
+    fn cjk_is_indexed_as_unigrams_and_bigrams() {
+        assert_eq!(tokenize("東京都"), ["東", "京", "都", "東京", "京都"]);
         assert_eq!(tokenize("猫"), ["猫"]);
         assert_eq!(
             tokenize("rust 数据库 fast"),
-            ["rust", "数据", "据库", "fast"]
+            ["rust", "数", "据", "库", "数据", "据库", "fast"]
         );
+    }
+
+    #[test]
+    fn a_single_character_query_matches_a_longer_word() {
+        // The reason unigrams are indexed at all: 子猫 must be findable by 猫.
+        let document = tokenize("子猫がいる");
+        for query in ["猫", "子猫", "子"] {
+            assert!(
+                tokenize(query).iter().any(|t| document.contains(t)),
+                "{query} should match"
+            );
+        }
+    }
+
+    #[test]
+    fn idf_never_rewards_a_common_term() {
+        // Drifted counters must not invert the ranking.
+        assert!(idf(10, 50) >= 0.0);
+        assert!(idf(0, 0) >= 0.0);
+        assert!(idf(1000, 2) > idf(1000, 999));
     }
 
     #[test]
