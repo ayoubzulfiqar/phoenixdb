@@ -106,8 +106,13 @@ class TextChunker {
       if (i >= start && i + sep.length > floor) return i + sep.length;
     }
     var e = limit;
-    // Never cut a surrogate pair in half.
-    if (e - 1 > start && _isHighSurrogate(text.codeUnitAt(e - 1))) e--;
+    // Never cut a surrogate pair in half. When the window is a single code
+    // unit there is nowhere to back off to, so take the whole pair instead —
+    // one chunk of two units beats an unpaired surrogate and a lost
+    // character.
+    if (_isHighSurrogate(text.codeUnitAt(e - 1))) {
+      e = e - 1 > start ? e - 1 : (e + 1).clamp(start, text.length);
+    }
     return e;
   }
 
