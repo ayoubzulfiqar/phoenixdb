@@ -79,7 +79,11 @@ class SemanticCache {
 
   /// The cached response for a prompt similar to [prompt], or `null`.
   Future<String?> lookup(String prompt) async {
-    final vector = await embedder.embedOne(prompt, purpose: EmbedPurpose.query);
+    // `document`, matching [put]: this compares a prompt with stored prompts,
+    // not a query with documents. An asymmetric embedder (Voyage and friends)
+    // gives a text different vectors per purpose, so mixing them here would
+    // put self-similarity below any sensible threshold and never hit.
+    final vector = await embedder.embedOne(prompt);
     final found = await store.query(
       CollectionQuery(
         vector: vector,
@@ -90,16 +94,26 @@ class SemanticCache {
     );
     final best = found.isEmpty ? null : found.first;
     final similarity = best?.vectorScore;
-    if (best == null || similarity == null || similarity < threshold) {
+    // Negated deliberately: a NaN similarity (a zero-norm embedding gives
+    // one) must count as a miss, and `similarity < threshold` would not.
+    if (best == null || similarity == null || !(similarity >= threshold)) {
+      misses++;
+      return null;
+    }
+    final response = best.metadata?['response'];
+    if (response is! String || response.isEmpty) {
       misses++;
       return null;
     }
     hits++;
-    return best.metadata?['response'] as String?;
+    return response;
   }
 
   /// Stores [response] as the answer to [prompt].
+  ///
+  /// An empty response is not stored: it would be served forever as a hit.
   Future<void> put(String prompt, String response) async {
+    if (response.isEmpty) return;
     final vector = await embedder.embedOne(prompt);
     await store.upsert([
       Document(
@@ -190,15 +204,22 @@ class CachedChatModel implements ChatModel {
       return;
     }
     final text = StringBuffer();
-    await for (final delta in inner.stream(
-      messages,
-      system: system,
-      maxTokens: maxTokens,
-    )) {
-      text.write(delta);
-      yield delta;
+    var complete = false;
+    try {
+      await for (final delta in inner.stream(
+        messages,
+        system: system,
+        maxTokens: maxTokens,
+      )) {
+        text.write(delta);
+        yield delta;
+      }
+      complete = true;
+    } finally {
+      // Only a stream that ran to completion is worth replaying: a truncated
+      // or failed one would be served to every similar prompt from now on.
+      if (complete) await cache.put(key, text.toString());
     }
-    await cache.put(key, text.toString());
   }
 
   @override
