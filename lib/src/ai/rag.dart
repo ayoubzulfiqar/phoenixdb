@@ -6,6 +6,7 @@ import 'dart:typed_data';
 
 import '../collection.dart';
 import 'chat.dart';
+import 'http.dart' show LlmException;
 import 'chunker.dart';
 import 'embedder.dart';
 
@@ -60,7 +61,8 @@ class RagAnswer {
   /// The model's answer.
   final String text;
 
-  /// Every source given to the model, in rank order.
+  /// The sources the model was given, in rank order — those that fitted the
+  /// context budget.
   final List<RagSource> sources;
 
   /// The raw model response, when not streamed.
@@ -98,7 +100,10 @@ List<RagSource> citedSources(String text, List<RagSource> sources) {
   final out = <RagSource>[];
   for (final m in _citation.allMatches(text)) {
     for (final part in m.group(1)!.split(',')) {
-      final n = int.parse(part.trim());
+      // `tryParse`, because a model can write a digit run wider than 64 bits
+      // and a citation is never worth throwing from a getter.
+      final n = int.tryParse(part.trim());
+      if (n == null) continue;
       final source = byNumber[n];
       if (source != null && seen.add(n)) out.add(source);
     }
@@ -194,8 +199,20 @@ class RagPipeline {
   /// returns the total chunk count. Re-ingesting a document replaces it:
   /// new chunks are written first, then stale ones removed, so the document
   /// never disappears in between.
+  ///
+  /// A repeated id within one call is applied once, with the last version
+  /// winning. Very large batches are written in slices, so a failure partway
+  /// through can leave a document holding chunks from both versions — retry
+  /// the same call to converge.
   Future<int> ingestAll(Iterable<RagDocument> documents) async {
-    final docs = documents.toList(growable: false);
+    // A repeated id in one batch would otherwise leave a mixture of both
+    // versions: the pruning pass cannot tell which chunks belong to which.
+    // Last one wins, as everywhere else.
+    final byId = <String, RagDocument>{};
+    for (final d in documents) {
+      byId[d.id] = d;
+    }
+    final docs = byId.values.toList(growable: false);
     final pending = <(RagDocument, TextChunk)>[];
     for (final d in docs) {
       // Chunk ids append `#nnnnn` and must fit the engine's 128-byte limit.
@@ -210,6 +227,12 @@ class RagPipeline {
     final vectors = pending.isEmpty
         ? const <Float32List>[]
         : await embedder.embed([for (final (_, c) in pending) c.text]);
+    if (vectors.length != pending.length) {
+      throw LlmException(
+        'the embedder returned ${vectors.length} vectors for '
+        '${pending.length} chunks',
+      );
+    }
     final chunks = <Document>[
       for (var i = 0; i < pending.length; i++)
         Document(
@@ -231,8 +254,13 @@ class RagPipeline {
         chunks.sublist(i, i + 256 < chunks.length ? i + 256 : chunks.length),
       );
     }
-    final fresh = {for (final c in chunks) c.id};
+    // Pruned per document, against that document's own fresh ids.
+    final freshByDoc = <String, Set<String>>{};
+    for (var i = 0; i < pending.length; i++) {
+      freshByDoc.putIfAbsent(pending[i].$1.id, () => {}).add(chunks[i].id);
+    }
     for (final d in docs) {
+      final fresh = freshByDoc[d.id] ?? const <String>{};
       final existing = await store.list(filter: Filter.eq('doc_id', d.id));
       final stale = [
         for (final c in existing)
@@ -256,6 +284,9 @@ class RagPipeline {
     int? k,
     Filter? filter,
   }) async {
+    if (k != null && k <= 0) {
+      throw ArgumentError.value(k, 'k', 'must be positive');
+    }
     final vector = await embedder.embedOne(
       question,
       purpose: EmbedPurpose.query,
@@ -273,22 +304,30 @@ class RagPipeline {
   }
 
   /// The prompt for [question] over [sources], after [history].
+  ///
+  /// Writes into [included] (when given) exactly the sources that fitted the
+  /// [maxContextChars] budget, so a caller can report the evidence the model
+  /// actually saw rather than everything retrieved.
   List<ChatMessage> buildMessages(
     String question,
     List<RagSource> sources, {
     List<ChatMessage> history = const [],
+    List<RagSource>? included,
   }) {
     final context = StringBuffer('<sources>\n');
     var used = 0;
     for (final s in sources) {
-      if (used > 0 && used + s.text.length > maxContextChars) break;
-      used += s.text.length;
-      context
+      final entry = StringBuffer()
         ..write('<source number="${s.number}"')
         ..write(s.documentId == null ? '' : ' document="${s.documentId}"')
         ..write('>\n')
         ..write(s.text)
         ..write('\n</source>\n');
+      // The wrapper counts too, so the stated cap is the real one.
+      if (used > 0 && used + entry.length > maxContextChars) continue;
+      used += entry.length;
+      context.write(entry);
+      included?.add(s);
     }
     context.write('</sources>\n\nQuestion: $question');
     return [...history, ChatMessage.user(context.toString())];
@@ -303,12 +342,13 @@ class RagPipeline {
     int? maxTokens,
   }) async {
     final sources = await retrieve(question, k: k, filter: filter);
+    final included = <RagSource>[];
     final response = await chat.complete(
-      buildMessages(question, sources, history: history),
+      buildMessages(question, sources, history: history, included: included),
       system: systemPrompt,
       maxTokens: maxTokens,
     );
-    return RagAnswer(response.text, sources, response: response);
+    return RagAnswer(response.text, included, response: response);
   }
 
   /// Like [ask], streaming the answer; the sources are known up front.
@@ -320,13 +360,16 @@ class RagPipeline {
     int? maxTokens,
   }) async {
     final sources = await retrieve(question, k: k, filter: filter);
-    return RagStream(
+    final included = <RagSource>[];
+    final messages = buildMessages(
+      question,
       sources,
-      chat.stream(
-        buildMessages(question, sources, history: history),
-        system: systemPrompt,
-        maxTokens: maxTokens,
-      ),
+      history: history,
+      included: included,
+    );
+    return RagStream(
+      included,
+      chat.stream(messages, system: systemPrompt, maxTokens: maxTokens),
     );
   }
 }
