@@ -29,6 +29,13 @@
 #include <stdbool.h>
 
 /**
+ * Longest dot path that can be indexed *and* queried, in bytes. Matches the
+ * per-field limit in [`validate_field`], so anything the index stores can be
+ * named by a filter.
+ */
+#define MAX_FIELD_PATH 256
+
+/**
  * Size of every page in bytes.
  */
 #define PAGE_SIZE 4096
@@ -189,6 +196,12 @@ typedef struct Collection Collection;
  * threads with an `Arc`.
  */
 typedef struct Database Database;
+
+/**
+ * A subscription over either raw keys or a collection's documents. Both
+ * encode into the same wire format, so one handle type serves both.
+ */
+typedef struct Sub Sub;
 
 /**
  * A thread-safe embedded vector index.
@@ -391,6 +404,17 @@ typedef struct {
     const VectorEngine *engine;
 } PhoenixVectorHandle;
 
+/**
+ * Opaque watcher handle handed to C.
+ */
+typedef struct {
+    HandleTag tag;
+    /**
+     * Owned subscription; boxed so the handle is pointer-stable.
+     */
+    Sub *sub;
+} PhoenixWatcher;
+
 #ifdef __cplusplus
 extern "C" {
 #endif // __cplusplus
@@ -573,6 +597,9 @@ int phoenix_count(PhoenixDB *handle, uint64_t *out_len);
  *   backup/restore/compact, stats, structural check, metrics text, tracing,
  *   and the `ABORTED`/`BUSY` status codes. Every earlier entry point keeps
  *   its signature.
+ * * 5 (PhoenixDB 4.1): document collections (`phoenix_collection_*`) and
+ *   change notifications (`phoenix_watch_*`). Every earlier entry point
+ *   keeps its signature.
  */
 uint32_t phoenix_abi_version(void);
 
@@ -802,7 +829,14 @@ int phoenix_spans_json(PhoenixDB *handle, char **out);
  * `options_json` may be null or an object with any of `dim` (0 = no vectors
  * / adopt the existing layout), `metric` (`"cosine"`, `"euclidean"`,
  * `"dot_product"` or 0/1/2), `text_index`, `sync`, `m`, `ef_construction`,
- * `ef_search`. A directory already open in this process is shared.
+ * `ef_search`.
+ *
+ * A directory already open in this process is **shared**: the running
+ * collection is returned and the rest of `options_json` is ignored, exactly
+ * as `phoenix_open_ex` does for a key/value handle. A conflicting `dim` or
+ * `metric` is an error rather than a silent reinterpretation; `sync`,
+ * `text_index` and the HNSW parameters belong to whoever opened first, and
+ * `phoenix_collection_stats` reports what is actually in force.
  *
  * # Safety
  * `path` must be a NUL-terminated string, `options_json` null or one, and
@@ -884,6 +918,44 @@ int phoenix_collection_list(PhoenixCollectionHandle *handle, const char *filter_
  * `out_json` must be writable.
  */
 int phoenix_collection_stats(PhoenixCollectionHandle *handle, char **out_json);
+
+/**
+ * Like [`phoenix_collection_list`], but `reverse` non-zero returns the
+ * highest ids first (newest-first paging). `after` stays exclusive in both
+ * directions.
+ *
+ * # Safety
+ * `filter_json` and `after` null or NUL-terminated; `out_json` writable.
+ */
+int phoenix_collection_list_ex(PhoenixCollectionHandle *handle, const char *filter_json, uint64_t limit, const char *after, int reverse, char **out_json);
+
+/**
+ * Checks the collection and writes a JSON report: `{"documents", "vectors",
+ * "orphan_vectors", "missing_vectors", "dead_vectors", "tree": {...}}`.
+ *
+ * # Safety
+ * `out_json` must be writable.
+ */
+int phoenix_collection_verify(PhoenixCollectionHandle *handle, char **out_json);
+
+/**
+ * Reclaims space: drops orphaned and tombstoned vectors and rebuilds the
+ * document store. `*out_reclaimed` (optional) receives how many vector
+ * records were reclaimed.
+ *
+ * # Safety
+ * `out_reclaimed` must be null or writable.
+ */
+int phoenix_collection_compact(PhoenixCollectionHandle *handle, uint64_t *out_reclaimed);
+
+/**
+ * Writes a consistent, compacted copy of the collection into directory
+ * `dir`, which can then be opened with [`phoenix_collection_open`].
+ *
+ * # Safety
+ * `dir` must be a NUL-terminated string.
+ */
+int phoenix_collection_backup(PhoenixCollectionHandle *handle, const char *dir);
 
 /**
  * Syncs vectors and checkpoints documents.
@@ -1136,6 +1208,83 @@ uintptr_t phoenix_vector_max_id_len(void);
  * not already been freed.
  */
 void phoenix_free_string_array(char **ptrs, uintptr_t len);
+
+/**
+ * Subscribes to committed changes to keys starting with `prefix`.
+ *
+ * * `prefix` — may be null with `prefix_len` 0 to watch everything.
+ * * `capacity` — changes buffered before the oldest are dropped.
+ * * `with_values` — non-zero to receive written values as well as keys.
+ *
+ * On success `*out_watcher` receives a handle to release with
+ * [`phoenix_watch_close`].
+ *
+ * # Safety
+ * `prefix` must be readable for `prefix_len` bytes and `out_watcher` must be
+ * a writable pointer-sized location.
+ */
+int phoenix_watch_open(PhoenixDB *handle, const uint8_t *prefix, uintptr_t prefix_len, uint64_t capacity, int with_values, PhoenixWatcher **out_watcher);
+
+/**
+ * Subscribes to a collection's document changes.
+ *
+ * The keys delivered are document ids (UTF-8), and `kind` tells an upsert
+ * (put) from a removal (delete). Values are never delivered; read the
+ * document if you need its contents.
+ *
+ * # Safety
+ * `out_watcher` must be a writable pointer-sized location.
+ */
+int phoenix_collection_watch_open(PhoenixCollectionHandle *handle, uint64_t capacity, PhoenixWatcher **out_watcher);
+
+/**
+ * Waits up to `timeout_ms` for changes, then writes every buffered change
+ * into `*out` (see the module docs for the encoding).
+ *
+ * An empty buffer means nothing arrived in time, [`phoenix_watch_wake`] was
+ * called, or the database closed — check [`phoenix_watch_is_closed`].
+ * `*out_dropped` (optional) receives how many changes were lost to a full
+ * queue since the last poll, and reading it resets the count.
+ *
+ * Release the buffer with `phoenix_buffer_free`.
+ *
+ * # Safety
+ * `out` must be writable for a [`PhoenixBuffer`]; `out_dropped` must be null
+ * or writable.
+ */
+int phoenix_watch_poll(PhoenixWatcher *handle, uint64_t timeout_ms, PhoenixBuffer *out, uint64_t *out_dropped);
+
+/**
+ * Returns a blocked [`phoenix_watch_poll`] immediately, so a consumer thread
+ * can shut down without waiting out its timeout. Safe to call from another
+ * thread.
+ *
+ * # Safety
+ * `handle` must be a live watcher handle.
+ */
+int phoenix_watch_wake(PhoenixWatcher *handle);
+
+/**
+ * Writes 1 into `*out_closed` when the watched database has closed, else 0.
+ *
+ * # Safety
+ * `out_closed` must be writable.
+ */
+int phoenix_watch_is_closed(PhoenixWatcher *handle, int *out_closed);
+
+/**
+ * Unsubscribes and frees the handle. Null and already-closed handles are
+ * ignored rather than double-freed.
+ *
+ * A poll in progress on another thread must be returned first with
+ * [`phoenix_watch_wake`]; closing under a blocked poll is undefined, exactly
+ * as freeing any handle in use is.
+ *
+ * # Safety
+ * `handle` must come from a `phoenix_*_watch_open` and must not be used
+ * afterwards.
+ */
+void phoenix_watch_close(PhoenixWatcher *handle);
 
 #ifdef __cplusplus
 }  // extern "C"
