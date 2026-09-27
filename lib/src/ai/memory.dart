@@ -19,7 +19,10 @@ import 'http.dart' show LlmException;
 /// Messages are keyed by a monotonic timestamp rather than a position, so two
 /// handles on one conversation (a UI isolate and a background job, say) can
 /// both append without overwriting each other, and deleting messages never
-/// makes a later append collide with a surviving one.
+/// makes a later append collide with a surviving one. Each append first reads
+/// the newest stored message, so the order holds across handles even where the
+/// platform clock is coarse; two genuinely simultaneous appends may still tie,
+/// and then their relative order is arbitrary but neither is lost.
 class ConversationMemory {
   /// Where messages live (may be shared with other data; messages are
   /// tagged with their conversation).
@@ -81,11 +84,29 @@ class ConversationMemory {
   /// A strictly increasing stamp, wide enough to sort as text.
   ///
   /// Microseconds since the epoch, forced to advance even when several
-  /// messages are appended inside one microsecond.
+  /// messages are appended inside one clock tick.
   int _stamp() {
     final now = DateTime.now().microsecondsSinceEpoch;
     _lastStamp = now > _lastStamp ? now : _lastStamp + 1;
     return _lastStamp;
+  }
+
+  /// Catches this handle up to the newest message already stored, so stamps
+  /// keep increasing across handles as well as within one.
+  ///
+  /// Without it, ordering would only be as fine as the platform clock: on
+  /// Windows a tick is a millisecond or more, so two handles appending in the
+  /// same tick would get equal stamps and their order would come down to the
+  /// random part of the id. One extra read per append buys a real order.
+  Future<void> _catchUp() async {
+    final newest = await store.list(
+      filter: _scope,
+      limit: 1,
+      newestFirst: true,
+    );
+    if (newest.isEmpty) return;
+    final stored = _stampOf(newest.first);
+    if (stored > _lastStamp) _lastStamp = stored;
   }
 
   /// Zero-padded so id order is chronological order, with a random tail so two
@@ -111,6 +132,7 @@ class ConversationMemory {
   /// Appends messages to the conversation.
   Future<void> addAll(List<ChatMessage> messages) async {
     if (messages.isEmpty) return;
+    await _catchUp();
     final vectors = await embedder.embed([for (final m in messages) m.content]);
     if (vectors.length != messages.length) {
       throw LlmException(
