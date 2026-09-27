@@ -22,17 +22,43 @@ class ChatMessage {
   /// Text content.
   final String content;
 
+  /// Tools the model asked to run, on an assistant turn.
+  final List<ToolCall> toolCalls;
+
+  /// Results being handed back, on a user turn.
+  final List<ToolResult> toolResults;
+
   /// Creates a message.
-  const ChatMessage(this.role, this.content);
+  const ChatMessage(
+    this.role,
+    this.content, {
+    this.toolCalls = const [],
+    this.toolResults = const [],
+  });
+
+  /// A user turn carrying tool results; see [Agent].
+  const ChatMessage.toolResults(this.toolResults)
+    : role = ChatRole.user,
+      content = '',
+      toolCalls = const [];
 
   /// A system message.
-  const ChatMessage.system(this.content) : role = ChatRole.system;
+  const ChatMessage.system(this.content)
+    : role = ChatRole.system,
+      toolCalls = const [],
+      toolResults = const [];
 
   /// A user message.
-  const ChatMessage.user(this.content) : role = ChatRole.user;
+  const ChatMessage.user(this.content)
+    : role = ChatRole.user,
+      toolCalls = const [],
+      toolResults = const [];
 
   /// An assistant message.
-  const ChatMessage.assistant(this.content) : role = ChatRole.assistant;
+  const ChatMessage.assistant(this.content)
+    : role = ChatRole.assistant,
+      toolCalls = const [],
+      toolResults = const [];
 
   @override
   bool operator ==(Object other) =>
@@ -43,6 +69,43 @@ class ChatMessage {
 
   @override
   String toString() => '${role.name}: $content';
+}
+
+/// A model's request to run a tool.
+class ToolCall {
+  /// Provider-assigned id, echoed back with the result.
+  final String id;
+
+  /// Which tool.
+  final String name;
+
+  /// Arguments, decoded from the provider's JSON.
+  final Map<String, Object?> input;
+
+  /// Creates a call.
+  const ToolCall({required this.id, required this.name, required this.input});
+
+  @override
+  String toString() => 'ToolCall($name, $input)';
+}
+
+/// What a tool returned, on its way back to the model.
+class ToolResult {
+  /// The [ToolCall.id] this answers.
+  final String id;
+
+  /// Text the model will read.
+  final String content;
+
+  /// Whether the tool failed. The model is told, so it can adapt.
+  final bool isError;
+
+  /// Creates a result.
+  const ToolResult({
+    required this.id,
+    required this.content,
+    this.isError = false,
+  });
 }
 
 /// Token accounting for one response.
@@ -85,8 +148,17 @@ class ChatResponse {
   /// Token usage, when reported.
   final ChatUsage? usage;
 
+  /// Tools the model asked to run. Empty for a plain answer.
+  final List<ToolCall> toolCalls;
+
   /// Creates a response.
-  const ChatResponse(this.text, {this.stopReason, this.model, this.usage});
+  const ChatResponse(
+    this.text, {
+    this.stopReason,
+    this.model,
+    this.usage,
+    this.toolCalls = const [],
+  });
 
   /// Whether the output hit the token limit and is truncated.
   bool get truncated => stopReason == 'max_tokens' || stopReason == 'length';
