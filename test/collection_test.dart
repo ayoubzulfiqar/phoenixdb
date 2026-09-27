@@ -270,6 +270,8 @@ void main() {
     }
   });
 
+  group('maintenance and parity', _maintenance);
+
   test('async collection has parity with the sync client', () async {
     final kb = await AsyncPhoenixCollection.open(
       path,
@@ -317,4 +319,214 @@ void main() {
       throwsA(isA<PhoenixException>()),
     );
   });
+}
+
+// ---------------------------------------------------------------------------
+// Maintenance, ordering and client parity (audit follow-ups).
+// ---------------------------------------------------------------------------
+
+void _maintenance() {
+  late Directory dir;
+  late String path;
+
+  setUp(() {
+    dir = Directory.systemTemp.createTempSync('phoenix_coll2_');
+    path = '${dir.path}/kb';
+  });
+  tearDown(() {
+    try {
+      dir.deleteSync(recursive: true);
+    } on FileSystemException {
+      // Windows can hold files briefly.
+    }
+  });
+
+  test('verify, compact and backup are reachable from Dart', () {
+    final kb = PhoenixCollection.open(path, dimensions: 2, sync: false);
+    try {
+      kb.upsert([
+        for (var i = 0; i < 12; i++)
+          Document(
+            'd${i.toString().padLeft(2, '0')}',
+            text: 'document $i',
+            metadata: {'i': i},
+            vector: vec([i.toDouble(), 1]),
+          ),
+      ]);
+      expect(kb.delete(['d00', 'd01']), 2);
+      kb.flush();
+
+      final report = kb.verify();
+      expect(report.documents, 10);
+      expect(report.vectors, 10);
+      expect(report.deadVectors, 2, reason: 'deletes leave tombstones');
+      expect(report.isConsistent, isTrue);
+      expect(report.treeKeys, greaterThan(0));
+
+      expect(kb.compact(), 2, reason: 'tombstones reclaimed');
+      expect(kb.verify().deadVectors, 0);
+      expect(kb.count(), 10, reason: 'and nothing else changed');
+
+      final copy = '${dir.path}/copy';
+      kb.backup(copy);
+      expect(() => kb.backup(path), throwsA(isA<PhoenixException>()));
+      final restored = PhoenixCollection.open(copy);
+      try {
+        expect(restored.count(), 10);
+        expect(restored.stats().repaired, 0);
+        expect(
+          restored.search(vector: vec([5, 1]), k: 1).single.id,
+          'd05',
+          reason: 'the vectors came along',
+        );
+      } finally {
+        restored.close();
+      }
+    } finally {
+      kb.close();
+    }
+  });
+
+  test('newest-first paging walks the collection backwards', () {
+    final kb = PhoenixCollection.open(path, sync: false);
+    try {
+      kb.upsert([for (var i = 0; i < 7; i++) Document('d$i', text: 'x')]);
+      expect(kb.list(limit: 3, newestFirst: true).map((d) => d.id), [
+        'd6',
+        'd5',
+        'd4',
+      ]);
+      expect(
+        kb.list(limit: 3, after: 'd4', newestFirst: true).map((d) => d.id),
+        ['d3', 'd2', 'd1'],
+        reason: 'the cursor is exclusive in both directions',
+      );
+      expect(
+        kb.documents(pageSize: 2, newestFirst: true).map((d) => d.id).toList(),
+        ['d6', 'd5', 'd4', 'd3', 'd2', 'd1', 'd0'],
+      );
+      expect(() => kb.documents(pageSize: 0).toList(), throwsArgumentError);
+    } finally {
+      kb.close();
+    }
+  });
+
+  test('the text index is reported and cannot be reinterpreted', () {
+    final lean = PhoenixCollection.open(
+      path,
+      dimensions: 2,
+      textIndex: false,
+      sync: false,
+    );
+    try {
+      expect(lean.stats().textIndex, isFalse);
+      lean.add(Document('a', text: 'hello', vector: vec([1, 0])));
+      // A text query on a collection that cannot answer it is an error, not
+      // an empty result that looks like "no matches".
+      expect(
+        () => lean.search(text: 'hello'),
+        throwsA(isA<PhoenixException>()),
+      );
+      expect(
+        () => lean.search(vector: vec([1, 0]), mmr: 0.5),
+        returnsNormally,
+        reason: 'mmr is fine when there are embeddings',
+      );
+    } finally {
+      lean.close();
+    }
+    // Reopening with the opposite setting is refused rather than silently
+    // adopted, which used to make text search return nothing.
+    expect(
+      () => PhoenixCollection.open(path, dimensions: 2),
+      throwsA(isA<PhoenixException>()),
+    );
+    final adopted = PhoenixCollection.open(path);
+    expect(adopted.stats().textIndex, isFalse);
+    adopted.close();
+  });
+
+  test('mmr without embeddings is refused', () {
+    final kb = PhoenixCollection.open(path, sync: false);
+    try {
+      kb.add(const Document('a', text: 'hello'));
+      expect(
+        () => kb.search(text: 'hello', mmr: 0.5),
+        throwsA(isA<PhoenixException>()),
+      );
+    } finally {
+      kb.close();
+    }
+  });
+
+  test('both clients validate arguments the same way', () async {
+    final kb = await AsyncPhoenixCollection.open(
+      path,
+      dimensions: 2,
+      sync: false,
+    );
+    try {
+      // Each of these threw ArgumentError on the sync client but reached the
+      // worker (and came back as a PhoenixException) on the async one.
+      await expectLater(kb.search(k: -1), throwsArgumentError);
+      await expectLater(kb.list(limit: -1), throwsArgumentError);
+      await expectLater(
+        kb.upsert([
+          Document('x', metadata: {'bad': Object()}),
+        ]),
+        throwsArgumentError,
+      );
+      expect(() => kb.documents(pageSize: 0), throwsArgumentError);
+      expect(() => kb.changes(capacity: 0), throwsArgumentError);
+      expect(await kb.count(), 0, reason: 'nothing was written');
+    } finally {
+      await kb.close();
+    }
+  });
+
+  test(
+    'async maintenance and newest-first paging match the sync client',
+    () async {
+      final kb = await AsyncPhoenixCollection.open(
+        path,
+        dimensions: 2,
+        sync: false,
+      );
+      try {
+        await kb.upsert([
+          for (var i = 0; i < 6; i++)
+            Document('d$i', text: 'x', vector: vec([i.toDouble(), 1])),
+        ]);
+        await kb.delete(['d0']);
+        await kb.flush();
+        final report = await kb.verify();
+        expect(report.documents, 5);
+        expect(report.deadVectors, 1);
+        expect(await kb.compact(), 1);
+        expect((await kb.verify()).deadVectors, 0);
+
+        expect((await kb.list(limit: 2, newestFirst: true)).map((d) => d.id), [
+          'd5',
+          'd4',
+        ]);
+        expect(
+          await kb
+              .documents(pageSize: 2, newestFirst: true)
+              .map((d) => d.id)
+              .toList(),
+          ['d5', 'd4', 'd3', 'd2', 'd1'],
+        );
+
+        final copy = '${dir.path}/async-copy';
+        await kb.backup(copy);
+        final restored = PhoenixCollection.open(copy);
+        expect(restored.count(), 5);
+        restored.close();
+      } finally {
+        await kb.close();
+        await kb.close(); // idempotent
+      }
+      await expectLater(kb.count(), throwsA(isA<PhoenixException>()));
+    },
+  );
 }
