@@ -43,6 +43,7 @@ REQUIRED=(
   phoenix_watch_open
   phoenix_watch_poll
   phoenix_watch_close
+  phoenix_salvage
 )
 
 if [[ "${1:-}" == "--shipped" ]]; then
