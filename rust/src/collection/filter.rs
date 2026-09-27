@@ -33,6 +33,14 @@ use std::collections::BTreeSet;
 /// against), in bytes.
 pub const MAX_INDEXED_STRING: usize = 512;
 
+/// Longest dot path that can be indexed *and* queried, in bytes. Matches the
+/// per-field limit in [`validate_field`], so anything the index stores can be
+/// named by a filter.
+pub const MAX_FIELD_PATH: usize = 256;
+
+/// Deepest metadata nesting any walk will follow.
+const MAX_METADATA_DEPTH: u32 = 64;
+
 /// A scalar a filter compares against.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Scalar {
@@ -137,9 +145,19 @@ impl Scalar {
     }
 
     /// Whether this value can be indexed (long strings are not).
+    ///
+    /// Measured on the *encoded* length, because [`Scalar::encode`] escapes
+    /// every NUL byte: a 512-byte string of NULs encodes to 1027 bytes, which
+    /// would push the index key past the engine's structural key limit.
     #[must_use]
     pub fn indexable(&self) -> bool {
-        !matches!(self, Scalar::Str(s) if s.len() > MAX_INDEXED_STRING)
+        match self {
+            Scalar::Str(s) => {
+                let escapes = s.as_bytes().iter().filter(|&&b| b == 0).count();
+                s.len() + escapes <= MAX_INDEXED_STRING
+            }
+            _ => true,
+        }
     }
 }
 
@@ -360,20 +378,30 @@ pub fn validate_field(field: &str) -> Result<()> {
 /// Every scalar reachable at `path` (arrays contribute each element).
 fn values_at(metadata: &Value, path: &str) -> Vec<Scalar> {
     let mut out = Vec::new();
-    collect_at(metadata, &path.split('.').collect::<Vec<_>>(), &mut out);
+    collect_at(
+        metadata,
+        &path.split('.').collect::<Vec<_>>(),
+        &mut out,
+        MAX_METADATA_DEPTH,
+    );
     out
 }
 
-fn collect_at(value: &Value, path: &[&str], out: &mut Vec<Scalar>) {
+fn collect_at(value: &Value, path: &[&str], out: &mut Vec<Scalar>, budget: u32) {
+    // Metadata is caller data and can nest arbitrarily; a stack overflow is
+    // not a catchable panic, so every walk is bounded.
+    let Some(budget) = budget.checked_sub(1) else {
+        return;
+    };
     match value {
         Value::Array(items) => {
             for item in items {
-                collect_at(item, path, out);
+                collect_at(item, path, out, budget);
             }
         }
         Value::Object(map) if !path.is_empty() => {
             if let Some(child) = map.get(path[0]) {
-                collect_at(child, &path[1..], out);
+                collect_at(child, &path[1..], out, budget);
             }
         }
         _ if path.is_empty() => {
@@ -388,16 +416,23 @@ fn collect_at(value: &Value, path: &[&str], out: &mut Vec<Scalar>) {
 }
 
 fn field_present(metadata: &Value, path: &str) -> bool {
-    fn walk(value: &Value, path: &[&str]) -> bool {
+    fn walk(value: &Value, path: &[&str], budget: u32) -> bool {
+        let Some(budget) = budget.checked_sub(1) else {
+            return false;
+        };
         match value {
-            Value::Array(items) => items.iter().any(|i| walk(i, path)),
-            Value::Object(map) if !path.is_empty() => {
-                map.get(path[0]).is_some_and(|c| walk(c, &path[1..]))
-            }
+            Value::Array(items) => items.iter().any(|i| walk(i, path, budget)),
+            Value::Object(map) if !path.is_empty() => map
+                .get(path[0])
+                .is_some_and(|c| walk(c, &path[1..], budget)),
             _ => path.is_empty(),
         }
     }
-    walk(metadata, &path.split('.').collect::<Vec<_>>())
+    walk(
+        metadata,
+        &path.split('.').collect::<Vec<_>>(),
+        MAX_METADATA_DEPTH,
+    )
 }
 
 /// What a document's metadata contributes to the index.
@@ -414,7 +449,13 @@ pub struct Flattened {
 /// Flattens metadata for indexing; at most `limit` entries (values plus
 /// presence paths).
 pub fn flatten(metadata: &Value, limit: usize) -> Result<Flattened> {
-    fn walk(value: &Value, path: &mut String, out: &mut Flattened, limit: usize) -> Result<()> {
+    fn walk(value: &Value, path: &mut String, out: &mut Flattened, budget: u32) -> Result<()> {
+        // Bounded like every other metadata walk: see `MAX_METADATA_DEPTH`.
+        let Some(budget) = budget.checked_sub(1) else {
+            return Err(Error::invalid(format!(
+                "metadata nests deeper than {MAX_METADATA_DEPTH} levels"
+            )));
+        };
         if !path.is_empty() && !value.is_array() {
             out.present.insert(path.clone());
         }
@@ -433,13 +474,23 @@ pub fn flatten(metadata: &Value, limit: usize) -> Result<Flattened> {
                         path.push('.');
                     }
                     path.push_str(k);
-                    walk(v, path, out, limit)?;
+                    // The whole path, not just this segment, must stay
+                    // queryable: `validate_field` rejects a filter naming a
+                    // longer path, so indexing it would store a value no
+                    // filter could ever reach. It also keeps the index key
+                    // inside the engine's structural key limit.
+                    if path.len() > MAX_FIELD_PATH {
+                        return Err(Error::invalid(format!(
+                            "metadata path {path:?} exceeds {MAX_FIELD_PATH} bytes"
+                        )));
+                    }
+                    walk(v, path, out, budget)?;
                     path.truncate(len);
                 }
             }
             Value::Array(items) => {
                 for item in items {
-                    walk(item, path, out, limit)?;
+                    walk(item, path, out, budget)?;
                 }
             }
             scalar => {
@@ -451,19 +502,21 @@ pub fn flatten(metadata: &Value, limit: usize) -> Result<Flattened> {
                 }
             }
         }
-        if out.values.len() + out.present.len() > limit {
-            return Err(Error::invalid(format!(
-                "metadata has more than {limit} indexed entries"
-            )));
-        }
         Ok(())
     }
     let mut out = Flattened::default();
-    walk(metadata, &mut String::new(), &mut out, limit)?;
+    walk(metadata, &mut String::new(), &mut out, MAX_METADATA_DEPTH)?;
     out.values
         .sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.encode().cmp(&b.1.encode())));
     out.values
         .dedup_by(|a, b| a.0 == b.0 && a.1.encode() == b.1.encode());
+    // Counted after the dedup: a thousand copies of one tag is one indexed
+    // entry, and rejecting it would be a false limit.
+    if out.values.len() + out.present.len() > limit {
+        return Err(Error::invalid(format!(
+            "metadata has more than {limit} indexed entries"
+        )));
+    }
     Ok(out)
 }
 
@@ -546,6 +599,66 @@ mod tests {
         let flat = flatten(&doc, 100).unwrap();
         assert_eq!(flat.values.len(), 1);
         assert!(flat.present.contains("body"));
+    }
+
+    #[test]
+    fn an_index_key_can_never_outgrow_the_engines_key_limit() {
+        // A string of NULs encodes to three bytes per NUL-escape pair, so the
+        // raw length is not what decides whether it can be indexed.
+        let at_limit = "\u{0}".repeat(MAX_INDEXED_STRING / 2);
+        let over = "\u{0}".repeat(MAX_INDEXED_STRING / 2 + 1);
+        assert!(
+            over.len() < MAX_INDEXED_STRING,
+            "raw length still looks fine"
+        );
+        assert!(Scalar::Str(at_limit).indexable(), "escapes to exactly 512");
+        assert!(
+            !Scalar::Str(over.clone()).indexable(),
+            "one NUL more than the escaped budget allows"
+        );
+        assert!(
+            Filter::parse(&json!({"f": over})).is_err(),
+            "and a filter cannot ask for it either"
+        );
+        let plain = "x".repeat(MAX_INDEXED_STRING);
+        assert!(Scalar::Str(plain).indexable());
+
+        // The widest indexable value plus the longest path and id still fits
+        // inside the 1 KiB structural key limit.
+        let worst = Scalar::Str("\u{0}".repeat(MAX_INDEXED_STRING / 2 - 1)).encode();
+        assert!(worst.len() <= MAX_INDEXED_STRING + 3);
+        assert!(1 + MAX_FIELD_PATH + 1 + worst.len() + 128 <= 1024);
+    }
+
+    #[test]
+    fn a_path_too_long_to_query_is_refused_rather_than_hidden() {
+        let deep = json!({"a".repeat(200): {"b".repeat(200): 1}});
+        let err = flatten(&deep, 100).unwrap_err();
+        assert!(err.to_string().contains("exceeds"), "{err}");
+        // The limit matches what a filter may name, so anything indexed can
+        // be retrieved.
+        assert!(validate_field(&"a".repeat(MAX_FIELD_PATH)).is_ok());
+        assert!(validate_field(&"a".repeat(MAX_FIELD_PATH + 1)).is_err());
+    }
+
+    #[test]
+    fn metadata_nested_absurdly_deep_is_refused_not_a_stack_overflow() {
+        let mut value = json!(1);
+        for _ in 0..500 {
+            value = json!({"a": value});
+        }
+        let err = flatten(&value, 10_000).unwrap_err();
+        assert!(err.to_string().contains("deeper than"), "{err}");
+        // The in-memory side must also stop rather than recurse forever.
+        assert!(!f(json!({"a": 1})).matches(&value));
+    }
+
+    #[test]
+    fn duplicate_values_count_once_against_the_entry_limit() {
+        let many = json!({"tags": vec!["x"; 5000]});
+        let flat = flatten(&many, 8).unwrap();
+        assert_eq!(flat.values.len(), 1, "one distinct value");
+        assert_eq!(flat.present.len(), 1);
     }
 
     #[test]
