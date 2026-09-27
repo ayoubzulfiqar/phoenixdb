@@ -59,12 +59,13 @@ pub mod text;
 use crate::error::{Error, Result};
 use crate::vector::distance::{dot, norm};
 use crate::vector::{HnswParams, MAX_ID_LEN, Metric, VectorEngine, VectorOptions};
+use crate::watch::{Change, ChangeKind, WatchOptions, Watcher};
 use crate::{Database, Options, prefix_successor};
 pub use filter::Filter;
 use filter::{Flattened, RangeOp, Scalar};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
 
@@ -353,6 +354,10 @@ pub struct Hit {
 pub struct CollectionStats {
     /// Documents stored.
     pub documents: u64,
+    /// Whether the BM25 text index is maintained. Reported because an
+    /// adopted layout (opening with `dim: 0`) may differ from what the
+    /// caller asked for.
+    pub text_index: bool,
     /// Documents with text.
     pub text_documents: u64,
     /// Documents with an embedding.
@@ -362,6 +367,118 @@ pub struct CollectionStats {
     /// Orphaned vectors removed and missing vectors found by the last
     /// recovery (non-zero only after a crash).
     pub repaired: u64,
+}
+
+/// One page of [`Collection::list_with`].
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct ListOptions<'a> {
+    /// Only documents matching this filter; `None` for all of them.
+    pub filter: Option<&'a Filter>,
+    /// Documents per page; `0` for no limit.
+    pub limit: usize,
+    /// Exclusive cursor: the id the previous page ended on.
+    pub after: Option<&'a str>,
+    /// Highest id first instead of lowest.
+    pub reverse: bool,
+}
+
+/// What [`Collection::verify`] found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct CollectionReport {
+    /// Documents stored.
+    pub documents: u64,
+    /// Live vectors in the index.
+    pub vectors: u64,
+    /// Vectors whose document is gone: reclaimable, and removed by the next
+    /// unclean-shutdown recovery or by [`Collection::compact`].
+    pub orphan_vectors: u64,
+    /// Documents that claim an embedding the index does not have. Non-zero
+    /// means a crash truncated the vector file: re-ingest those documents.
+    pub missing_vectors: u64,
+    /// Tombstoned vector records awaiting [`Collection::compact`].
+    pub dead_vectors: u64,
+    /// Structural report for the document store.
+    pub tree: crate::TreeReport,
+}
+
+/// A committed change to one document.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DocumentChange {
+    /// The document's id, empty for [`ChangeKind::Reset`].
+    pub id: String,
+    /// Whether the document was written, removed, or the whole collection
+    /// was replaced.
+    pub kind: ChangeKind,
+    /// Commit timestamp; changes arrive in this order.
+    pub commit_ts: u64,
+}
+
+/// A subscription to a collection's document changes; dropping it
+/// unsubscribes. See [`Collection::watch`].
+pub struct DocumentWatcher {
+    inner: Watcher,
+}
+
+impl DocumentWatcher {
+    fn decode(changes: Vec<Change>) -> Vec<DocumentChange> {
+        changes
+            .into_iter()
+            .filter_map(|change| match change.kind {
+                ChangeKind::Reset => Some(DocumentChange {
+                    id: String::new(),
+                    kind: ChangeKind::Reset,
+                    commit_ts: change.commit_ts,
+                }),
+                kind => change.key.split_first().map(|(_tag, id)| DocumentChange {
+                    id: String::from_utf8_lossy(id).into_owned(),
+                    kind,
+                    commit_ts: change.commit_ts,
+                }),
+            })
+            .collect()
+    }
+
+    /// Takes every buffered change, waiting up to `timeout` for the first.
+    #[must_use]
+    pub fn poll(&self, timeout: std::time::Duration) -> Vec<DocumentChange> {
+        Self::decode(self.inner.poll(timeout))
+    }
+
+    /// Takes every buffered change without waiting.
+    #[must_use]
+    pub fn try_poll(&self) -> Vec<DocumentChange> {
+        Self::decode(self.inner.try_poll())
+    }
+
+    /// Returns a blocked [`DocumentWatcher::poll`] immediately.
+    pub fn wake(&self) {
+        self.inner.wake();
+    }
+
+    /// Changes dropped because the queue was full; reading resets the count.
+    pub fn dropped(&self) -> u64 {
+        self.inner.dropped()
+    }
+
+    /// Whether the collection has closed.
+    #[must_use]
+    pub fn is_closed(&self) -> bool {
+        self.inner.is_closed()
+    }
+
+    /// Buffered changes not yet taken.
+    #[must_use]
+    pub fn pending(&self) -> usize {
+        self.inner.pending()
+    }
+}
+
+impl std::fmt::Debug for DocumentWatcher {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DocumentWatcher")
+            .field("pending", &self.pending())
+            .finish()
+    }
 }
 
 /// A collection of documents; see the module docs.
@@ -395,10 +512,13 @@ fn term_prefix(term: &str) -> Vec<u8> {
 /// Length of the encoded scalar at the start of `bytes` (see
 /// [`Scalar::encode`]), so the id that follows can be recovered.
 fn encoded_len(bytes: &[u8]) -> Option<usize> {
+    // Every arm is checked against the actual length: a truncated key must
+    // report `None` (reported as corruption) rather than panic on a slice.
+    let fixed = |n: usize| (bytes.len() >= n).then_some(n);
     match *bytes.first()? {
-        0x01 => Some(1),
-        0x02 => Some(2),
-        0x03 => Some(9),
+        0x01 => fixed(1),
+        0x02 => fixed(2),
+        0x03 => fixed(9),
         0x04 => {
             let mut i = 1;
             while i + 1 < bytes.len() {
@@ -473,6 +593,16 @@ impl Collection {
                         "collection at {} uses the {} metric",
                         dir.display(),
                         Metric::from_u8(stored.metric)?.name()
+                    )));
+                }
+                // As for `dim` and `metric`: reinterpreting an existing
+                // collection silently would make `search(text: ...)` return
+                // nothing at all on a collection that has no postings.
+                if options.dim != 0 && stored.text_index != options.text_index {
+                    return Err(Error::invalid(format!(
+                        "collection at {} was created {} a text index",
+                        dir.display(),
+                        if stored.text_index { "with" } else { "without" }
                     )));
                 }
                 stored
@@ -553,8 +683,12 @@ impl Collection {
             return Ok(0);
         };
         let mut repaired = 0u64;
+        // A vector whose document is absent — or whose document says it has
+        // none — can never be returned by a search, so drop it. Without this,
+        // a filter-only or vector search would report a phantom id.
         for id in engine.ids() {
-            if self.db.get_auto(&key(IDS, &[id.as_bytes()])).is_err() {
+            let record = self.record_auto(&id)?;
+            if record.is_none_or(|r| !r.has_vector) {
                 engine.remove(&id)?;
                 repaired += 1;
             }
@@ -562,15 +696,46 @@ impl Collection {
         if repaired > 0 {
             engine.flush()?;
         }
+
+        // The other direction: a document claiming an embedding the index
+        // lost (a truncated vector file). Record the truth, so `get` and
+        // search agree and the caller can re-ingest those documents.
         let txn = self.db.begin(true)?;
         let ids = self.all_ids(txn);
         let _ = self.db.rollback(txn);
+        let mut lost = Vec::new();
         for id in ids? {
             if let Some(record) = self.record_auto(&id)?
                 && record.has_vector
                 && !engine.contains(&id)
             {
-                repaired += 1;
+                lost.push((id, record));
+            }
+        }
+        if !lost.is_empty() {
+            repaired += lost.len() as u64;
+            let _turn = self.db.serialize_writes();
+            let txn = self.db.begin(false)?;
+            let staged = (|| -> Result<()> {
+                for (id, record) in &lost {
+                    let fixed = DocRecord {
+                        has_vector: false,
+                        ..record.clone()
+                    };
+                    self.db.insert(
+                        txn,
+                        &key(DOC, &[id.as_bytes()]),
+                        &bincode::serialize(&fixed)?,
+                    )?;
+                }
+                Ok(())
+            })();
+            match staged {
+                Ok(()) => self.db.commit(txn)?,
+                Err(e) => {
+                    let _ = self.db.rollback(txn);
+                    return Err(e);
+                }
             }
         }
         Ok(repaired)
@@ -724,6 +889,9 @@ impl Collection {
                 let hit = self.eval(txn, &Filter::In(field.clone(), vs.clone()), all)?;
                 complement(self, hit, all)?
             }
+            // An empty conjunction is vacuously true, which is what
+            // `Filter::matches` reports; `None` here would mean "nothing".
+            Filter::And(fs) if fs.is_empty() => self.universe(txn, all)?.clone(),
             Filter::And(fs) => {
                 let mut acc: Option<IdSet> = None;
                 for f in fs {
@@ -786,7 +954,7 @@ impl Collection {
         Ok(Some(Document {
             id: id.to_string(),
             text: record.text,
-            metadata: parse_metadata(&record.metadata),
+            metadata: parse_metadata(&record.metadata)?,
             vector,
         }))
     }
@@ -810,27 +978,31 @@ impl Collection {
         limit: usize,
         after: Option<&str>,
     ) -> Result<Vec<Document>> {
+        self.list_with(&ListOptions {
+            filter,
+            limit,
+            after,
+            reverse: false,
+        })
+    }
+
+    /// Documents matching a [`ListOptions`] page, in id order or reversed.
+    ///
+    /// Reverse order is what a chat or feed wants — the newest ids first —
+    /// and it pages the same way: `after` is always exclusive, so a reverse
+    /// page continues from the *lowest* id seen so far.
+    pub fn list_with(&self, options: &ListOptions<'_>) -> Result<Vec<Document>> {
         let txn = self.db.begin(true)?;
         let result = (|| {
-            let ids = match self.filter_ids(txn, filter)? {
-                Some(ids) => ids,
-                None => self.all_ids(txn)?,
-            };
-            let mut out = Vec::new();
-            let range = match after {
-                Some(a) => ids.range::<str, _>((Bound::Excluded(a), Bound::Unbounded)),
-                None => ids.range::<str, _>(..),
-            };
-            for id in range {
-                if limit != 0 && out.len() >= limit {
-                    break;
-                }
-                if let Some(record) = self.record_in(txn, id)? {
+            let ids = self.page_ids(txn, options)?;
+            let mut out = Vec::with_capacity(ids.len());
+            for id in ids {
+                if let Some(record) = self.record_in(txn, &id)? {
                     out.push(Document {
-                        id: id.clone(),
                         text: record.text,
-                        metadata: parse_metadata(&record.metadata),
+                        metadata: parse_metadata(&record.metadata)?,
                         vector: None,
+                        id,
                     });
                 }
             }
@@ -838,6 +1010,73 @@ impl Collection {
         })();
         let _ = self.db.rollback(txn);
         result
+    }
+
+    /// The ids on one page, newest- or oldest-first.
+    ///
+    /// Without a filter this walks the id index straight from the cursor and
+    /// keeps at most `limit` ids in memory, so paging a large collection costs
+    /// the page rather than the collection. A filter has to be evaluated over
+    /// the whole set first, so that path materialises it.
+    fn page_ids(&self, txn: u64, options: &ListOptions<'_>) -> Result<Vec<String>> {
+        let limit = if options.limit == 0 {
+            usize::MAX
+        } else {
+            options.limit
+        };
+        if let Some(ids) = self.filter_ids(txn, options.filter)? {
+            let range: Vec<&String> = match (options.after, options.reverse) {
+                (Some(a), false) => ids
+                    .range::<str, _>((Bound::Excluded(a), Bound::Unbounded))
+                    .collect(),
+                (Some(a), true) => ids
+                    .range::<str, _>((Bound::Unbounded, Bound::Excluded(a)))
+                    .rev()
+                    .collect(),
+                (None, false) => ids.iter().collect(),
+                (None, true) => ids.iter().rev().collect(),
+            };
+            return Ok(range.into_iter().take(limit).cloned().collect());
+        }
+
+        // Unfiltered: scan the id index itself.
+        let mut lo = vec![IDS];
+        let mut hi = prefix_successor(&[IDS]).unwrap_or_else(|| vec![IDS, 0xFF]);
+        match (options.after, options.reverse) {
+            (Some(a), false) => {
+                lo.extend_from_slice(a.as_bytes());
+                lo.push(0); // first key strictly after `a`
+            }
+            (Some(a), true) => {
+                hi = key(IDS, &[a.as_bytes()]); // exclusive upper bound
+            }
+            _ => {}
+        }
+        let mut out: VecDeque<String> = VecDeque::new();
+        self.scan_suffixes(
+            txn,
+            Bound::Included(&lo),
+            Bound::Excluded(&hi),
+            1,
+            |suffix, _| {
+                out.push_back(String::from_utf8_lossy(suffix).into_owned());
+                // Forward: stop at a full page. Reverse: the page is the tail,
+                // so keep a sliding window of the last `limit` ids.
+                if out.len() > limit {
+                    if options.reverse {
+                        out.pop_front();
+                    } else {
+                        out.pop_back();
+                    }
+                }
+                Ok(())
+            },
+        )?;
+        let mut ids: Vec<String> = out.into();
+        if options.reverse {
+            ids.reverse();
+        }
+        Ok(ids)
     }
 
     /// Statistics.
@@ -848,6 +1087,7 @@ impl Collection {
         let c = c?;
         Ok(CollectionStats {
             documents: c.docs,
+            text_index: self.config.text_index,
             text_documents: c.text_docs,
             vectors: self.vectors.as_ref().map_or(0, |v| v.len() as u64),
             dim: self.config.dim,
@@ -940,7 +1180,11 @@ impl Collection {
                     self.db.insert(txn, &k, &posting)?;
                 }
                 counters.docs += 1;
-                if record.text.is_some() {
+                // Symmetric with `unindex`, which only decrements when the
+                // text index is on: counting here regardless would make
+                // `text_documents` climb forever on a collection created
+                // with `text_index: false`.
+                if record.text.is_some() && self.config.text_index {
                     counters.text_docs += 1;
                     counters.text_terms += u64::from(record.text_len);
                 }
@@ -958,12 +1202,21 @@ impl Collection {
         };
 
         // Vectors go to disk before the documents commit, so a committed
-        // document never lacks its vector.
+        // document never lacks its vector. Inserting a vector for an id that
+        // already has one *replaces* it, so the previous embedding is copied
+        // out first: if the commit then fails, the documents roll back and
+        // these restore the index to match them. Without that, a failed
+        // upsert would leave the old text paired with the new embedding, and
+        // the old embedding would be gone for good.
+        let mut undo: Vec<(String, Option<Vec<f32>>)> = Vec::new();
         if let Some(engine) = &self.vectors {
             let items: Vec<(&str, &[f32])> = prepared
                 .iter()
                 .filter_map(|(doc, ..)| doc.vector.as_deref().map(|v| (doc.id.as_str(), v)))
                 .collect();
+            for (id, _) in &items {
+                undo.push(((*id).to_string(), engine.get(id).ok()));
+            }
             let written = engine.insert_many(&items).and_then(|()| {
                 if self.sync_on_write {
                     engine.flush()
@@ -973,11 +1226,15 @@ impl Collection {
             });
             if let Err(e) = written {
                 let _ = self.db.rollback(txn);
+                Self::undo_vectors(engine, &undo);
                 return Err(e);
             }
         }
         if let Err(e) = self.db.commit(txn) {
             let _ = self.db.rollback(txn);
+            if let Some(engine) = &self.vectors {
+                Self::undo_vectors(engine, &undo);
+            }
             return Err(e);
         }
         // Only ids whose *final* version in this batch has no vector.
@@ -994,12 +1251,31 @@ impl Collection {
         Ok(())
     }
 
+    /// Puts the vector index back the way it was after a failed upsert:
+    /// restores what each id held before, or removes it if it held nothing.
+    ///
+    /// Best effort — the upsert is already failing, and the next open (or
+    /// [`Collection::verify`]) reports anything left inconsistent.
+    fn undo_vectors(engine: &VectorEngine, undo: &[(String, Option<Vec<f32>>)]) {
+        for (id, previous) in undo {
+            match previous {
+                Some(vector) => {
+                    let _ = engine.insert(id, vector);
+                }
+                None => {
+                    let _ = engine.remove(id);
+                }
+            }
+        }
+        let _ = engine.flush();
+    }
+
     /// Removes a document's index entries and counts (not its record).
     fn unindex(&self, txn: u64, id: &str, old: &DocRecord, counters: &mut Counters) -> Result<()> {
         let idb = id.as_bytes();
         // The stored metadata passed `flatten` when it was written, so this
         // reproduces exactly the keys that were indexed.
-        let flat = filter::flatten(&parse_metadata(&old.metadata), MAX_INDEXED_VALUES)?;
+        let flat = filter::flatten(&parse_metadata(&old.metadata)?, MAX_INDEXED_VALUES)?;
         for k in index_keys(&flat, idb) {
             remove_if_present(&self.db, txn, &k)?;
         }
@@ -1073,10 +1349,15 @@ impl Collection {
         if req.k > MAX_K {
             return Err(Error::invalid(format!("k must be at most {MAX_K}")));
         }
-        if let Some(l) = req.mmr
-            && !(0.0..=1.0).contains(&l)
-        {
-            return Err(Error::invalid("mmr lambda must be in [0, 1]"));
+        if let Some(l) = req.mmr {
+            if !(0.0..=1.0).contains(&l) {
+                return Err(Error::invalid("mmr lambda must be in [0, 1]"));
+            }
+            if self.vectors.is_none() {
+                return Err(Error::invalid(
+                    "mmr needs embeddings; this collection has no vectors",
+                ));
+            }
         }
         if let Some(v) = &req.vector {
             if self.vectors.is_none() {
@@ -1085,6 +1366,11 @@ impl Collection {
             crate::vector::distance::validate_vector(v, self.config.dim)?;
         }
         let text_query = req.text.as_deref().filter(|t| !t.trim().is_empty());
+        if text_query.is_some() && !self.config.text_index {
+            return Err(Error::invalid(
+                "this collection has no text index (it was created with text_index: false)",
+            ));
+        }
         let fetch = req
             .candidates
             .unwrap_or(req.k * 4)
@@ -1157,24 +1443,29 @@ impl Collection {
             scored.retain(|h| h.score >= min);
         }
 
-        for hit in &mut scored {
-            if (req.include_text || req.include_metadata)
-                && let Some(record) = self.record_in(txn, &hit.id)?
-            {
-                if req.include_text {
-                    hit.text = record.text;
-                }
-                if req.include_metadata {
-                    hit.metadata = Some(parse_metadata(&record.metadata));
-                }
+        // Hydrate, and drop anything whose document is not there: a hit that
+        // `get` and `list` would both deny is worse than one result fewer.
+        // (Recovery removes such vectors; this keeps the answer honest if one
+        // survives, e.g. because the index outran a rolled-back write.)
+        let mut out = Vec::with_capacity(scored.len());
+        for mut hit in scored {
+            let Some(record) = self.record_in(txn, &hit.id)? else {
+                continue;
+            };
+            if req.include_metadata {
+                hit.metadata = Some(parse_metadata(&record.metadata)?);
+            }
+            if req.include_text {
+                hit.text = record.text;
             }
             if req.include_vector
                 && let Some(engine) = &self.vectors
             {
                 hit.vector = engine.get(&hit.id).ok();
             }
+            out.push(hit);
         }
-        Ok(scored)
+        Ok(out)
     }
 
     /// BM25 over the inverted index: the best `n` `(id, score)` pairs.
@@ -1219,6 +1510,133 @@ impl Collection {
         ranked.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         ranked.truncate(n);
         Ok(ranked)
+    }
+
+    /// Subscribes to committed document changes: one [`DocumentChange`] per
+    /// document written or removed, in commit order.
+    ///
+    /// Only documents are reported, not the metadata index or postings that
+    /// back them, so a UI can rebuild a list from ids alone. Delivery follows
+    /// the rules in [`crate::watch`]: committed changes only, oldest dropped
+    /// when a consumer falls behind.
+    #[must_use]
+    pub fn watch(&self, options: WatchOptions) -> DocumentWatcher {
+        DocumentWatcher {
+            inner: self.db.watch(&[DOC], options),
+        }
+    }
+
+    /// Checks the collection and reports what it found, without changing it.
+    ///
+    /// Verifies the document store structurally (every key ordered, every
+    /// page reachable and checksummed) and cross-checks the documents against
+    /// the vector index.
+    ///
+    /// The document counts cover everything committed, but [`TreeReport`]
+    /// describes the *checkpointed* pages only — recent commits still live in
+    /// the log until a [`Collection::flush`], so a freshly written collection
+    /// reports an empty tree and that is not a fault.
+    ///
+    /// [`TreeReport`]: crate::TreeReport
+    pub fn verify(&self) -> Result<CollectionReport> {
+        let tree = self.db.check()?;
+        let txn = self.db.begin(true)?;
+        let ids = self.all_ids(txn);
+        let counters = self.counters(txn);
+        let _ = self.db.rollback(txn);
+        let ids = ids?;
+        let documents = counters?.docs;
+
+        let mut orphan_vectors = 0;
+        let mut missing_vectors = 0;
+        let mut vectors = 0;
+        let mut dead_vectors = 0;
+        if let Some(engine) = &self.vectors {
+            for id in engine.ids() {
+                if ids.contains(&id) {
+                    vectors += 1;
+                } else {
+                    orphan_vectors += 1;
+                }
+            }
+            for id in &ids {
+                if let Some(record) = self.record_auto(id)?
+                    && record.has_vector
+                    && !engine.contains(id)
+                {
+                    missing_vectors += 1;
+                }
+            }
+            let stats = engine.stats();
+            dead_vectors = stats.deleted as u64;
+        }
+        Ok(CollectionReport {
+            documents,
+            vectors,
+            orphan_vectors,
+            missing_vectors,
+            dead_vectors,
+            tree,
+        })
+    }
+
+    /// Reclaims space: drops orphaned and tombstoned vectors and rebuilds the
+    /// document store without its free pages.
+    ///
+    /// Returns the number of vector records reclaimed. Writes are excluded
+    /// for the duration, and a crash mid-compaction leaves the previous
+    /// contents intact.
+    pub fn compact(&self) -> Result<usize> {
+        let _turn = self.db.serialize_writes();
+        let mut reclaimed = 0;
+        if let Some(engine) = &self.vectors {
+            // An orphan is a vector whose document never committed (or whose
+            // delete committed first); tombstoning makes `compact` drop it.
+            let txn = self.db.begin(true)?;
+            let ids = self.all_ids(txn);
+            let _ = self.db.rollback(txn);
+            let ids = ids?;
+            for id in engine.ids() {
+                if !ids.contains(&id) {
+                    engine.remove(&id)?;
+                }
+            }
+            reclaimed = engine.compact()?;
+            engine.flush()?;
+        }
+        self.db.compact()?;
+        Ok(reclaimed)
+    }
+
+    /// Writes a consistent, compacted copy of the collection into `dir`.
+    ///
+    /// The copy is a complete collection directory: open it with
+    /// [`Collection::open`]. Writes are excluded while it is taken, so the
+    /// documents, their metadata index and the vectors all belong to the same
+    /// moment. Restoring is a file-level operation: close the collection,
+    /// replace its directory with the backup, and open it again.
+    pub fn backup(&self, dir: impl AsRef<Path>) -> Result<()> {
+        let dir = dir.as_ref();
+        if dir == self.dir {
+            return Err(Error::invalid("cannot back a collection up onto itself"));
+        }
+        let _turn = self.db.serialize_writes();
+        std::fs::create_dir_all(dir)?;
+        self.db.backup(dir.join("docs.pdb"))?;
+        if let Some(engine) = &self.vectors {
+            // Sync and snapshot first, so the copied pair is consistent.
+            engine.save(None)?;
+            let vectors = self.dir.join("vectors.pvec");
+            std::fs::copy(&vectors, dir.join("vectors.pvec"))?;
+            let snapshot = VectorEngine::snapshot_path(&vectors);
+            if snapshot.exists() {
+                std::fs::copy(&snapshot, dir.join("vectors.pvec.hnsw"))?;
+            }
+        }
+        // The copy has never been open, so it carries no unclean marker.
+        let copy = Database::open(dir.join("docs.pdb"), Options::default())?;
+        let _ = copy.delete_auto(OPEN_KEY);
+        Ok(())
     }
 
     /// Syncs the vectors and checkpoints the documents.
@@ -1305,12 +1723,17 @@ fn remove_if_present(db: &Database, txn: u64, key: &[u8]) -> Result<()> {
     }
 }
 
-fn parse_metadata(text: &str) -> Value {
+/// Decodes a stored metadata string.
+///
+/// A string that does not parse is [`Error::Corruption`], not `null`: the
+/// index entries for a document are re-derived from this value when it is
+/// replaced or deleted, so silently reading it as `null` would leave every
+/// one of them behind and inflate `count(filter)` for good.
+fn parse_metadata(text: &str) -> Result<Value> {
     if text.is_empty() {
-        Value::Null
-    } else {
-        serde_json::from_str(text).unwrap_or(Value::Null)
+        return Ok(Value::Null);
     }
+    serde_json::from_str(text).map_err(|e| Error::corrupt(format!("document metadata: {e}")))
 }
 
 fn blank_hit(id: String, score: f32) -> Hit {
@@ -1370,7 +1793,14 @@ fn fuse(
                 }
             }
             Fusion::Weighted { alpha } => {
-                let alpha = alpha.clamp(0.0, 1.0);
+                // When one retriever found nothing, its weight would zero
+                // every score and leave the results in id order; fall back to
+                // the side that did find something.
+                let alpha = match (vector.is_empty(), text.is_empty()) {
+                    (false, true) => 1.0,
+                    (true, false) => 0.0,
+                    _ => alpha.clamp(0.0, 1.0),
+                };
                 let (vmin, vmax) = min_max(vector.iter().map(|(_, _, s)| *s));
                 let (tmin, tmax) = min_max(text.iter().map(|(_, s)| *s));
                 for h in hits.values_mut() {
