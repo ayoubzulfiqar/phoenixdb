@@ -767,6 +767,23 @@ impl VectorEngine {
         Ok(())
     }
 
+    /// Copies the index — vectors and graph snapshot — to `destination`.
+    ///
+    /// Writes are excluded for the duration, so the pair is consistent. The
+    /// copy is read through this engine's own handle: it holds an exclusive
+    /// lock on the file, which on Windows blocks any other handle from
+    /// reading it.
+    pub fn copy_to(&self, destination: impl AsRef<Path>) -> Result<()> {
+        let destination = destination.as_ref();
+        let mut inner = self.inner.write();
+        inner.store.sync()?;
+        inner.store.copy_to(destination)?;
+        // The graph is written straight to its place beside the copy rather
+        // than copied, so the pair always matches.
+        let snapshot = Self::snapshot_path(destination);
+        self.save_locked(&mut inner, Some(&snapshot))
+    }
+
     /// Syncs the vector file without writing a snapshot.
     pub fn flush(&self) -> Result<()> {
         self.inner.write().store.sync()
