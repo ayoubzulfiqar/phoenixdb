@@ -637,3 +637,344 @@ fn search_requests_parse_from_json() {
         assert!(SearchRequest::from_json(&bad).is_err(), "{bad}");
     }
 }
+
+// ---------------------------------------------------------------------------
+// Regression tests for the audit findings.
+// ---------------------------------------------------------------------------
+
+fn open_with(dir: &Path, options: CollectionOptions) -> Collection {
+    Collection::open(dir, options).unwrap()
+}
+
+#[test]
+fn a_collection_without_a_text_index_keeps_honest_counters() {
+    let dir = tempfile::tempdir().unwrap();
+    let c = open_with(
+        dir.path(),
+        CollectionOptions {
+            dim: 0,
+            text_index: false,
+            sync_on_write: false,
+            ..CollectionOptions::default()
+        },
+    );
+    c.upsert(&[doc("a", "x", json!({}), None)]).unwrap();
+    c.upsert(&[doc("a", "y", json!({}), None)]).unwrap();
+    c.upsert(&[doc("a", "z", json!({}), None)]).unwrap();
+    let stats = c.stats().unwrap();
+    assert_eq!(stats.documents, 1);
+    assert_eq!(
+        stats.text_documents, 0,
+        "nothing is indexed, so nothing is counted"
+    );
+    assert!(!stats.text_index, "stats report the layout in force");
+
+    c.delete(&["a"]).unwrap();
+    assert_eq!(c.stats().unwrap().text_documents, 0);
+
+    // A text query against a collection that cannot answer it is an error,
+    // not an empty result.
+    let err = c
+        .search(&SearchRequest {
+            text: Some("x".into()),
+            ..SearchRequest::new(5)
+        })
+        .unwrap_err();
+    assert!(err.to_string().contains("no text index"), "{err}");
+}
+
+#[test]
+fn reopening_with_a_different_text_index_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let _c = open_with(
+            dir.path(),
+            CollectionOptions {
+                dim: 2,
+                text_index: false,
+                ..CollectionOptions::default()
+            },
+        );
+    }
+    let err = Collection::open(
+        dir.path(),
+        CollectionOptions {
+            dim: 2,
+            text_index: true,
+            ..CollectionOptions::default()
+        },
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("without a text index"), "{err}");
+    // Adopting the stored layout still works.
+    let adopted = Collection::open(dir.path(), CollectionOptions::default()).unwrap();
+    assert!(!adopted.stats().unwrap().text_index);
+}
+
+#[test]
+fn a_failed_upsert_restores_the_previous_embeddings() {
+    let dir = tempfile::tempdir().unwrap();
+    let c = open(dir.path(), 2);
+    c.upsert(&[
+        doc("keep", "t", json!({}), Some(vec![1.0, 0.0])),
+        doc("gone", "t", json!({}), Some(vec![0.0, 1.0])),
+    ])
+    .unwrap();
+
+    // Exactly what `upsert` does when the commit fails after the vectors are
+    // written: the old embedding is put back, and an id that had none is
+    // removed again.
+    let engine = c.vectors.as_ref().unwrap();
+    let undo = vec![
+        ("keep".to_string(), engine.get("keep").ok()),
+        ("fresh".to_string(), None),
+    ];
+    engine.insert("keep", &[0.5, 0.5]).unwrap();
+    engine.insert("fresh", &[0.1, 0.9]).unwrap();
+    Collection::undo_vectors(engine, &undo);
+
+    assert_eq!(engine.get("keep").unwrap(), vec![1.0, 0.0], "restored");
+    assert!(!engine.contains("fresh"), "a new vector is withdrawn");
+    assert!(engine.contains("gone"), "untouched ids are left alone");
+}
+
+#[test]
+fn a_vector_the_documents_disowned_is_never_reported() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let c = open(dir.path(), 2);
+        c.upsert(&[doc("real", "t", json!({}), Some(vec![1.0, 0.0]))])
+            .unwrap();
+        // A vector for an id no document claims: what a crash between the
+        // vector write and the commit leaves behind.
+        c.inject_orphan_vector("ghost", &[0.0, 1.0]).unwrap();
+
+        // Even before recovery, a search must not report it: `get` and `list`
+        // would both deny it exists.
+        let hits = c
+            .search(&SearchRequest {
+                vector: Some(vec![0.0, 1.0]),
+                ..SearchRequest::new(5)
+            })
+            .unwrap();
+        assert_eq!(ids(&hits), ["real"], "{hits:?}");
+        assert!(c.get("ghost", false).unwrap().is_none());
+        c.flush().unwrap();
+        c.simulate_crash();
+    }
+    let c = open(dir.path(), 2);
+    assert_eq!(c.stats().unwrap().repaired, 1);
+    assert_eq!(c.verify().unwrap().orphan_vectors, 0, "recovery removed it");
+}
+
+#[test]
+fn an_embedding_a_document_claims_but_lost_is_recorded_as_absent() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let c = open(dir.path(), 2);
+        c.upsert(&[doc("a", "t", json!({}), Some(vec![1.0, 0.0]))])
+            .unwrap();
+        // The vector file loses its tail while the document survives.
+        let engine = c.vectors.as_ref().unwrap();
+        engine.remove("a").unwrap();
+        engine.flush().unwrap();
+        c.simulate_crash();
+    }
+    let c = open(dir.path(), 2);
+    assert_eq!(c.stats().unwrap().repaired, 1);
+    let doc = c.get("a", true).unwrap().unwrap();
+    assert!(doc.vector.is_none());
+    let report = c.verify().unwrap();
+    assert_eq!(
+        report.missing_vectors, 0,
+        "the record now says what is true: {report:?}"
+    );
+    assert_eq!(report.documents, 1);
+}
+
+#[test]
+fn corrupt_stored_metadata_is_reported_not_swallowed() {
+    let dir = tempfile::tempdir().unwrap();
+    let c = open(dir.path(), 0);
+    c.upsert(&[doc("a", "t", json!({"k": 1}), None)]).unwrap();
+
+    // Overwrite the record with metadata that is not JSON.
+    let broken = DocRecord {
+        metadata: "{not json".to_string(),
+        text: Some("t".into()),
+        has_vector: false,
+        text_len: 1,
+    };
+    c.db.put_auto(&key(DOC, &[b"a"]), &bincode::serialize(&broken).unwrap())
+        .unwrap();
+
+    let err = c.get("a", false).unwrap_err();
+    assert!(err.to_string().contains("metadata"), "{err}");
+    assert!(c.list(None, 0, None).is_err(), "list reports it too");
+}
+
+#[test]
+fn an_empty_conjunction_matches_everything() {
+    let dir = tempfile::tempdir().unwrap();
+    let c = open(dir.path(), 0);
+    c.upsert(&[
+        doc("a", "x", json!({}), None),
+        doc("b", "y", json!({"k": 1}), None),
+    ])
+    .unwrap();
+    let empty = Filter::And(Vec::new());
+    assert!(empty.matches(&json!({})), "the reference says true");
+    assert_eq!(
+        c.count(Some(&empty)).unwrap(),
+        2,
+        "and so must the index path"
+    );
+    assert_eq!(c.count(Some(&Filter::All)).unwrap(), c.count(None).unwrap());
+}
+
+#[test]
+fn a_truncated_index_key_is_corruption_not_a_panic() {
+    // Each tag claims a fixed width; a key cut short must report `None`.
+    assert_eq!(encoded_len(&[0x03, 1, 2]), None);
+    assert_eq!(encoded_len(&[0x02]), None);
+    assert_eq!(encoded_len(&[0x01]), Some(1));
+    assert_eq!(encoded_len(&[0x04, b'a', 0x00, 0x01]), Some(4));
+    assert_eq!(encoded_len(&[0x04, b'a']), None, "unterminated string");
+    assert_eq!(encoded_len(&[]), None);
+}
+
+#[test]
+fn mmr_without_embeddings_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let c = open(dir.path(), 0);
+    c.upsert(&[doc("a", "hello", json!({}), None)]).unwrap();
+    let err = c
+        .search(&SearchRequest {
+            text: Some("hello".into()),
+            mmr: Some(0.5),
+            ..SearchRequest::new(3)
+        })
+        .unwrap_err();
+    assert!(err.to_string().contains("mmr needs embeddings"), "{err}");
+}
+
+#[test]
+fn listing_pages_in_both_directions() {
+    let dir = tempfile::tempdir().unwrap();
+    let c = open(dir.path(), 0);
+    c.upsert(
+        &(0..10)
+            .map(|i| doc(&format!("d{i}"), "x", json!({"even": i % 2 == 0}), None))
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
+
+    let newest = c
+        .list_with(&ListOptions {
+            limit: 3,
+            reverse: true,
+            ..ListOptions::default()
+        })
+        .unwrap();
+    assert_eq!(
+        newest.iter().map(|d| d.id.as_str()).collect::<Vec<_>>(),
+        ["d9", "d8", "d7"]
+    );
+
+    // The cursor is exclusive in both directions.
+    let next = c
+        .list_with(&ListOptions {
+            limit: 3,
+            reverse: true,
+            after: Some("d7"),
+            ..ListOptions::default()
+        })
+        .unwrap();
+    assert_eq!(
+        next.iter().map(|d| d.id.as_str()).collect::<Vec<_>>(),
+        ["d6", "d5", "d4"]
+    );
+
+    // Filtered, reversed.
+    let evens = c
+        .list_with(&ListOptions {
+            filter: Some(&filter(json!({"even": true}))),
+            limit: 2,
+            reverse: true,
+            ..ListOptions::default()
+        })
+        .unwrap();
+    assert_eq!(
+        evens.iter().map(|d| d.id.as_str()).collect::<Vec<_>>(),
+        ["d8", "d6"]
+    );
+
+    // Paging forward still walks every document exactly once.
+    let mut seen = Vec::new();
+    let mut after: Option<String> = None;
+    loop {
+        let page = c.list(None, 4, after.as_deref()).unwrap();
+        if page.is_empty() {
+            break;
+        }
+        after = Some(page.last().unwrap().id.clone());
+        seen.extend(page.into_iter().map(|d| d.id));
+    }
+    assert_eq!(seen.len(), 10);
+    assert_eq!(seen, {
+        let mut sorted = seen.clone();
+        sorted.sort();
+        sorted
+    });
+}
+
+#[test]
+fn verify_compact_and_backup_report_and_reclaim() {
+    let dir = tempfile::tempdir().unwrap();
+    let c = open(dir.path(), 2);
+    c.upsert(
+        &(0..20)
+            .map(|i| {
+                doc(
+                    &format!("d{i:02}"),
+                    "text here",
+                    json!({"i": i}),
+                    Some(vec![i as f32, 1.0]),
+                )
+            })
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
+    c.delete(&["d00", "d01", "d02"]).unwrap();
+
+    c.flush().unwrap(); // the tree report covers checkpointed pages
+    let report = c.verify().unwrap();
+    assert_eq!(report.documents, 17);
+    assert_eq!(report.vectors, 17);
+    assert_eq!(report.orphan_vectors, 0);
+    assert_eq!(report.missing_vectors, 0);
+    assert_eq!(report.dead_vectors, 3, "deletes leave tombstones");
+    assert!(report.tree.keys > 0);
+
+    assert_eq!(c.compact().unwrap(), 3, "tombstones reclaimed");
+    assert_eq!(c.verify().unwrap().dead_vectors, 0);
+    assert_eq!(c.count(None).unwrap(), 17, "and nothing else changed");
+
+    let backup = dir.path().join("copy");
+    c.backup(&backup).unwrap();
+    assert!(c.backup(dir.path()).is_err(), "not onto itself");
+    let restored = Collection::open(&backup, CollectionOptions::default()).unwrap();
+    assert_eq!(restored.count(None).unwrap(), 17);
+    assert_eq!(restored.stats().unwrap().repaired, 0, "a clean copy");
+    assert_eq!(
+        restored
+            .search(&SearchRequest {
+                vector: Some(vec![5.0, 1.0]),
+                ..SearchRequest::new(1)
+            })
+            .unwrap()[0]
+            .id,
+        "d05",
+        "the vectors came along"
+    );
+}
