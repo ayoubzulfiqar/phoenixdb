@@ -99,8 +99,12 @@ export 'src/collection.dart'
         CollectionQuery,
         SearchHit,
         CollectionStats,
+        CollectionReport,
+        CollectionWatcher,
         DocumentStore;
 export 'src/collection_isolate.dart' show AsyncPhoenixCollection;
+export 'src/watch.dart'
+    show Change, ChangeKind, ChangeWatcher, CollectionChange;
 export 'src/isolate_worker.dart' show AsyncPhoenixDB;
 export 'src/kv.dart'
     show
