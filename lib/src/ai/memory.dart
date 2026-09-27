@@ -3,16 +3,23 @@
 library;
 
 import 'dart:convert';
+import 'dart:math';
 
 import '../collection.dart';
 import 'chat.dart';
 import 'embedder.dart';
+import 'http.dart' show LlmException;
 
 /// Persists a conversation and assembles its context for the next turn.
 ///
 /// Every message is stored with its embedding, so besides the most recent
 /// turns [context] can recall older turns relevant to the new question —
 /// the conversation can outgrow any context window without forgetting.
+///
+/// Messages are keyed by a monotonic timestamp rather than a position, so two
+/// handles on one conversation (a UI isolate and a background job, say) can
+/// both append without overwriting each other, and deleting messages never
+/// makes a later append collide with a surviving one.
 class ConversationMemory {
   /// Where messages live (may be shared with other data; messages are
   /// tagged with their conversation).
@@ -24,13 +31,19 @@ class ConversationMemory {
   /// Conversation id.
   final String conversationId;
 
-  int _next;
+  /// Messages this handle has seen: the count when it opened plus what it has
+  /// appended. Another handle's appends are not reflected; [count] asks the
+  /// store.
+  int length;
+
+  final Random _random = Random();
+  int _lastStamp = 0;
 
   ConversationMemory._(
     this.store,
     this.embedder,
     this.conversationId,
-    this._next,
+    this.length,
   );
 
   /// Opens (or starts) conversation [conversationId].
@@ -53,8 +66,8 @@ class ConversationMemory {
         'embedder produces ${embedder.dimensions}',
       );
     }
-    final count = await store.count(filter: _scopeOf(conversationId));
-    return ConversationMemory._(store, embedder, conversationId, count);
+    final existing = await store.count(filter: _scopeOf(conversationId));
+    return ConversationMemory._(store, embedder, conversationId, existing);
   }
 
   static Filter _scopeOf(String conversationId) =>
@@ -62,32 +75,61 @@ class ConversationMemory {
 
   Filter get _scope => _scopeOf(conversationId);
 
-  /// Messages stored so far.
-  int get length => _next;
+  /// Messages stored in this conversation right now, from the store.
+  Future<int> count() => store.count(filter: _scope);
 
-  // Zero-padded sequence numbers make id order chronological order.
-  String _id(int seq) => '$conversationId/${seq.toString().padLeft(10, '0')}';
+  /// A strictly increasing stamp, wide enough to sort as text.
+  ///
+  /// Microseconds since the epoch, forced to advance even when several
+  /// messages are appended inside one microsecond.
+  int _stamp() {
+    final now = DateTime.now().microsecondsSinceEpoch;
+    _lastStamp = now > _lastStamp ? now : _lastStamp + 1;
+    return _lastStamp;
+  }
 
-  static ChatMessage _message(Document d) => ChatMessage(
-    ChatRole.values.byName(d.metadata!['role']! as String),
-    d.text ?? '',
-  );
+  /// Zero-padded so id order is chronological order, with a random tail so two
+  /// handles writing in the same microsecond cannot land on one id.
+  String _id(int stamp) {
+    final tail = _random.nextInt(0x10000).toRadixString(16).padLeft(4, '0');
+    return '$conversationId/${stamp.toString().padLeft(19, '0')}-$tail';
+  }
+
+  static ChatMessage _message(Document d) {
+    final role = d.metadata?['role'];
+    return ChatMessage(
+      role is String ? ChatRole.values.byName(role) : ChatRole.user,
+      d.text ?? '',
+    );
+  }
+
+  static int _stampOf(Document d) {
+    final seq = d.metadata?['seq'];
+    return seq is num ? seq.toInt() : 0;
+  }
 
   /// Appends messages to the conversation.
   Future<void> addAll(List<ChatMessage> messages) async {
     if (messages.isEmpty) return;
     final vectors = await embedder.embed([for (final m in messages) m.content]);
+    if (vectors.length != messages.length) {
+      throw LlmException(
+        'the embedder returned ${vectors.length} vectors for '
+        '${messages.length} messages',
+      );
+    }
     final docs = <Document>[];
     for (var i = 0; i < messages.length; i++) {
+      final stamp = _stamp();
       docs.add(
         Document(
-          _id(_next + i),
+          _id(stamp),
           text: messages[i].content,
           metadata: {
             'kind': 'memory',
             'conversation': conversationId,
             'role': messages[i].role.name,
-            'seq': _next + i,
+            'seq': stamp,
             'at': DateTime.now().millisecondsSinceEpoch,
           },
           vector: vectors[i],
@@ -95,7 +137,7 @@ class ConversationMemory {
       );
     }
     await store.upsert(docs);
-    _next += messages.length;
+    length += messages.length;
   }
 
   /// Appends one message.
@@ -103,11 +145,15 @@ class ConversationMemory {
 
   /// The last [n] messages, oldest first.
   Future<List<ChatMessage>> recent([int n = 10]) async {
-    if (n <= 0 || _next == 0) return const [];
-    final docs = await store.list(
-      filter: _scope & Filter.gte('seq', _next - n),
+    if (n <= 0) return const [];
+    // Newest-first with a limit, so the cost is the page rather than the
+    // whole conversation.
+    final newest = await store.list(
+      filter: _scope,
+      limit: n,
+      newestFirst: true,
     );
-    return [for (final d in docs) _message(d)];
+    return [for (final d in newest.reversed) _message(d)];
   }
 
   /// Up to [k] earlier messages most relevant to [query], oldest first,
@@ -117,28 +163,39 @@ class ConversationMemory {
     int k = 4,
     int skipRecent = 0,
   }) async {
-    final cutoff = _next - skipRecent;
-    if (k <= 0 || cutoff <= 0) return const [];
+    if (k <= 0) return const [];
+    var scope = _scope;
+    if (skipRecent > 0) {
+      final newest = await store.list(
+        filter: _scope,
+        limit: skipRecent,
+        newestFirst: true,
+      );
+      if (newest.length < skipRecent) return const [];
+      // Everything strictly older than the oldest message `recent` will show.
+      scope = scope & Filter.lt('seq', _stampOf(newest.last));
+    }
     final hits = [
       ...await store.query(
         CollectionQuery(
           vector: await embedder.embedOne(query, purpose: EmbedPurpose.query),
           text: query,
-          filter: _scope & Filter.lt('seq', cutoff),
+          filter: scope,
           k: k,
         ),
       ),
     ];
-    hits.sort(
-      (a, b) =>
-          (a.metadata!['seq']! as num).compareTo(b.metadata!['seq']! as num),
-    );
+    hits.sort((a, b) {
+      final x = a.metadata?['seq'];
+      final y = b.metadata?['seq'];
+      return (x is num ? x : 0).compareTo(y is num ? y : 0);
+    });
     return [
       for (final h in hits)
-        ChatMessage(
-          ChatRole.values.byName(h.metadata!['role']! as String),
-          h.text ?? '',
-        ),
+        ChatMessage(switch (h.metadata?['role']) {
+          final String role => ChatRole.values.byName(role),
+          _ => ChatRole.user,
+        }, h.text ?? ''),
     ];
   }
 
@@ -165,8 +222,14 @@ class ConversationMemory {
   /// Deletes the conversation; returns how many messages were removed.
   Future<int> clear() async {
     final docs = await store.list(filter: _scope);
-    _next = 0;
-    if (docs.isEmpty) return 0;
-    return store.delete([for (final d in docs) d.id]);
+    if (docs.isEmpty) {
+      length = 0;
+      return 0;
+    }
+    final removed = await store.delete([for (final d in docs) d.id]);
+    // Only after the delete succeeded: believing the conversation empty while
+    // its messages survive is how a later append overwrites them.
+    length = 0;
+    return removed;
   }
 }
