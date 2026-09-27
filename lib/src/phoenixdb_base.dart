@@ -13,6 +13,8 @@ import 'dart:typed_data';
 import 'package:ffi/ffi.dart';
 
 import 'bindings.dart';
+import 'native/watch_bindings.dart';
+import 'watch.dart';
 import 'kv.dart';
 import 'sql_result.dart';
 
@@ -613,6 +615,40 @@ class PhoenixDatabase implements Finalizable {
   }
 
   /// Metrics in the Prometheus text exposition format.
+  /// Subscribes to committed changes to keys starting with [prefix].
+  ///
+  /// A null or empty prefix watches the whole database. The returned
+  /// [ChangeWatcher] buffers up to [capacity] changes and blocks in
+  /// [ChangeWatcher.poll] until one arrives — so on a UI isolate use
+  /// [AsyncPhoenixDB.changes] instead, which polls on its own isolate and
+  /// gives you a `Stream`.
+  ///
+  /// Set [values] to receive each written value along with its key.
+  ///
+  /// ```dart
+  /// final watcher = db.watch(prefix: utf8Key('user:'));
+  /// db.insert(utf8Key('user:1'), utf8Value('ada'));
+  /// print(watcher.poll().single.keyString);   // user:1
+  /// watcher.close();
+  /// ```
+  ChangeWatcher watch({
+    Uint8List? prefix,
+    int capacity = 1024,
+    bool values = false,
+  }) {
+    if (capacity <= 0) {
+      throw ArgumentError.value(capacity, 'capacity', 'must be positive');
+    }
+    _ensureOpen();
+    return ChangeWatcher.openOnDatabase(
+      PhoenixWatchBindings.from(_b),
+      _owner.pointer,
+      prefix: prefix,
+      capacity: capacity,
+      values: values,
+    );
+  }
+
   String metricsPrometheus() => _takeString(
     (out) => _b.metricsText(_owner.pointer, 1, out),
     'metricsPrometheus',
