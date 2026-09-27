@@ -330,8 +330,12 @@ pub unsafe extern "C" fn phoenix_vector_free(handle: *mut PhoenixVectorHandle) {
             let _registry = VECTOR_REGISTRY.lock();
             drop(engine);
         }
-        // SAFETY: the handle box itself is freed exactly once, here.
-        drop(unsafe { Box::from_raw(handle) });
+        // The handle struct itself is deliberately *not* freed: it stays
+        // allocated as a poisoned tombstone. Freeing it would let the
+        // allocator hand the same address to the next open, and a caller's
+        // second close would then read a live handle's tag and release it —
+        // a double free of someone else's handle. A tombstone costs a few
+        // bytes per handle ever opened and makes a double close safe.
         Ok(())
     });
 }
