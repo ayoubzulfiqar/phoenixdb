@@ -117,7 +117,7 @@ impl LeafChainGuard {
 }
 
 /// Result of a full structural check, see [`BTree::check`].
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
 pub struct TreeReport {
     /// Levels from the root to the leaves (1 for a lone root leaf).
     pub depth: u32,
