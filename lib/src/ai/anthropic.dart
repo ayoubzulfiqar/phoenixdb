@@ -75,7 +75,8 @@ class AnthropicChatModel implements ChatModel {
   /// API root, for proxies and gateways.
   final Uri baseUrl;
 
-  /// Extra request headers (e.g. additional `anthropic-beta` flags).
+  /// Extra request headers (e.g. additional `anthropic-beta` flags). Header
+  /// names are matched case-insensitively, as HTTP requires.
   final Map<String, String> headers;
 
   final HttpTransport _http;
@@ -118,10 +119,13 @@ class AnthropicChatModel implements ChatModel {
   Uri get _endpoint => joinUrl(baseUrl, 'v1/messages');
 
   Map<String, String> get _headers {
-    final betas = [
-      if (_fallbacks) 'server-side-fallback-2026-07-01',
-      ?headers['anthropic-beta'],
-    ];
+    // HTTP header names are case-insensitive, so a caller's `Anthropic-Beta`
+    // must be merged rather than dropped.
+    String? caller;
+    for (final entry in headers.entries) {
+      if (entry.key.toLowerCase() == 'anthropic-beta') caller = entry.value;
+    }
+    final betas = [if (_fallbacks) 'server-side-fallback-2026-07-01', ?caller];
     return {
       ...headers,
       'x-api-key': apiKey,
@@ -209,6 +213,7 @@ class AnthropicChatModel implements ChatModel {
   }) async* {
     String? stop;
     Object? details;
+    var finished = false;
     final events = _http.postSse(
       _endpoint,
       _headers,
@@ -246,10 +251,23 @@ class AnthropicChatModel implements ChatModel {
             errorType: type,
           );
         case 'message_stop':
-          break;
+          // The answer is complete. Stop reading rather than waiting for the
+          // server to close the connection: a gateway that keeps it open
+          // would otherwise stall until the idle timeout and then report an
+          // error after a perfectly good answer.
+          finished = true;
       }
+      if (finished) break;
     }
     if (stop == 'refusal') throw _refusal(details);
+    if (!finished) {
+      // No `message_stop` means the connection ended mid-answer. Reporting it
+      // is the only way a caller can tell a short answer from a cut one.
+      throw const LlmException(
+        'the response stream ended before Claude finished; '
+        'discard the partial text and retry',
+      );
+    }
   }
 
   @override
