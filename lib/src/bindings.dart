@@ -563,7 +563,7 @@ typedef SpansJsonDart =
 /// compact, stats, the structural check, metrics text and tracing. Each bump
 /// is additive, but the guard is exact, so a stale native library is reported
 /// at load time rather than as a missing-symbol crash on first use.
-const int kExpectedAbiVersion = 4;
+const int kExpectedAbiVersion = 5;
 
 /// Thrown when the native library cannot be located or is incompatible.
 class PhoenixLoadException implements Exception {
