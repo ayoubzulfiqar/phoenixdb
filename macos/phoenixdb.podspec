@@ -6,7 +6,7 @@
 #
 Pod::Spec.new do |s|
   s.name             = 'phoenixdb'
-  s.version          = '4.1.0'
+  s.version          = '4.1.1'
   s.summary          = 'ACID-compliant embedded database engine (Rust + dart:ffi).'
   s.description      = <<-DESC
 B+Tree storage with MVCC snapshot isolation, write-ahead log and
