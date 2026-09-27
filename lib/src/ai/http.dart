@@ -86,6 +86,15 @@ class SseEvent {
 }
 
 /// Parses a byte stream of `text/event-stream` into events.
+///
+/// An event is dispatched on the blank line that ends it, as the SSE spec
+/// requires. A trailing block with no blank line is **discarded**: it is
+/// exactly what a connection cut mid-frame leaves behind, and treating it as
+/// complete would turn a truncated response into a plausible short one.
+/// Callers detect truncation by the absence of the provider's terminal event.
+///
+/// Malformed UTF-8 is replaced rather than thrown, so a byte split across two
+/// chunks cannot abort a stream.
 Stream<SseEvent> parseSse(Stream<List<int>> bytes) async* {
   String? event;
   final data = StringBuffer();
@@ -94,7 +103,7 @@ Stream<SseEvent> parseSse(Stream<List<int>> bytes) async* {
   // against the stream's runtime element type, which rejects a
   // `Stream<Uint8List>`.
   await for (final line in const LineSplitter().bind(
-    utf8.decoder.bind(bytes),
+    const Utf8Decoder(allowMalformed: true).bind(bytes),
   )) {
     if (line.isEmpty) {
       if (hasData) yield SseEvent(event ?? 'message', data.toString());
@@ -117,7 +126,7 @@ Stream<SseEvent> parseSse(Stream<List<int>> bytes) async* {
         hasData = true;
     }
   }
-  if (hasData) yield SseEvent(event ?? 'message', data.toString());
+  // Deliberately no final dispatch: see the doc comment.
 }
 
 /// JSON-over-HTTP transport with bounded, jittered retries.
@@ -128,8 +137,8 @@ class HttpTransport {
   /// Retries after the first attempt for retryable failures.
   final int maxRetries;
 
-  /// Deadline for a whole non-streaming response, and the longest silence
-  /// tolerated between streamed events.
+  /// Deadline for one whole call — every attempt, retry and the body read
+  /// together — and the longest silence tolerated between streamed events.
   final Duration timeout;
 
   /// First retry delay; later retries double it (plus jitter).
@@ -179,7 +188,9 @@ class HttpTransport {
           return LlmHttpException(
             status,
             '${error['message'] ?? body}',
-            errorType: error['type'] as String? ?? error['code']?.toString(),
+            // Defensive: a provider that answers `{"type": 429}` must not
+            // turn into a `TypeError` on the way out.
+            errorType: error['type']?.toString() ?? error['code']?.toString(),
           );
         }
       }
@@ -190,22 +201,27 @@ class HttpTransport {
   }
 
   /// Opens a 2xx response, retrying connection failures and retryable
-  /// statuses.
+  /// statuses until [deadline].
   Future<HttpClientResponse> _withRetries(
     Uri uri,
     Map<String, String> headers,
     Object body,
+    DateTime deadline,
   ) async {
     for (var attempt = 0; ; attempt++) {
       try {
-        final response = await _open(uri, headers, body).timeout(timeout);
+        final response = await _open(
+          uri,
+          headers,
+          body,
+        ).timeout(_remaining(deadline, uri));
         if (response.statusCode >= 200 && response.statusCode < 300) {
           return response;
         }
         final text = await response
             .transform(utf8.decoder)
             .join()
-            .timeout(timeout);
+            .timeout(_remaining(deadline, uri));
         final error = _error(response.statusCode, text);
         if (!error.isRetryable || attempt >= maxRetries) throw error;
         await Future<void>.delayed(
@@ -216,12 +232,21 @@ class HttpTransport {
       } on Object catch (e) {
         // SocketException, HttpException, TimeoutException, ...
         if (e is! IOException && e is! TimeoutException) rethrow;
-        if (attempt >= maxRetries) {
+        if (attempt >= maxRetries || DateTime.now().isAfter(deadline)) {
           throw LlmException('request to ${uri.host} failed: $e');
         }
         await Future<void>.delayed(_backoff(attempt, null));
       }
     }
+  }
+
+  /// What is left of the call's budget, never zero or negative.
+  Duration _remaining(DateTime deadline, Uri uri) {
+    final left = deadline.difference(DateTime.now());
+    if (left <= Duration.zero) {
+      throw LlmException('request to ${uri.host} ran out of time');
+    }
+    return left;
   }
 
   /// POSTs [body] as JSON and decodes a JSON object response.
@@ -230,13 +255,38 @@ class HttpTransport {
     Map<String, String> headers,
     Object body,
   ) async {
-    final response = await _withRetries(uri, headers, body);
-    final text = await response.transform(utf8.decoder).join().timeout(timeout);
-    final json = jsonDecode(text);
-    if (json is! Map) {
-      throw LlmException('expected a JSON object from ${uri.host}');
+    final deadline = DateTime.now().add(timeout);
+    // The body read is inside the retry loop: a response that stalls or is
+    // cut mid-body is the same class of failure as one that never arrived,
+    // and was previously neither retried nor reported as an `LlmException`.
+    for (var attempt = 0; ; attempt++) {
+      final response = await _withRetries(uri, headers, body, deadline);
+      final String text;
+      try {
+        text = await response
+            .transform(const Utf8Decoder(allowMalformed: true))
+            .join()
+            .timeout(_remaining(deadline, uri));
+      } on Object catch (e) {
+        if (e is! IOException && e is! TimeoutException) rethrow;
+        if (attempt >= maxRetries || DateTime.now().isAfter(deadline)) {
+          throw LlmException('reading the reply from ${uri.host} failed: $e');
+        }
+        await Future<void>.delayed(_backoff(attempt, null));
+        continue;
+      }
+      final Object? json;
+      try {
+        json = jsonDecode(text);
+      } on FormatException catch (e) {
+        // A proxy's HTML error page, for instance.
+        throw LlmException('${uri.host} did not return JSON: $e');
+      }
+      if (json is! Map) {
+        throw LlmException('expected a JSON object from ${uri.host}');
+      }
+      return json.cast<String, Object?>();
     }
-    return json.cast<String, Object?>();
   }
 
   /// POSTs [body] as JSON and streams the Server-Sent Events of the answer.
@@ -246,10 +296,15 @@ class HttpTransport {
     Map<String, String> headers,
     Object body,
   ) async* {
-    final response = await _withRetries(uri, {
-      ...headers,
-      'accept': 'text/event-stream',
-    }, body);
+    // A stream has no total deadline — a long answer is the normal case — so
+    // only the connect-and-retry phase is bounded, and the idle timeout below
+    // covers the rest.
+    final response = await _withRetries(
+      uri,
+      {...headers, 'accept': 'text/event-stream'},
+      body,
+      DateTime.now().add(timeout),
+    );
     yield* parseSse(response).timeout(
       timeout,
       onTimeout: (sink) {
