@@ -11,6 +11,7 @@ import 'dart:typed_data';
 import 'chat.dart';
 import 'embedder.dart';
 import 'http.dart';
+import 'tools.dart';
 
 Map<String, String> _auth(String? apiKey, Map<String, String> headers) => {
   ...headers,
@@ -18,7 +19,7 @@ Map<String, String> _auth(String? apiKey, Map<String, String> headers) => {
 };
 
 /// A [ChatModel] for any OpenAI-compatible chat-completions server.
-class OpenAICompatibleChatModel implements ChatModel {
+class OpenAICompatibleChatModel implements ToolCallingModel {
   @override
   final String model;
 
@@ -99,11 +100,53 @@ class OpenAICompatibleChatModel implements ChatModel {
     maxTokens: maxTokens,
   );
 
+  /// Messages in the chat-completions shape.
+  ///
+  /// Tool results are their own `role: tool` messages here, rather than blocks
+  /// inside a user turn, so one [ChatMessage] can expand to several.
+  static List<Map<String, Object?>> _messages(ChatMessage m) {
+    if (m.toolResults.isNotEmpty) {
+      return [
+        for (final result in m.toolResults)
+          {
+            'role': 'tool',
+            'tool_call_id': result.id,
+            'content': result.isError
+                ? 'error: ${result.content}'
+                : result.content,
+          },
+      ];
+    }
+    if (m.toolCalls.isNotEmpty) {
+      return [
+        {
+          'role': m.role.name,
+          if (m.content.isNotEmpty) 'content': m.content,
+          'tool_calls': [
+            for (final call in m.toolCalls)
+              {
+                'id': call.id,
+                'type': 'function',
+                'function': {
+                  'name': call.name,
+                  'arguments': jsonEncode(call.input),
+                },
+              },
+          ],
+        },
+      ];
+    }
+    return [
+      {'role': m.role.name, 'content': m.content},
+    ];
+  }
+
   Map<String, Object?> _body(
     List<ChatMessage> messages,
     String? system,
     int? limit, {
     required bool stream,
+    List<Tool> tools = const [],
   }) {
     final (sys, rest) = splitSystem(messages, system);
     if (rest.isEmpty) {
@@ -114,8 +157,10 @@ class OpenAICompatibleChatModel implements ChatModel {
       'model': model,
       'messages': [
         if (sys != null) {'role': 'system', 'content': sys},
-        for (final m in rest) {'role': m.role.name, 'content': m.content},
+        for (final m in rest) ..._messages(m),
       ],
+      if (tools.isNotEmpty)
+        'tools': [for (final t in tools) t.toOpenAIJson()],
       if ((limit ?? maxTokens) != null) maxTokensField: limit ?? maxTokens,
       if (stream) 'stream': true,
     };
@@ -138,11 +183,19 @@ class OpenAICompatibleChatModel implements ChatModel {
     List<ChatMessage> messages, {
     String? system,
     int? maxTokens,
+  }) => completeWithTools(messages, system: system, maxTokens: maxTokens);
+
+  @override
+  Future<ChatResponse> completeWithTools(
+    List<ChatMessage> messages, {
+    String? system,
+    int? maxTokens,
+    List<Tool> tools = const [],
   }) async {
     final json = await _http.postJson(
       joinUrl(baseUrl, 'chat/completions'),
       _auth(apiKey, headers),
-      _body(messages, system, maxTokens, stream: false),
+      _body(messages, system, maxTokens, stream: false, tools: tools),
     );
     final choices = json['choices'];
     if (choices is! List || choices.isEmpty) {
@@ -154,11 +207,26 @@ class OpenAICompatibleChatModel implements ChatModel {
     if (refusal is String && refusal.isNotEmpty) {
       throw LlmRefusalException(refusal);
     }
+    final calls = <ToolCall>[];
+    for (final raw in (message['tool_calls'] as List? ?? const [])) {
+      if (raw is! Map) continue;
+      final function = raw['function'];
+      if (function is! Map) continue;
+      calls.add(
+        ToolCall(
+          id: '${raw['id']}',
+          name: '${function['name']}',
+          // Arguments arrive as a JSON *string* in this API.
+          input: decodeToolInput(function['arguments']),
+        ),
+      );
+    }
     return ChatResponse(
       message['content'] as String? ?? '',
       stopReason: choice['finish_reason'] as String?,
       model: json['model'] as String?,
       usage: _usage(json['usage']),
+      toolCalls: calls,
     );
   }
 
