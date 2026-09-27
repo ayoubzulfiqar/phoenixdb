@@ -168,13 +168,17 @@ class OpenAICompatibleChatModel implements ChatModel {
     String? system,
     int? maxTokens,
   }) async* {
+    var finished = false;
     final events = _http.postSse(
       joinUrl(baseUrl, 'chat/completions'),
       _auth(apiKey, headers),
       _body(messages, system, maxTokens, stream: true),
     );
     await for (final e in events) {
-      if (e.data == '[DONE]') break;
+      if (e.data == '[DONE]') {
+        finished = true;
+        break;
+      }
       final Object? json;
       try {
         json = jsonDecode(e.data);
@@ -198,8 +202,17 @@ class OpenAICompatibleChatModel implements ChatModel {
       if (refusal is String && refusal.isNotEmpty) {
         throw LlmRefusalException(refusal);
       }
+      // A finish reason is the other way servers end a stream; not every
+      // OpenAI-compatible server sends `[DONE]`.
+      if ((choices.first as Map)['finish_reason'] != null) finished = true;
       final text = delta['content'];
       if (text is String && text.isNotEmpty) yield text;
+    }
+    if (!finished) {
+      throw const LlmException(
+        'the response stream ended before the model finished; '
+        'discard the partial text and retry',
+      );
     }
   }
 
