@@ -10,6 +10,7 @@ import 'dart:io';
 
 import 'chat.dart';
 import 'http.dart';
+import 'tools.dart';
 
 /// Thinking effort for Claude (`output_config.effort`).
 enum ClaudeEffort {
@@ -43,7 +44,7 @@ enum ClaudeEffort {
 /// request declined by a safety classifier on Anthropic's recommended
 /// fallback model instead of failing it. A request that is still declined
 /// throws [LlmRefusalException].
-class AnthropicChatModel implements ChatModel {
+class AnthropicChatModel implements ToolCallingModel {
   @override
   final String model;
 
@@ -134,11 +135,41 @@ class AnthropicChatModel implements ChatModel {
     };
   }
 
+  /// One message in the Messages API shape.
+  ///
+  /// Text alone travels as a plain string; a turn carrying tool calls or
+  /// results becomes a content-block list, which is how this API represents
+  /// them.
+  static Map<String, Object?> _message(ChatMessage m) {
+    if (m.toolCalls.isEmpty && m.toolResults.isEmpty) {
+      return {'role': m.role.name, 'content': m.content};
+    }
+    final blocks = <Map<String, Object?>>[
+      if (m.content.isNotEmpty) {'type': 'text', 'text': m.content},
+      for (final call in m.toolCalls)
+        {
+          'type': 'tool_use',
+          'id': call.id,
+          'name': call.name,
+          'input': call.input,
+        },
+      for (final result in m.toolResults)
+        {
+          'type': 'tool_result',
+          'tool_use_id': result.id,
+          'content': result.content,
+          if (result.isError) 'is_error': true,
+        },
+    ];
+    return {'role': m.role.name, 'content': blocks};
+  }
+
   Map<String, Object?> _body(
     List<ChatMessage> messages,
     String? system,
     int limit, {
     required bool stream,
+    List<Tool> tools = const [],
   }) {
     final (sys, rest) = splitSystem(messages, system);
     if (rest.isEmpty) {
@@ -148,9 +179,9 @@ class AnthropicChatModel implements ChatModel {
       'model': model,
       'max_tokens': limit,
       'system': ?sys,
-      'messages': [
-        for (final m in rest) {'role': m.role.name, 'content': m.content},
-      ],
+      'messages': [for (final m in rest) _message(m)],
+      if (tools.isNotEmpty)
+        'tools': [for (final t in tools) t.toAnthropicJson()],
       if (adaptiveThinking) 'thinking': {'type': 'adaptive'},
       if (effort != null) 'output_config': {'effort': effort!.name},
       if (_fallbacks) 'fallbacks': 'default',
@@ -182,26 +213,54 @@ class AnthropicChatModel implements ChatModel {
     List<ChatMessage> messages, {
     String? system,
     int? maxTokens,
+  }) => completeWithTools(messages, system: system, maxTokens: maxTokens);
+
+  @override
+  Future<ChatResponse> completeWithTools(
+    List<ChatMessage> messages, {
+    String? system,
+    int? maxTokens,
+    List<Tool> tools = const [],
   }) async {
     final json = await _http.postJson(
       _endpoint,
       _headers,
-      _body(messages, system, maxTokens ?? this.maxTokens, stream: false),
+      _body(
+        messages,
+        system,
+        maxTokens ?? this.maxTokens,
+        stream: false,
+        tools: tools,
+      ),
     );
     final stop = json['stop_reason'] as String?;
     // Check the stop reason before reading content: a refusal can come with
     // empty or partial content.
     if (stop == 'refusal') throw _refusal(json['stop_details']);
     final text = StringBuffer();
+    final calls = <ToolCall>[];
     for (final block in (json['content'] as List? ?? const [])) {
-      // Only text: thinking and fallback-marker blocks are not the answer.
-      if (block is Map && block['type'] == 'text') text.write(block['text']);
+      if (block is! Map) continue;
+      switch (block['type']) {
+        // Only text: thinking and fallback-marker blocks are not the answer.
+        case 'text':
+          text.write(block['text']);
+        case 'tool_use':
+          calls.add(
+            ToolCall(
+              id: '${block['id']}',
+              name: '${block['name']}',
+              input: decodeToolInput(block['input']),
+            ),
+          );
+      }
     }
     return ChatResponse(
       text.toString(),
       stopReason: stop,
       model: json['model'] as String?,
       usage: _usage(json['usage']),
+      toolCalls: calls,
     );
   }
 
