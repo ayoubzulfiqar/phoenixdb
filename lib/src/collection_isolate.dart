@@ -9,21 +9,46 @@
 /// ```
 library;
 
+import 'dart:async';
+import 'dart:convert' show JsonUnsupportedObjectError, jsonEncode;
 import 'dart:isolate';
 import 'dart:typed_data';
 
 import 'collection.dart';
 import 'native/vector_bindings.dart' show VectorMetric;
+import 'watch.dart';
+import 'watch_isolate.dart';
 import 'worker.dart';
 
-enum _Op { upsert, delete, get, query, count, list, stats, flush, close }
+enum _Op {
+  upsert,
+  delete,
+  get,
+  query,
+  count,
+  list,
+  stats,
+  verify,
+  compact,
+  backup,
+  flush,
+  close,
+}
 
 class _Request {
   final _Op op;
   final Object? a;
   final Object? b;
-  final Object? c;
-  const _Request(this.op, [this.a, this.b, this.c]);
+  const _Request(this.op, [this.a, this.b]);
+}
+
+/// One page request, so `list` keeps its four parameters together.
+class _Page {
+  final Filter? filter;
+  final int limit;
+  final String? after;
+  final bool newestFirst;
+  const _Page(this.filter, this.limit, this.after, this.newestFirst);
 }
 
 class _Boot {
@@ -66,13 +91,22 @@ Object? _execute(PhoenixCollection c, _Request r) {
     case _Op.count:
       return c.count(filter: r.a as Filter?);
     case _Op.list:
+      final page = r.a! as _Page;
       return c.list(
-        filter: r.a as Filter?,
-        limit: r.b! as int,
-        after: r.c as String?,
+        filter: page.filter,
+        limit: page.limit,
+        after: page.after,
+        newestFirst: page.newestFirst,
       );
     case _Op.stats:
       return c.stats();
+    case _Op.verify:
+      return c.verify();
+    case _Op.compact:
+      return c.compact();
+    case _Op.backup:
+      c.backup(r.a! as String);
+      return null;
     case _Op.flush:
       c.flush();
       return null;
@@ -106,8 +140,20 @@ void _main(_Boot boot) => serveWorker<PhoenixCollection>(
 class AsyncPhoenixCollection implements DocumentStore {
   final WorkerClient _worker;
   final int _dimensions;
+  final Set<WatchSession> _watchers = {};
 
-  AsyncPhoenixCollection._(this._worker, this._dimensions);
+  /// Directory the collection lives in.
+  final String path;
+
+  /// Native library override this client was opened with, if any.
+  final String? libraryPath;
+
+  AsyncPhoenixCollection._(
+    this._worker,
+    this._dimensions,
+    this.path,
+    this.libraryPath,
+  );
 
   /// Spawns the worker and opens the collection; arguments mirror
   /// [PhoenixCollection.open].
@@ -142,11 +188,28 @@ class AsyncPhoenixCollection implements DocumentStore {
       debugName: 'phoenixdb-collection-worker',
       what: 'collection',
     );
-    final client = AsyncPhoenixCollection._(worker, dimensions);
+    final client = AsyncPhoenixCollection._(
+      worker,
+      dimensions,
+      path,
+      libraryPath,
+    );
     if (dimensions != 0) return client;
-    // Adopt an existing collection's layout.
-    final stats = await client.stats();
-    return AsyncPhoenixCollection._(worker, stats.dimensions);
+    try {
+      // Adopt an existing collection's layout.
+      final stats = await client.stats();
+      return AsyncPhoenixCollection._(
+        worker,
+        stats.dimensions,
+        path,
+        libraryPath,
+      );
+    } on Object {
+      // Otherwise the worker isolate — and the directory's file lock — would
+      // outlive this failed open with no way to reach it.
+      await client.close();
+      rethrow;
+    }
   }
 
   /// Embedding dimensionality (0 when the collection has no vectors).
@@ -178,6 +241,17 @@ class AsyncPhoenixCollection implements DocumentStore {
     if (documents.isEmpty) return;
     for (final d in documents) {
       _checkVector(d.vector, 'documents["${d.id}"].vector');
+      final metadata = d.metadata;
+      if (metadata != null) {
+        try {
+          jsonEncode(metadata);
+        } on JsonUnsupportedObjectError catch (e) {
+          throw ArgumentError(
+            'documents["${d.id}"].metadata is not JSON-encodable: '
+            '${e.unsupportedObject}',
+          );
+        }
+      }
     }
     await _send(_Request(_Op.upsert, List<Document>.of(documents)));
   }
@@ -229,6 +303,9 @@ class AsyncPhoenixCollection implements DocumentStore {
   /// Runs a prepared [CollectionQuery].
   @override
   Future<List<SearchHit>> query(CollectionQuery q) async {
+    // Validated here as well as natively, so an obvious mistake fails at the
+    // call site with the same error the synchronous client gives.
+    if (q.k < 0) throw ArgumentError.value(q.k, 'k', 'must be >= 0');
     _checkVector(q.vector, 'vector');
     return ((await _send(_Request(_Op.query, q)))! as List).cast<SearchHit>();
   }
@@ -244,14 +321,33 @@ class AsyncPhoenixCollection implements DocumentStore {
     Filter? filter,
     int limit = 0,
     String? after,
-  }) async => ((await _send(_Request(_Op.list, filter, limit, after)))! as List)
-      .cast<Document>();
+    bool newestFirst = false,
+  }) async {
+    if (limit < 0) throw ArgumentError.value(limit, 'limit', 'must be >= 0');
+    final raw = await _send(
+      _Request(_Op.list, _Page(filter, limit, after, newestFirst)),
+    );
+    return (raw! as List).cast<Document>();
+  }
 
-  /// Every document matching [filter], fetched in pages of [pageSize].
-  Stream<Document> documents({Filter? filter, int pageSize = 256}) async* {
+  /// Every document matching [filter], fetched in pages of [pageSize],
+  /// oldest first unless [newestFirst] is set.
+  Stream<Document> documents({
+    Filter? filter,
+    int pageSize = 256,
+    bool newestFirst = false,
+  }) async* {
+    if (pageSize <= 0) {
+      throw ArgumentError.value(pageSize, 'pageSize', 'must be positive');
+    }
     String? after;
     while (true) {
-      final page = await list(filter: filter, limit: pageSize, after: after);
+      final page = await list(
+        filter: filter,
+        limit: pageSize,
+        after: after,
+        newestFirst: newestFirst,
+      );
       for (final d in page) {
         yield d;
       }
@@ -264,9 +360,77 @@ class AsyncPhoenixCollection implements DocumentStore {
   Future<CollectionStats> stats() async =>
       await _send(const _Request(_Op.stats)) as CollectionStats;
 
+  /// Checks the collection and reports what it found, without changing it.
+  Future<CollectionReport> verify() async =>
+      await _send(const _Request(_Op.verify)) as CollectionReport;
+
+  /// Reclaims space; returns how many vector records were reclaimed.
+  Future<int> compact() async =>
+      await _send(const _Request(_Op.compact)) as int;
+
+  /// Writes a consistent, compacted copy of the collection into [dir].
+  Future<void> backup(String dir) => _send(_Request(_Op.backup, dir));
+
+  /// Committed document changes as they happen: one [CollectionChange] per
+  /// document written or removed, in commit order.
+  ///
+  /// The subscription runs on its own isolate — the blocking native poll
+  /// cannot share the worker that serves the other calls — and ends when it is
+  /// cancelled or the collection closes. A consumer that falls behind loses
+  /// the oldest changes past [capacity]; rebuild from [list] if that matters.
+  ///
+  /// ```dart
+  /// final sub = kb.changes().listen((c) => print('${c.kind} ${c.id}'));
+  /// // ... later
+  /// await sub.cancel();
+  /// ```
+  Stream<CollectionChange> changes({int capacity = 1024}) {
+    if (capacity <= 0) {
+      throw ArgumentError.value(capacity, 'capacity', 'must be positive');
+    }
+    final spec = WatchSpec(
+      path: path,
+      libraryPath: libraryPath,
+      capacity: capacity,
+      collection: true,
+    );
+    late WatchSession session;
+    late StreamController<CollectionChange> controller;
+    controller = StreamController<CollectionChange>(
+      onListen: () {
+        session = WatchSession.start(spec);
+        _watchers.add(session);
+        session.batches.listen(
+          (batch) {
+            for (final change in batch) {
+              controller.add(change as CollectionChange);
+            }
+          },
+          onError: controller.addError,
+          onDone: () {
+            _watchers.remove(session);
+            if (!controller.isClosed) controller.close();
+          },
+        );
+      },
+      onCancel: () async {
+        await session.stop();
+        _watchers.remove(session);
+      },
+    );
+    return controller.stream;
+  }
+
   /// Syncs vectors and checkpoints documents.
   Future<void> flush() => _send(const _Request(_Op.flush));
 
-  /// Closes the collection and stops the worker. Idempotent.
-  Future<void> close() => _worker.close(const _Request(_Op.close));
+  /// Closes the collection, ends any [changes] streams, and stops the
+  /// worker. Idempotent.
+  Future<void> close() async {
+    for (final session in _watchers.toList()) {
+      await session.stop();
+    }
+    _watchers.clear();
+    await _worker.close(const _Request(_Op.close));
+  }
 }
