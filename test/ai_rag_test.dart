@@ -309,6 +309,8 @@ void main() {
     });
   });
 
+  group('audited retrieval behaviour', _ragAudit);
+
   group('ConversationMemory', () {
     test('keeps order, recalls relevant turns and survives reopen', () async {
       final kb = await AsyncPhoenixCollection.open(
@@ -395,4 +397,276 @@ class _CountingEmbedder implements Embedder {
 
   @override
   void close() {}
+}
+
+// ---------------------------------------------------------------------------
+// Regression tests for the audit findings.
+// ---------------------------------------------------------------------------
+
+/// An embedder that answers differently per purpose, like Voyage and E5 do.
+/// Every retrieval test elsewhere uses [HashingEmbedder], which ignores
+/// purpose and so cannot catch a query/document mix-up.
+class AsymmetricEmbedder implements Embedder {
+  final HashingEmbedder _inner;
+  AsymmetricEmbedder(this._inner);
+
+  @override
+  int get dimensions => _inner.dimensions;
+
+  @override
+  Future<List<Float32List>> embed(
+    List<String> texts, {
+    EmbedPurpose purpose = EmbedPurpose.document,
+  }) async => [for (final t in texts) _inner.embedSync('${purpose.name}: $t')];
+
+  @override
+  void close() {}
+}
+
+/// Returns fewer vectors than it was given.
+class ShortEmbedder implements Embedder {
+  @override
+  int get dimensions => 256;
+
+  @override
+  Future<List<Float32List>> embed(
+    List<String> texts, {
+    EmbedPurpose purpose = EmbedPurpose.document,
+  }) async => [Float32List(256)];
+
+  @override
+  void close() {}
+}
+
+void _ragAudit() {
+  late Directory dir;
+  setUp(() => dir = Directory.systemTemp.createTempSync('phoenix_ai2_'));
+  tearDown(() {
+    try {
+      dir.deleteSync(recursive: true);
+    } on FileSystemException {
+      // Windows can hold files briefly.
+    }
+  });
+
+  PhoenixCollection open(String name, {int dimensions = 256}) =>
+      PhoenixCollection.open(
+        '${dir.path}/$name',
+        dimensions: dimensions,
+        sync: false,
+      );
+
+  test('a repeated document id in one batch leaves one version', () async {
+    final kb = open('dup');
+    try {
+      final rag = RagPipeline(
+        store: kb.asStore(),
+        embedder: HashingEmbedder(),
+        chat: FakeChat((_, _) => 'x'),
+        chunker: TextChunker(chunkSize: 40, overlap: 0),
+      );
+      // The long version would leave chunks the short one never overwrites.
+      await rag.ingestAll([
+        RagDocument('a', List.filled(12, 'alpha beta gamma delta').join(' ')),
+        const RagDocument('a', 'only this survives'),
+      ]);
+      final chunks = kb.list(filter: Filter.eq('doc_id', 'a'));
+      expect(chunks, hasLength(1));
+      expect(chunks.single.text, 'only this survives');
+    } finally {
+      kb.close();
+    }
+  });
+
+  test('citations tolerate anything a model might write', () {
+    final sources = [
+      RagSource(1, const SearchHit(id: 'a', score: 1)),
+      RagSource(2, const SearchHit(id: 'b', score: 1)),
+    ];
+    // Out of range, wider than 64 bits, zero, and a spaced pair.
+    const text = 'see [2], [9], [12345678901234567890], [0] and [1, 2]';
+    expect(citedSources(text, sources).map((s) => s.number), [
+      2,
+      1,
+    ], reason: 'first citation order, unknown numbers ignored');
+  });
+
+  test('only the sources that fitted the budget are reported', () async {
+    final kb = open('budget');
+    try {
+      final chat = FakeChat((_, _) => 'answer [1]');
+      final rag = RagPipeline(
+        store: kb.asStore(),
+        embedder: HashingEmbedder(),
+        chat: chat,
+        chunker: TextChunker(chunkSize: 400, overlap: 0),
+        k: 5,
+        // Room for one chunk and its wrapper, not two.
+        maxContextChars: 420,
+      );
+      await rag.ingestAll([
+        for (var i = 0; i < 4; i++)
+          RagDocument('d$i', 'vacation policy ${'padding ' * 45}'),
+      ]);
+      final answer = await rag.ask('vacation policy');
+      final prompt = chat.calls.last.$1.last.content;
+      expect(answer.sources, hasLength(1), reason: 'what the model saw');
+      expect(
+        prompt.split('<source number=').length - 1,
+        answer.sources.length,
+        reason: 'the reported sources are exactly the ones in the prompt',
+      );
+      expect(prompt.length, lessThanOrEqualTo(600));
+    } finally {
+      kb.close();
+    }
+  });
+
+  test('an embedder that returns the wrong count is reported', () async {
+    final kb = open('short');
+    try {
+      final rag = RagPipeline(
+        store: kb.asStore(),
+        embedder: ShortEmbedder(),
+        chat: FakeChat((_, _) => 'x'),
+        chunker: TextChunker(chunkSize: 20, overlap: 0),
+      );
+      await expectLater(
+        rag.ingest(const RagDocument('a', 'one two three four five six seven')),
+        throwsA(isA<LlmException>()),
+      );
+      expect(kb.count(), 0);
+    } finally {
+      kb.close();
+    }
+  });
+
+  test('the semantic cache hits with an asymmetric embedder', () async {
+    final kb = open('cache');
+    try {
+      final cache = SemanticCache(
+        store: kb.asStore(),
+        embedder: AsymmetricEmbedder(HashingEmbedder()),
+        threshold: 0.95,
+      );
+      await cache.put('what is the capital of France?', 'Paris.');
+      expect(
+        await cache.lookup('what is the capital of France?'),
+        'Paris.',
+        reason: 'a stored prompt must match itself whatever the purpose field',
+      );
+      expect(cache.hits, 1);
+    } finally {
+      kb.close();
+    }
+  });
+
+  test('a zero-norm prompt misses instead of matching anything', () async {
+    final kb = open('nan');
+    try {
+      final cache = SemanticCache(
+        store: kb.asStore(),
+        embedder: HashingEmbedder(),
+      );
+      await cache.put('a real question', 'a real answer');
+      // No letters or digits, so the hashing embedder returns all zeros and
+      // cosine similarity is NaN.
+      expect(await cache.lookup('???'), isNull);
+      expect(await cache.lookup('---'), isNull);
+      expect(cache.misses, 2);
+    } finally {
+      kb.close();
+    }
+  });
+
+  test('empty and interrupted answers are never cached', () async {
+    final kb = open('empty');
+    try {
+      final cache = SemanticCache(
+        store: kb.asStore(),
+        embedder: HashingEmbedder(),
+      );
+      await cache.put('a question', '');
+      expect(await cache.lookup('a question'), isNull, reason: 'not stored');
+
+      // A stream that fails partway must not leave a truncated answer behind.
+      final model = cache.wrap(
+        FakeChat((_, _) => throw const LlmException('connection lost')),
+      );
+      final q = [const ChatMessage.user('tell me about Rust')];
+      await expectLater(model.stream(q).join(), throwsA(isA<LlmException>()));
+      expect(await cache.lookup('user: tell me about Rust'), isNull);
+    } finally {
+      kb.close();
+    }
+  });
+
+  test('two memory handles on one conversation do not overwrite', () async {
+    final kb = open('mem');
+    try {
+      final store = kb.asStore();
+      final a = await ConversationMemory.open(
+        store: store,
+        embedder: HashingEmbedder(),
+        conversationId: 'chat',
+      );
+      final b = await ConversationMemory.open(
+        store: store,
+        embedder: HashingEmbedder(),
+        conversationId: 'chat',
+      );
+      // Interleaved appends through both handles.
+      await a.add(const ChatMessage.user('one'));
+      await b.add(const ChatMessage.user('two'));
+      await a.add(const ChatMessage.user('three'));
+      await b.add(const ChatMessage.user('four'));
+      expect(await a.count(), 4, reason: 'nothing was overwritten');
+      expect((await a.recent(4)).map((m) => m.content), [
+        'one',
+        'two',
+        'three',
+        'four',
+      ]);
+
+      // Deleting older messages must not make the next append collide.
+      final oldest = kb.list(limit: 2).map((d) => d.id).toList();
+      kb.delete(oldest);
+      final c = await ConversationMemory.open(
+        store: store,
+        embedder: HashingEmbedder(),
+        conversationId: 'chat',
+      );
+      await c.add(const ChatMessage.user('five'));
+      expect(await c.count(), 3);
+      expect((await c.recent(3)).map((m) => m.content), [
+        'three',
+        'four',
+        'five',
+      ]);
+      expect(await c.clear(), 3);
+      expect(await c.count(), 0);
+    } finally {
+      kb.close();
+    }
+  });
+
+  test('a one-unit chunk window keeps surrogate pairs whole', () {
+    final chunks = TextChunker(chunkSize: 1, overlap: 0).split('😀😀');
+    expect(chunks.map((c) => c.text).join(), '😀😀');
+    expect(
+      chunks.every((c) => c.text.runes.every((r) => r == 0x1F600)),
+      isTrue,
+    );
+  });
+
+  test('cached vectors are copies, not the cache itself', () async {
+    final cached = CachedEmbedder(
+      HashingEmbedder(dimensions: 8),
+      namespace: 'copies',
+    );
+    final first = await cached.embed(['text']);
+    first.single[0] = 42; // a caller normalising in place
+    final second = await cached.embed(['text']);
+    expect(second.single[0], isNot(42), reason: 'the cache was not corrupted');
+  });
 }
