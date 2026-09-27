@@ -21,7 +21,9 @@
 //! * Documents come back as `{"id", "text"?, "metadata", "vector"?}`.
 
 use super::{give_string, guard, path_arg};
-use crate::collection::{Collection, CollectionOptions, Document, Filter, SearchRequest};
+use crate::collection::{
+    Collection, CollectionOptions, Document, Filter, ListOptions, SearchRequest,
+};
 use crate::error::Error;
 use crate::security::HandleTag;
 use crate::vector::{HnswParams, Metric};
@@ -65,7 +67,7 @@ fn open_shared(dir: &Path, options: CollectionOptions) -> Result<Arc<Collection>
                 existing.dim()
             )));
         }
-        if options.dim != 0 && existing.dim() != 0 && options.metric != existing.metric() {
+        if options.dim != 0 && options.metric != existing.metric() {
             return Err(Error::invalid(format!(
                 "{} is already open with the {} metric",
                 dir.display(),
@@ -87,7 +89,7 @@ impl PhoenixCollectionHandle {
     /// # Safety
     /// `handle` must come from [`phoenix_collection_open`] and not yet have
     /// been passed to [`phoenix_collection_close`].
-    unsafe fn validate<'a>(
+    pub(super) unsafe fn validate<'a>(
         handle: *const PhoenixCollectionHandle,
     ) -> Result<&'a Collection, Error> {
         if handle.is_null() {
@@ -227,7 +229,10 @@ fn options_from(value: Option<&Value>) -> Result<CollectionOptions, Error> {
             "sync" => options.sync_on_write = flag(v, "sync")?,
             "m" => {
                 hnsw.m = size(v, "m")?;
-                hnsw.m_max0 = hnsw.m * 2;
+                // Saturating: `m` is caller input, and the graph validates
+                // its range afterwards. A wrapping multiply would turn a
+                // silly value into a panic (and status -7) instead of -2.
+                hnsw.m_max0 = hnsw.m.saturating_mul(2);
             }
             "ef_construction" => hnsw.ef_construction = size(v, "ef_construction")?,
             "ef_search" => hnsw.ef_search = size(v, "ef_search")?,
@@ -247,7 +252,14 @@ fn options_from(value: Option<&Value>) -> Result<CollectionOptions, Error> {
 /// `options_json` may be null or an object with any of `dim` (0 = no vectors
 /// / adopt the existing layout), `metric` (`"cosine"`, `"euclidean"`,
 /// `"dot_product"` or 0/1/2), `text_index`, `sync`, `m`, `ef_construction`,
-/// `ef_search`. A directory already open in this process is shared.
+/// `ef_search`.
+///
+/// A directory already open in this process is **shared**: the running
+/// collection is returned and the rest of `options_json` is ignored, exactly
+/// as `phoenix_open_ex` does for a key/value handle. A conflicting `dim` or
+/// `metric` is an error rather than a silent reinterpretation; `sync`,
+/// `text_index` and the HNSW parameters belong to whoever opened first, and
+/// `phoenix_collection_stats` reports what is actually in force.
 ///
 /// # Safety
 /// `path` must be a NUL-terminated string, `options_json` null or one, and
@@ -307,8 +319,12 @@ pub unsafe extern "C" fn phoenix_collection_close(handle: *mut PhoenixCollection
             let _registry = COLLECTION_REGISTRY.lock();
             drop(collection);
         }
-        // SAFETY: the box is freed exactly once, here.
-        drop(unsafe { Box::from_raw(handle) });
+        // The handle struct itself is deliberately *not* freed: it stays
+        // allocated as a poisoned tombstone. Freeing it would let the
+        // allocator hand the same address to the next open, and a caller's
+        // second close would then read a live handle's tag and release it —
+        // a double free of someone else's handle. A tombstone costs a few
+        // bytes per handle ever opened and makes a double close safe.
         Ok(())
     });
 }
@@ -598,6 +614,116 @@ pub unsafe extern "C" fn phoenix_collection_stats(
     })
 }
 
+/// Like [`phoenix_collection_list`], but `reverse` non-zero returns the
+/// highest ids first (newest-first paging). `after` stays exclusive in both
+/// directions.
+///
+/// # Safety
+/// `filter_json` and `after` null or NUL-terminated; `out_json` writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn phoenix_collection_list_ex(
+    handle: *mut PhoenixCollectionHandle,
+    filter_json: *const c_char,
+    limit: u64,
+    after: *const c_char,
+    reverse: c_int,
+    out_json: *mut *mut c_char,
+) -> c_int {
+    guard(|| {
+        if out_json.is_null() {
+            return Err(Error::invalid("out_json is null"));
+        }
+        // SAFETY: checked non-null above.
+        unsafe { *out_json = std::ptr::null_mut() };
+        // SAFETY: handle validity is the caller's obligation.
+        let c = unsafe { PhoenixCollectionHandle::validate(handle) }?;
+        // SAFETY: caller guarantees NUL-terminated strings or null.
+        let filter = filter_from(unsafe { json_arg(filter_json, "filter_json") }?)?;
+        // SAFETY: as above.
+        let after = unsafe { str_arg(after, "after") }?;
+        let docs = c.list_with(&ListOptions {
+            filter: filter.as_ref(),
+            limit: usize::try_from(limit).unwrap_or(usize::MAX),
+            after,
+            reverse: reverse != 0,
+        })?;
+        let out: Vec<Value> = docs.iter().map(document_json).collect();
+        // SAFETY: `out_json` validated above.
+        unsafe { give_string(out_json, Value::Array(out).to_string()) }
+    })
+}
+
+/// Checks the collection and writes a JSON report: `{"documents", "vectors",
+/// "orphan_vectors", "missing_vectors", "dead_vectors", "tree": {...}}`.
+///
+/// # Safety
+/// `out_json` must be writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn phoenix_collection_verify(
+    handle: *mut PhoenixCollectionHandle,
+    out_json: *mut *mut c_char,
+) -> c_int {
+    guard(|| {
+        if out_json.is_null() {
+            return Err(Error::invalid("out_json is null"));
+        }
+        // SAFETY: checked non-null above.
+        unsafe { *out_json = std::ptr::null_mut() };
+        // SAFETY: handle validity is the caller's obligation.
+        let c = unsafe { PhoenixCollectionHandle::validate(handle) }?;
+        let report = serde_json::to_value(c.verify()?)
+            .map_err(|e| Error::invalid(format!("serialising the report: {e}")))?;
+        // SAFETY: `out_json` validated above.
+        unsafe { give_string(out_json, report.to_string()) }
+    })
+}
+
+/// Reclaims space: drops orphaned and tombstoned vectors and rebuilds the
+/// document store. `*out_reclaimed` (optional) receives how many vector
+/// records were reclaimed.
+///
+/// # Safety
+/// `out_reclaimed` must be null or writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn phoenix_collection_compact(
+    handle: *mut PhoenixCollectionHandle,
+    out_reclaimed: *mut u64,
+) -> c_int {
+    guard(|| {
+        if !out_reclaimed.is_null() {
+            // SAFETY: non-null; the caller guarantees it is writable.
+            unsafe { *out_reclaimed = 0 };
+        }
+        // SAFETY: handle validity is the caller's obligation.
+        let c = unsafe { PhoenixCollectionHandle::validate(handle) }?;
+        let reclaimed = c.compact()?;
+        if !out_reclaimed.is_null() {
+            // SAFETY: as above.
+            unsafe { *out_reclaimed = reclaimed as u64 };
+        }
+        Ok(())
+    })
+}
+
+/// Writes a consistent, compacted copy of the collection into directory
+/// `dir`, which can then be opened with [`phoenix_collection_open`].
+///
+/// # Safety
+/// `dir` must be a NUL-terminated string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn phoenix_collection_backup(
+    handle: *mut PhoenixCollectionHandle,
+    dir: *const c_char,
+) -> c_int {
+    guard(|| {
+        // SAFETY: handle validity is the caller's obligation.
+        let c = unsafe { PhoenixCollectionHandle::validate(handle) }?;
+        // SAFETY: caller guarantees a NUL-terminated string.
+        let dir = unsafe { path_arg(dir, "dir") }?;
+        c.backup(dir)
+    })
+}
+
 /// Syncs vectors and checkpoints documents.
 ///
 /// # Safety
@@ -614,9 +740,14 @@ pub unsafe extern "C" fn phoenix_collection_flush(handle: *mut PhoenixCollection
 /// Number of distinct collections open in this process (diagnostics).
 #[unsafe(no_mangle)]
 pub extern "C" fn phoenix_collection_open_count() -> u32 {
-    let mut registry = COLLECTION_REGISTRY.lock();
-    registry.retain(|(_, weak)| weak.strong_count() > 0);
-    u32::try_from(registry.len()).unwrap_or(u32::MAX)
+    // Guarded like every other entry point: this one prunes the registry, so
+    // it takes a lock and must not unwind into the caller.
+    std::panic::catch_unwind(|| {
+        let mut registry = COLLECTION_REGISTRY.lock();
+        registry.retain(|(_, weak)| weak.strong_count() > 0);
+        u32::try_from(registry.len()).unwrap_or(u32::MAX)
+    })
+    .unwrap_or(0)
 }
 
 #[cfg(test)]
