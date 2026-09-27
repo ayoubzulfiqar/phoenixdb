@@ -60,6 +60,7 @@ pub mod page;
 pub mod page_cache;
 pub mod page_pool;
 pub mod pager;
+pub mod repair;
 pub use pager::Pager;
 pub mod security;
 #[cfg(feature = "sql")]
