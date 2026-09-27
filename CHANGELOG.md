@@ -5,6 +5,22 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 4.1.1 - 2026-09-27
+
+### Fixed
+
+- **Conversation memory ordering no longer depends on the system clock.**
+  `ConversationMemory` allocated message ids from `DateTime.now()`, so on a
+  platform whose clock ticks coarsely (Windows: a millisecond or more) two
+  handles appending to one conversation inside a single tick received equal
+  stamps, and their relative order came down to the random part of the id —
+  `recent()` and `context()` could then return two concurrent messages in the
+  wrong order. Each append now catches up to the newest stored message before
+  allocating, so the sequence increases from stored state rather than from the
+  clock and holds at any resolution, at the cost of one read per append. No
+  message was ever lost, and ordering within a single handle was always
+  correct.
+
 ## 4.1.0 - 2026-09-27
 
 Reactive queries, on-device agents, collection maintenance and salvage
