@@ -315,7 +315,7 @@ fn abi_version_matches_expectation() {
     // 4.0 (open_ex, range scans, batches, backup, stats, check, tracing).
     // Must stay in lockstep with `kExpectedAbiVersion` in
     // lib/src/bindings.dart, or Dart refuses to load the library.
-    assert_eq!(phoenix_abi_version(), 4);
+    assert_eq!(phoenix_abi_version(), 5);
 }
 
 #[test]
