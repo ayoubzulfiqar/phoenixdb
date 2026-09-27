@@ -114,6 +114,7 @@ export 'src/kv.dart'
         PhoenixStats,
         PhoenixTreeReport,
         TraceSpan,
+        SalvageReport,
         prefixSuccessor;
 export 'src/native/vector_bindings.dart' show VectorMetric;
 export 'src/phoenix_vector_db.dart'
