@@ -143,7 +143,7 @@ Or add it to `pubspec.yaml`:
 
 ```yaml
 dependencies:
-  phoenixdb: ^4.1.0
+  phoenixdb: ^4.1.1
 ```
 
 > **Use `flutter pub`, not `dart pub`.** PhoenixDB is a Flutter FFI plugin, so
