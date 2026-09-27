@@ -133,6 +133,50 @@ typedef CollectionListDart =
       Pointer<Pointer<Utf8>> outJson,
     );
 
+/// Native signature for `phoenix_collection_list_ex`.
+typedef CollectionListExNative =
+    Int32 Function(
+      Pointer<PhoenixCollectionNative> handle,
+      Pointer<Utf8> filterJson,
+      Uint64 limit,
+      Pointer<Utf8> after,
+      Int32 reverse,
+      Pointer<Pointer<Utf8>> outJson,
+    );
+
+/// Dart signature for `phoenix_collection_list_ex`.
+typedef CollectionListExDart =
+    int Function(
+      Pointer<PhoenixCollectionNative> handle,
+      Pointer<Utf8> filterJson,
+      int limit,
+      Pointer<Utf8> after,
+      int reverse,
+      Pointer<Pointer<Utf8>> outJson,
+    );
+
+/// Native signature for `phoenix_collection_compact`.
+typedef CollectionCompactNative =
+    Int32 Function(
+      Pointer<PhoenixCollectionNative> handle,
+      Pointer<Uint64> outReclaimed,
+    );
+
+/// Dart signature for `phoenix_collection_compact`.
+typedef CollectionCompactDart =
+    int Function(
+      Pointer<PhoenixCollectionNative> handle,
+      Pointer<Uint64> outReclaimed,
+    );
+
+/// Native signature for `phoenix_collection_backup`.
+typedef CollectionBackupNative =
+    Int32 Function(Pointer<PhoenixCollectionNative> handle, Pointer<Utf8> dir);
+
+/// Dart signature for `phoenix_collection_backup`.
+typedef CollectionBackupDart =
+    int Function(Pointer<PhoenixCollectionNative> handle, Pointer<Utf8> dir);
+
 /// Native signature for `phoenix_collection_stats`.
 typedef CollectionStatsNative =
     Int32 Function(
@@ -191,8 +235,20 @@ class PhoenixCollectionBindings {
   /// `phoenix_collection_list`.
   final CollectionListDart list;
 
+  /// `phoenix_collection_list_ex`.
+  final CollectionListExDart listEx;
+
+  /// `phoenix_collection_compact`.
+  final CollectionCompactDart compact;
+
+  /// `phoenix_collection_backup`.
+  final CollectionBackupDart backup;
+
   /// `phoenix_collection_stats`.
   final CollectionStatsDart stats;
+
+  /// `phoenix_collection_verify`.
+  final CollectionStatsDart verify;
 
   /// `phoenix_collection_flush`.
   final CollectionFlushDart flush;
@@ -235,9 +291,25 @@ class PhoenixCollectionBindings {
           .lookupFunction<CollectionListNative, CollectionListDart>(
             'phoenix_collection_list',
           ),
+      listEx = base.library
+          .lookupFunction<CollectionListExNative, CollectionListExDart>(
+            'phoenix_collection_list_ex',
+          ),
+      compact = base.library
+          .lookupFunction<CollectionCompactNative, CollectionCompactDart>(
+            'phoenix_collection_compact',
+          ),
+      backup = base.library
+          .lookupFunction<CollectionBackupNative, CollectionBackupDart>(
+            'phoenix_collection_backup',
+          ),
       stats = base.library
           .lookupFunction<CollectionStatsNative, CollectionStatsDart>(
             'phoenix_collection_stats',
+          ),
+      verify = base.library
+          .lookupFunction<CollectionStatsNative, CollectionStatsDart>(
+            'phoenix_collection_verify',
           ),
       flush = base.library
           .lookupFunction<CollectionFlushNative, CollectionFlushDart>(
