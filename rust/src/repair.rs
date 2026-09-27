@@ -104,6 +104,20 @@ pub fn salvage(source: impl AsRef<Path>, destination: impl AsRef<Path>) -> Resul
     }
     let page_count = u32::try_from(len / PAGE_SIZE as u64).unwrap_or(u32::MAX);
 
+    // Probe before scanning. A database that is still open holds an exclusive
+    // lock on its file, and on Windows that lock is mandatory: every read
+    // through this handle fails. Without the probe each failure would look
+    // like a damaged page and salvage would cheerfully report that nothing
+    // could be recovered.
+    let mut probe = vec![0u8; PAGE_SIZE];
+    if let Err(e) = crate::fsutil::read_at(&file, &mut probe, 0) {
+        return Err(Error::Busy(format!(
+            "cannot read {}: {e}. Close the database first — salvage reads the \
+             file directly",
+            source.display()
+        )));
+    }
+
     let mut report = SalvageReport::default();
 
     // Pass one: find the intact leaf pages and their log sequence numbers, so
