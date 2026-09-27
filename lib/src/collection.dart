@@ -30,8 +30,10 @@ import 'package:ffi/ffi.dart';
 
 import 'bindings.dart';
 import 'native/collection_bindings.dart';
+import 'native/watch_bindings.dart';
 import 'native/vector_bindings.dart' show VectorMetric;
 import 'phoenixdb_base.dart';
+import 'watch.dart';
 
 /// One document: an id plus any of text, metadata and an embedding.
 class Document {
@@ -58,12 +60,21 @@ class Document {
     if (vector != null) 'has_vector': true,
   };
 
-  static Document _fromJson(Map<String, Object?> json) => Document(
-    json['id']! as String,
-    text: json['text'] as String?,
-    metadata: (json['metadata'] as Map?)?.cast<String, Object?>(),
-    vector: _floats(json['vector']),
-  );
+  static Document _fromJson(Map<String, Object?> json) {
+    final id = json['id'];
+    if (id is! String) {
+      throw PhoenixException(
+        PhoenixStatus.corruption,
+        'a document came back without a string id',
+      );
+    }
+    return Document(
+      id,
+      text: json['text'] as String?,
+      metadata: (json['metadata'] as Map?)?.cast<String, Object?>(),
+      vector: _floats(json['vector']),
+    );
+  }
 
   @override
   String toString() =>
@@ -313,8 +324,13 @@ class SearchHit {
   });
 
   factory SearchHit._fromJson(Map<String, Object?> j) => SearchHit(
-    id: j['id']! as String,
-    score: (j['score']! as num).toDouble(),
+    id: j['id'] is String
+        ? j['id']! as String
+        : throw PhoenixException(
+            PhoenixStatus.corruption,
+            'a hit came back without a string id',
+          ),
+    score: (j['score'] as num?)?.toDouble() ?? 0,
     vectorScore: (j['vector_score'] as num?)?.toDouble(),
     distance: (j['distance'] as num?)?.toDouble(),
     textScore: (j['text_score'] as num?)?.toDouble(),
@@ -349,6 +365,12 @@ class CollectionStats {
   /// Problems repaired when the collection was opened after a crash.
   final int repaired;
 
+  /// Whether the BM25 text index is maintained.
+  ///
+  /// Reported because opening with `dimensions: 0` adopts the stored layout,
+  /// which may differ from what this caller asked for.
+  final bool textIndex;
+
   /// Creates a statistics snapshot.
   const CollectionStats({
     required this.documents,
@@ -357,15 +379,17 @@ class CollectionStats {
     required this.dimensions,
     required this.metric,
     required this.repaired,
+    required this.textIndex,
   });
 
   factory CollectionStats._fromJson(Map<String, Object?> j) => CollectionStats(
-    documents: j['documents']! as int,
-    textDocuments: j['text_documents']! as int,
-    vectors: j['vectors']! as int,
-    dimensions: j['dim']! as int,
-    metric: j['metric']! as String,
-    repaired: j['repaired']! as int,
+    documents: _int(j, 'documents'),
+    textDocuments: _int(j, 'text_documents'),
+    vectors: _int(j, 'vectors'),
+    dimensions: _int(j, 'dim'),
+    metric: j['metric'] is String ? j['metric']! as String : 'unknown',
+    repaired: _int(j, 'repaired'),
+    textIndex: j['text_index'] == true,
   );
 
   @override
@@ -395,8 +419,14 @@ abstract interface class DocumentStore {
   /// Number of documents, or of those matching [filter].
   Future<int> count({Filter? filter});
 
-  /// Documents matching [filter] in id order.
-  Future<List<Document>> list({Filter? filter, int limit = 0, String? after});
+  /// Documents matching [filter] in id order, or descending when
+  /// [newestFirst] is set.
+  Future<List<Document>> list({
+    Filter? filter,
+    int limit = 0,
+    String? after,
+    bool newestFirst = false,
+  });
 }
 
 class _SyncStore implements DocumentStore {
@@ -426,8 +456,151 @@ class _SyncStore implements DocumentStore {
       Future.sync(() => _c.count(filter: filter));
 
   @override
-  Future<List<Document>> list({Filter? filter, int limit = 0, String? after}) =>
-      Future.sync(() => _c.list(filter: filter, limit: limit, after: after));
+  Future<List<Document>> list({
+    Filter? filter,
+    int limit = 0,
+    String? after,
+    bool newestFirst = false,
+  }) => Future.sync(
+    () => _c.list(
+      filter: filter,
+      limit: limit,
+      after: after,
+      newestFirst: newestFirst,
+    ),
+  );
+}
+
+/// What [PhoenixCollection.verify] found.
+class CollectionReport {
+  /// Documents stored.
+  final int documents;
+
+  /// Live vectors in the index.
+  final int vectors;
+
+  /// Vectors whose document is gone; reclaimed by
+  /// [PhoenixCollection.compact].
+  final int orphanVectors;
+
+  /// Documents that claim an embedding the index does not have. Non-zero
+  /// means a crash truncated the vector file: re-ingest those documents.
+  final int missingVectors;
+
+  /// Tombstoned vector records awaiting [PhoenixCollection.compact].
+  final int deadVectors;
+
+  /// Keys in the checkpointed document store. Recent writes live in the log
+  /// until a [PhoenixCollection.flush], so a fresh collection reports 0 here
+  /// and that is not a fault.
+  final int treeKeys;
+
+  /// Pages allocated but neither reachable nor free — space a crash leaked,
+  /// reclaimed by [PhoenixCollection.compact].
+  final int unreachablePages;
+
+  /// Creates a report.
+  const CollectionReport({
+    required this.documents,
+    required this.vectors,
+    required this.orphanVectors,
+    required this.missingVectors,
+    required this.deadVectors,
+    required this.treeKeys,
+    required this.unreachablePages,
+  });
+
+  /// Whether the documents and the vector index agree.
+  bool get isConsistent => orphanVectors == 0 && missingVectors == 0;
+
+  factory CollectionReport._fromJson(Map<String, Object?> j) {
+    final tree = j['tree'] is Map
+        ? (j['tree']! as Map).cast<String, Object?>()
+        : const <String, Object?>{};
+    return CollectionReport(
+      documents: _int(j, 'documents'),
+      vectors: _int(j, 'vectors'),
+      orphanVectors: _int(j, 'orphan_vectors'),
+      missingVectors: _int(j, 'missing_vectors'),
+      deadVectors: _int(j, 'dead_vectors'),
+      treeKeys: _int(tree, 'keys'),
+      unreachablePages: _int(tree, 'unreachable_pages'),
+    );
+  }
+
+  @override
+  String toString() =>
+      'CollectionReport(documents: $documents, vectors: $vectors, '
+      'orphans: $orphanVectors, missing: $missingVectors, '
+      'dead: $deadVectors)';
+}
+
+/// Casts a decoded JSON object, reporting a surprising shape as a Phoenix
+/// error rather than a raw `TypeError` from inside the FFI wrapper.
+Map<String, Object?> _object(Object? value) {
+  if (value is Map) return value.cast<String, Object?>();
+  throw PhoenixException(
+    PhoenixStatus.corruption,
+    'expected a JSON object, got ${value.runtimeType}',
+  );
+}
+
+/// Casts a decoded JSON array, with the same guarantee as [_object].
+List<Object?> _list(Object? value) {
+  if (value is List) return value;
+  throw PhoenixException(
+    PhoenixStatus.corruption,
+    'expected a JSON array, got ${value.runtimeType}',
+  );
+}
+
+/// Reads an integer field, reporting a surprising shape as a Phoenix error
+/// rather than a raw `TypeError` from inside the FFI wrapper.
+int _int(Map<String, Object?> json, String field) {
+  final value = json[field];
+  if (value is int) return value;
+  if (value is num) return value.toInt();
+  throw PhoenixException(
+    PhoenixStatus.corruption,
+    'expected an integer `$field`, got ${value.runtimeType}',
+  );
+}
+
+/// A subscription to a collection's document changes; close it when done.
+///
+/// Wraps the raw key watcher: a collection's keys *are* its document ids.
+class CollectionWatcher {
+  final ChangeWatcher _inner;
+
+  CollectionWatcher._(this._inner);
+
+  /// Whether [close] has run.
+  bool get isClosed => _inner.isClosed;
+
+  /// Whether the collection has closed, so no more changes can arrive.
+  bool get isFinished => _inner.isFinished;
+
+  /// Changes dropped because the queue was full since the last [poll].
+  int get dropped => _inner.dropped;
+
+  /// Waits up to [timeout] for changes and returns everything buffered.
+  /// Blocks the calling isolate.
+  List<CollectionChange> poll({
+    Duration timeout = const Duration(seconds: 1),
+  }) => [
+    for (final change in _inner.poll(timeout: timeout))
+      CollectionChange(
+        id: change.keyString,
+        kind: change.kind,
+        commitTs: change.commitTs,
+      ),
+  ];
+
+  /// Returns a [poll] blocked on another isolate immediately.
+  void wake() => _inner.wake();
+
+  /// Unsubscribes. Idempotent.
+  void close() => _inner.close();
 }
 
 class _CollectionOwner implements Finalizable {
@@ -513,11 +686,19 @@ class PhoenixCollection implements Finalizable {
         path,
         dimensions,
       );
-      collection._dimensions = collection.stats().dimensions;
+      try {
+        // Adopt the layout actually in force (`dimensions: 0` asks for it).
+        collection._dimensions = collection.stats().dimensions;
+      } on Object {
+        // Otherwise the handle — and the directory's file lock — would be
+        // held until the finalizer eventually ran.
+        collection.close();
+        rethrow;
+      }
       return collection;
     } finally {
-      calloc.free(pathPtr);
-      calloc.free(optionsPtr);
+      malloc.free(pathPtr);
+      malloc.free(optionsPtr);
       calloc.free(out);
     }
   }
@@ -610,9 +791,11 @@ class PhoenixCollection implements Finalizable {
         floats += v.length;
       }
     }
-    final docs = _encode([for (final d in documents) d._wire()], 'documents');
-    final vectors = floats == 0 ? nullptr : calloc<Float>(floats);
+    Pointer<Utf8>? docs;
+    Pointer<Float> vectors = nullptr;
     try {
+      docs = _encode([for (final d in documents) d._wire()], 'documents');
+      vectors = floats == 0 ? nullptr : calloc<Float>(floats);
       if (floats > 0) {
         final view = vectors.asTypedList(floats);
         var at = 0;
@@ -626,8 +809,8 @@ class PhoenixCollection implements Finalizable {
       }
       _check(_b.upsert(_h, docs, vectors, floats), 'upsert');
     } finally {
-      calloc.free(docs);
-      if (floats > 0) calloc.free(vectors);
+      if (docs != null) malloc.free(docs);
+      if (vectors != nullptr) calloc.free(vectors);
     }
   }
 
@@ -638,36 +821,38 @@ class PhoenixCollection implements Finalizable {
   int delete(Iterable<String> ids) {
     final list = ids.toList(growable: false);
     if (list.isEmpty) return 0;
-    final json = _encode(list, 'ids');
-    final out = calloc<Uint64>();
+    Pointer<Utf8>? json;
+    Pointer<Uint64>? out;
     try {
+      json = _encode(list, 'ids');
+      out = calloc<Uint64>();
       _check(_b.delete(_h, json, out), 'delete');
       return out.value;
     } finally {
-      calloc.free(json);
-      calloc.free(out);
+      if (json != null) malloc.free(json);
+      if (out != null) calloc.free(out);
     }
   }
 
   /// The document with [id], or `null`.
   Document? get(String id, {bool withVector = false}) {
-    final idPtr = id.toNativeUtf8();
-    final out = calloc<Pointer<Utf8>>();
+    Pointer<Utf8>? idPtr;
+    Pointer<Pointer<Utf8>>? out;
     try {
+      idPtr = id.toNativeUtf8();
+      out = calloc<Pointer<Utf8>>();
       final status = _b.get(_h, idPtr, withVector ? 1 : 0, out);
       if (status == PhoenixStatus.notFound) return null;
       _check(status, 'get("$id")');
       final ptr = out.value;
       try {
-        return Document._fromJson(
-          (jsonDecode(ptr.toDartString()) as Map).cast<String, Object?>(),
-        );
+        return Document._fromJson(_object(jsonDecode(ptr.toDartString())));
       } finally {
         _b.base.stringFree(ptr);
       }
     } finally {
-      calloc.free(idPtr);
-      calloc.free(out);
+      if (idPtr != null) malloc.free(idPtr);
+      if (out != null) calloc.free(out);
     }
   }
 
@@ -712,64 +897,85 @@ class PhoenixCollection implements Finalizable {
     if (q.k < 0) throw ArgumentError.value(q.k, 'k', 'must be >= 0');
     final v = q.vector;
     if (v != null) _checkVector(v, 'vector');
-    final request = _encode(q._wire(), 'query');
-    final qv = v == null ? nullptr : calloc<Float>(v.length);
+    Pointer<Utf8>? request;
+    Pointer<Float> qv = nullptr;
     try {
+      request = _encode(q._wire(), 'query');
+      qv = v == null ? nullptr : calloc<Float>(v.length);
       if (v != null) qv.asTypedList(v.length).setAll(0, v);
       final raw = _json(
-        (out) => _b.search(_h, request, qv, v?.length ?? 0, out),
+        (out) => _b.search(_h, request!, qv, v?.length ?? 0, out),
         'search',
       );
-      return [
-        for (final h in raw! as List)
-          SearchHit._fromJson((h as Map).cast<String, Object?>()),
-      ];
+      return [for (final h in _list(raw)) SearchHit._fromJson(_object(h))];
     } finally {
-      calloc.free(request);
-      if (v != null) calloc.free(qv);
+      if (request != null) malloc.free(request);
+      if (qv != nullptr) calloc.free(qv);
     }
   }
 
   /// Number of documents, or of those matching [filter].
   int count({Filter? filter}) {
-    final json = filter == null ? nullptr : _encode(filter.json, 'filter');
-    final out = calloc<Uint64>();
+    Pointer<Utf8> json = nullptr;
+    Pointer<Uint64>? out;
     try {
+      json = filter == null ? nullptr : _encode(filter.json, 'filter');
+      out = calloc<Uint64>();
       _check(_b.count(_h, json, out), 'count');
       return out.value;
     } finally {
-      if (filter != null) calloc.free(json);
-      calloc.free(out);
+      if (json != nullptr) malloc.free(json);
+      if (out != null) calloc.free(out);
     }
   }
 
   /// Documents matching [filter] in id order, after [after] (exclusive), at
   /// most [limit] (0 = no limit). Vectors are not included.
-  List<Document> list({Filter? filter, int limit = 0, String? after}) {
+  ///
+  /// Set [newestFirst] for descending id order — what a chat or feed wants.
+  /// [after] stays exclusive either way, so a descending page continues from
+  /// the lowest id seen so far.
+  List<Document> list({
+    Filter? filter,
+    int limit = 0,
+    String? after,
+    bool newestFirst = false,
+  }) {
     if (limit < 0) throw ArgumentError.value(limit, 'limit', 'must be >= 0');
-    final json = filter == null ? nullptr : _encode(filter.json, 'filter');
-    final afterPtr = after == null ? nullptr : after.toNativeUtf8();
+    Pointer<Utf8> json = nullptr;
+    Pointer<Utf8> afterPtr = nullptr;
     try {
+      json = filter == null ? nullptr : _encode(filter.json, 'filter');
+      afterPtr = after == null ? nullptr : after.toNativeUtf8();
       final raw = _json(
-        (out) => _b.list(_h, json, limit, afterPtr, out),
+        (out) => _b.listEx(_h, json, limit, afterPtr, newestFirst ? 1 : 0, out),
         'list',
       );
-      return [
-        for (final d in raw! as List)
-          Document._fromJson((d as Map).cast<String, Object?>()),
-      ];
+      return [for (final d in _list(raw)) Document._fromJson(_object(d))];
     } finally {
-      if (filter != null) calloc.free(json);
-      if (after != null) calloc.free(afterPtr);
+      if (json != nullptr) malloc.free(json);
+      if (afterPtr != nullptr) malloc.free(afterPtr);
     }
   }
 
   /// Every document matching [filter], fetched lazily in pages of
-  /// [pageSize].
-  Iterable<Document> documents({Filter? filter, int pageSize = 256}) sync* {
+  /// [pageSize], oldest first unless [newestFirst] is set.
+  Iterable<Document> documents({
+    Filter? filter,
+    int pageSize = 256,
+    bool newestFirst = false,
+  }) sync* {
+    if (pageSize <= 0) {
+      throw ArgumentError.value(pageSize, 'pageSize', 'must be positive');
+    }
     String? after;
     while (true) {
-      final page = list(filter: filter, limit: pageSize, after: after);
+      final page = list(
+        filter: filter,
+        limit: pageSize,
+        after: after,
+        newestFirst: newestFirst,
+      );
       yield* page;
       if (page.length < pageSize) return;
       after = page.last.id;
@@ -781,6 +987,62 @@ class PhoenixCollection implements Finalizable {
     (_json((out) => _b.stats(_h, out), 'stats')! as Map)
         .cast<String, Object?>(),
   );
+
+  /// Checks the collection and reports what it found, without changing it.
+  CollectionReport verify() => CollectionReport._fromJson(
+    (_json((out) => _b.verify(_h, out), 'verify')! as Map)
+        .cast<String, Object?>(),
+  );
+
+  /// Reclaims space: drops orphaned and tombstoned vectors and rebuilds the
+  /// document store. Returns how many vector records were reclaimed.
+  ///
+  /// Writes are excluded for the duration, and a crash mid-compaction leaves
+  /// the previous contents intact.
+  int compact() {
+    final out = calloc<Uint64>();
+    try {
+      _check(_b.compact(_h, out), 'compact');
+      return out.value;
+    } finally {
+      calloc.free(out);
+    }
+  }
+
+  /// Writes a consistent, compacted copy of the collection into directory
+  /// [dir], which can then be opened with [PhoenixCollection.open].
+  ///
+  /// Restoring is a file-level operation: close the collection, replace its
+  /// directory with the backup, and open it again.
+  void backup(String dir) {
+    final dirPtr = dir.toNativeUtf8();
+    try {
+      _check(_b.backup(_h, dirPtr), 'backup("$dir")');
+    } finally {
+      malloc.free(dirPtr);
+    }
+  }
+
+  /// Subscribes to committed document changes: one [CollectionChange] per
+  /// document written or removed, in commit order.
+  ///
+  /// [CollectionWatcher.poll] blocks the calling isolate; on a UI isolate use
+  /// [AsyncPhoenixCollection.changes], which gives you a `Stream`.
+  CollectionWatcher watch({int capacity = 1024}) =>
+      CollectionWatcher._(rawWatcher(capacity: capacity));
+
+  /// The underlying key watcher, whose keys are document ids. Used by the
+  /// `Stream` API; prefer [watch].
+  ChangeWatcher rawWatcher({int capacity = 1024}) {
+    if (capacity <= 0) {
+      throw ArgumentError.value(capacity, 'capacity', 'must be positive');
+    }
+    return ChangeWatcher.openOnCollection(
+      PhoenixWatchBindings.from(_b.base),
+      _h.cast(),
+      capacity: capacity,
+    );
+  }
 
   /// Syncs vectors and checkpoints documents.
   void flush() => _check(_b.flush(_h), 'flush');
