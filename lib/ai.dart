@@ -28,6 +28,9 @@
 ///   persists vectors in a [PhoenixDatabase] so no text is embedded twice.
 /// * **Retrieval** — [TextChunker] and [RagPipeline]: hybrid vector + BM25
 ///   retrieval with MMR, grounded answers with numbered citations.
+/// * **Tools and agents** — [Tool] lets a model call your code, and [Agent]
+///   runs the loop: ask, execute, feed the results back, repeat. Pair it with
+///   [knowledgeBaseTool] and the model can search on-device data itself.
 /// * **Caching and memory** — [SemanticCache] reuses answers to prompts
 ///   that mean the same thing; [ConversationMemory] keeps recent turns and
 ///   recalls relevant older ones.
@@ -40,7 +43,14 @@ import 'phoenixdb.dart';
 
 export 'src/ai/anthropic.dart' show AnthropicChatModel, ClaudeEffort;
 export 'src/ai/chat.dart'
-    show ChatModel, ChatMessage, ChatRole, ChatResponse, ChatUsage;
+    show
+        ChatModel,
+        ChatMessage,
+        ChatRole,
+        ChatResponse,
+        ChatUsage,
+        ToolCall,
+        ToolResult;
 export 'src/ai/chunker.dart' show TextChunker, TextChunk;
 export 'src/ai/embedder.dart'
     show Embedder, EmbedPurpose, EmbedOne, HashingEmbedder, CachedEmbedder;
@@ -58,3 +68,12 @@ export 'src/ai/rag.dart'
         RagStream,
         citedSources;
 export 'src/ai/semantic_cache.dart' show SemanticCache, CachedChatModel;
+export 'src/ai/tools.dart'
+    show
+        Agent,
+        AgentRun,
+        AgentStep,
+        Tool,
+        ToolCallingModel,
+        decodeToolInput,
+        knowledgeBaseTool;
