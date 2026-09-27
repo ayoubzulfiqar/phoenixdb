@@ -1624,14 +1624,10 @@ impl Collection {
         std::fs::create_dir_all(dir)?;
         self.db.backup(dir.join("docs.pdb"))?;
         if let Some(engine) = &self.vectors {
-            // Sync and snapshot first, so the copied pair is consistent.
-            engine.save(None)?;
-            let vectors = self.dir.join("vectors.pvec");
-            std::fs::copy(&vectors, dir.join("vectors.pvec"))?;
-            let snapshot = VectorEngine::snapshot_path(&vectors);
-            if snapshot.exists() {
-                std::fs::copy(&snapshot, dir.join("vectors.pvec.hnsw"))?;
-            }
+            // Through the engine, not `std::fs::copy`: it holds an exclusive
+            // lock on the vector file, and on Windows that lock stops any
+            // other handle from reading it.
+            engine.copy_to(dir.join("vectors.pvec"))?;
         }
         // The copy has never been open, so it carries no unclean marker.
         let copy = Database::open(dir.join("docs.pdb"), Options::default())?;
