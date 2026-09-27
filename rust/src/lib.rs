@@ -67,6 +67,7 @@ pub mod sql;
 pub mod txn;
 pub mod vector;
 pub mod wal;
+pub mod watch;
 
 pub use btree::{BTree, FillFactor, TreeReport};
 pub use error::{Error, PhoenixStatus, Result};
@@ -169,6 +170,8 @@ pub struct Database {
     metrics: EngineMetrics,
     /// See [`Database::serialize_writes`].
     writer_turn: parking_lot::Mutex<()>,
+    /// Live change subscriptions; see [`Database::watch`].
+    watchers: Arc<watch::Registry>,
     /// Set by [`Database::simulate_crash`]: skip the checkpoint in `Drop`.
     crashed: bool,
 }
@@ -251,6 +254,7 @@ impl Database {
             tracing: AtomicBool::new(options.tracing),
             metrics,
             writer_turn: parking_lot::Mutex::new(()),
+            watchers: watch::Registry::new(),
             crashed: false,
         };
         if db.tracing_enabled() {
@@ -443,6 +447,10 @@ impl Database {
         self.metrics
             .wal_bytes_written
             .add(wal.bytes_appended() - bytes_before);
+        // Collected while the write set is still borrowed; published only
+        // after the commit succeeds, so a watcher never sees a change that
+        // did not happen.
+        let pending = self.pending_changes(txn, commit_ts);
         let actual = versions.commit(txn_id)?;
         debug_assert_eq!(actual, commit_ts, "commit timestamp drifted");
         self.metrics.txn_commits.increment();
@@ -456,7 +464,68 @@ impl Database {
             // must not turn it into an error. The next one retries.
             let _ = Self::checkpoint_locked(&mut inner, &self.metrics);
         }
+        // Outside the engine lock: a woken consumer usually reads straight
+        // away, and should not queue behind the commit that woke it.
+        drop(inner);
+        self.watchers.publish(&pending);
         Ok(())
+    }
+
+    /// Subscribes to committed changes to keys starting with `prefix`.
+    ///
+    /// An empty prefix watches the whole database. The returned [`Watcher`]
+    /// buffers changes until polled and unsubscribes when dropped; see the
+    /// [`watch`] module for delivery guarantees.
+    ///
+    /// ```no_run
+    /// # use phoenixdb::{Database, Options};
+    /// # use phoenixdb::watch::WatchOptions;
+    /// # use std::time::Duration;
+    /// # fn main() -> phoenixdb::Result<()> {
+    /// let db = Database::open("app.pdb", Options::default())?;
+    /// let watcher = db.watch(b"user:", WatchOptions::default());
+    /// db.put_auto(b"user:1", b"ada")?;
+    /// assert_eq!(watcher.poll(Duration::from_millis(250)).len(), 1);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn watch(&self, prefix: &[u8], options: watch::WatchOptions) -> watch::Watcher {
+        self.watchers.subscribe(prefix, options)
+    }
+
+    /// Number of live change subscriptions (diagnostics).
+    #[must_use]
+    pub fn watcher_count(&self) -> usize {
+        self.watchers.len()
+    }
+
+    /// The changes a committing transaction should publish, or nothing when
+    /// no one is listening.
+    fn pending_changes(&self, txn: &txn::Transaction, commit_ts: u64) -> Vec<watch::Change> {
+        if self.watchers.is_empty() {
+            return Vec::new();
+        }
+        let values = self.watchers.wants_values();
+        txn.writes
+            .iter()
+            .map(|(key, write)| {
+                let value = write.as_value();
+                watch::Change {
+                    kind: if value.is_some() {
+                        watch::ChangeKind::Put
+                    } else {
+                        watch::ChangeKind::Delete
+                    },
+                    key: key.clone(),
+                    value: if values {
+                        value.map(<[u8]>::to_vec)
+                    } else {
+                        None
+                    },
+                    commit_ts,
+                }
+            })
+            .collect()
     }
 
     /// Takes this database's writer turn: a mutex that read-modify-write
@@ -933,6 +1002,11 @@ impl Database {
         inner.versions = VersionStore::new(meta.tree_ts + 1, meta.next_txn_id);
         inner.wal.reset(meta.tree_ts, &[])?;
         inner.next_auto_checkpoint = self.options.checkpoint_bytes;
+        let restored_ts = meta.tree_ts;
+        drop(inner);
+        // Every key may have changed at once; watchers are told to re-read
+        // rather than sent a change per key.
+        self.watchers.publish_reset(restored_ts);
         Ok(())
     }
 
@@ -1140,6 +1214,9 @@ fn refuse_if_open(path: &Path) -> Result<()> {
 
 impl Drop for Database {
     fn drop(&mut self) {
+        // Unblock any consumer waiting on a change, whether or not this is a
+        // simulated crash: a blocked poll must never outlive the database.
+        self.watchers.close_all();
         if self.crashed {
             return;
         }
