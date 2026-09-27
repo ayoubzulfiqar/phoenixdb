@@ -615,6 +615,51 @@ class PhoenixDatabase implements Finalizable {
   }
 
   /// Metrics in the Prometheus text exposition format.
+  /// Recovers what is still readable from a damaged database at [source]
+  /// into a new database at [destination].
+  ///
+  /// For when a file is too damaged to open or fails [check]: every page is
+  /// scanned, the key/value pairs on intact leaf pages are kept, and whatever
+  /// lived on a damaged page is lost. The returned [SalvageReport] says how
+  /// much of each, and [SalvageReport.isClean] is true when nothing was lost.
+  ///
+  /// Neither path may be open — salvage reads the file directly — and
+  /// [destination] must not exist, so the damaged original is never touched
+  /// and can be tried again.
+  ///
+  /// ```dart
+  /// final report = PhoenixDatabase.salvage('broken.pdb', 'recovered.pdb');
+  /// print('${report.keysRecovered} keys recovered');
+  /// ```
+  static SalvageReport salvage(
+    String source,
+    String destination, {
+    String? libraryPath,
+  }) {
+    final b = PhoenixBindings.load(path: libraryPath);
+    final sourcePtr = source.toNativeUtf8();
+    final destinationPtr = destination.toNativeUtf8();
+    final out = calloc<Pointer<Utf8>>();
+    try {
+      final status = b.salvage(sourcePtr, destinationPtr, out);
+      if (status != PhoenixStatus.ok) {
+        throw _errorFor(b, status, 'salvage("$source")');
+      }
+      final ptr = out.value;
+      try {
+        return SalvageReport.fromJson(
+          (jsonDecode(ptr.toDartString()) as Map).cast<String, Object?>(),
+        );
+      } finally {
+        b.stringFree(ptr);
+      }
+    } finally {
+      malloc.free(sourcePtr);
+      malloc.free(destinationPtr);
+      calloc.free(out);
+    }
+  }
+
   /// Subscribes to committed changes to keys starting with [prefix].
   ///
   /// A null or empty prefix watches the whole database. The returned
