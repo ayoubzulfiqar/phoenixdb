@@ -159,8 +159,7 @@ class OpenAICompatibleChatModel implements ToolCallingModel {
         if (sys != null) {'role': 'system', 'content': sys},
         for (final m in rest) ..._messages(m),
       ],
-      if (tools.isNotEmpty)
-        'tools': [for (final t in tools) t.toOpenAIJson()],
+      if (tools.isNotEmpty) 'tools': [for (final t in tools) t.toOpenAIJson()],
       if ((limit ?? maxTokens) != null) maxTokensField: limit ?? maxTokens,
       if (stream) 'stream': true,
     };
