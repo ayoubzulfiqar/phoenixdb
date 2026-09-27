@@ -19,12 +19,20 @@
 
 pub mod collection_ffi;
 pub mod vector_ffi;
+pub mod watch_ffi;
+
+pub use watch_ffi::{
+    PhoenixWatcher, phoenix_collection_watch_open, phoenix_watch_close, phoenix_watch_is_closed,
+    phoenix_watch_open, phoenix_watch_poll, phoenix_watch_wake,
+};
 
 pub use collection_ffi::{
-    PhoenixCollectionHandle, phoenix_collection_close, phoenix_collection_count,
-    phoenix_collection_delete, phoenix_collection_flush, phoenix_collection_get,
-    phoenix_collection_list, phoenix_collection_open, phoenix_collection_open_count,
+    PhoenixCollectionHandle, phoenix_collection_backup, phoenix_collection_close,
+    phoenix_collection_compact, phoenix_collection_count, phoenix_collection_delete,
+    phoenix_collection_flush, phoenix_collection_get, phoenix_collection_list,
+    phoenix_collection_list_ex, phoenix_collection_open, phoenix_collection_open_count,
     phoenix_collection_search, phoenix_collection_stats, phoenix_collection_upsert,
+    phoenix_collection_verify,
 };
 
 pub use vector_ffi::{
@@ -401,8 +409,12 @@ pub unsafe extern "C" fn phoenix_close(handle: *mut PhoenixDbHandle) -> c_int {
             let _registry = REGISTRY.lock();
             drop(db);
         }
-        // SAFETY: the handle box itself is freed exactly once, here.
-        drop(unsafe { Box::from_raw(handle) });
+        // The handle struct itself is deliberately *not* freed: it stays
+        // allocated as a poisoned tombstone. Freeing it would let the
+        // allocator hand the same address to the next open, and a caller's
+        // second close would then read a live handle's tag and release it —
+        // a double free of someone else's handle. A tombstone costs a few
+        // bytes per handle ever opened and makes a double close safe.
         Ok(())
     })
 }
@@ -720,9 +732,12 @@ pub unsafe extern "C" fn phoenix_count(handle: *mut PhoenixDbHandle, out_len: *m
 ///   backup/restore/compact, stats, structural check, metrics text, tracing,
 ///   and the `ABORTED`/`BUSY` status codes. Every earlier entry point keeps
 ///   its signature.
+/// * 5 (PhoenixDB 4.1): document collections (`phoenix_collection_*`) and
+///   change notifications (`phoenix_watch_*`). Every earlier entry point
+///   keeps its signature.
 #[unsafe(no_mangle)]
 pub extern "C" fn phoenix_abi_version() -> u32 {
-    4
+    5
 }
 
 /// Whether this build includes the vector search engine.
