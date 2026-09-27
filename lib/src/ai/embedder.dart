@@ -7,6 +7,7 @@ import 'dart:math';
 import 'dart:typed_data';
 
 import '../phoenixdb_base.dart';
+import 'http.dart' show LlmException;
 
 /// Whether a text is being stored or used to search. Asymmetric embedding
 /// models (Voyage AI, E5, …) embed the two differently.
@@ -237,18 +238,33 @@ class CachedEmbedder implements Embedder {
       // Embed each distinct missing text once.
       final unique = <String>{for (final i in missing) texts[i]}.toList();
       final vectors = await inner.embed(unique, purpose: purpose);
+      if (vectors.length != unique.length) {
+        throw LlmException(
+          'the embedder returned ${vectors.length} vectors for '
+          '${unique.length} texts',
+        );
+      }
       final byText = {
         for (var j = 0; j < unique.length; j++) unique[j]: vectors[j],
       };
       for (final i in missing) {
-        final v = byText[texts[i]]!;
+        final v = byText[texts[i]];
+        if (v == null) {
+          throw const LlmException(
+            'the embedder returned vectors for different texts than it was '
+            'given',
+          );
+        }
         final key = _key(texts[i], purpose);
         _remember(key, v);
         _store(key, v);
         out[i] = v;
       }
     }
-    return out.cast<Float32List>();
+    // Copies, not the cached instances: a caller that normalises a returned
+    // vector in place must not corrupt the cache (or another slot that points
+    // at the same text).
+    return [for (final v in out) Float32List.fromList(v!)];
   }
 
   @override
