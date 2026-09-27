@@ -336,10 +336,20 @@ class AsyncPhoenixCollection implements DocumentStore {
     Filter? filter,
     int pageSize = 256,
     bool newestFirst = false,
-  }) async* {
+  }) {
+    // Validated before the stream exists, so a bad argument fails at the call
+    // site rather than on the first `listen`.
     if (pageSize <= 0) {
       throw ArgumentError.value(pageSize, 'pageSize', 'must be positive');
     }
+    return _documents(filter, pageSize, newestFirst);
+  }
+
+  Stream<Document> _documents(
+    Filter? filter,
+    int pageSize,
+    bool newestFirst,
+  ) async* {
     String? after;
     while (true) {
       final page = await list(

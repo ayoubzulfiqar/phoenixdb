@@ -964,10 +964,20 @@ class PhoenixCollection implements Finalizable {
     Filter? filter,
     int pageSize = 256,
     bool newestFirst = false,
-  }) sync* {
+  }) {
+    // Validated before the iterable exists, so a bad argument fails at the
+    // call site rather than on the first `moveNext`.
     if (pageSize <= 0) {
       throw ArgumentError.value(pageSize, 'pageSize', 'must be positive');
     }
+    return _documents(filter, pageSize, newestFirst);
+  }
+
+  Iterable<Document> _documents(
+    Filter? filter,
+    int pageSize,
+    bool newestFirst,
+  ) sync* {
     String? after;
     while (true) {
       final page = list(
