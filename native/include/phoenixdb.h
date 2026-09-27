@@ -754,6 +754,21 @@ int phoenix_backup(PhoenixDB *handle, const char *path);
 int phoenix_restore(PhoenixDB *handle, const char *path);
 
 /**
+ * Recovers what is readable from a damaged database at `source` into a new
+ * database at `destination`, which must not exist.
+ *
+ * Neither path may be open: salvage reads the file directly. `*out_json`
+ * receives a report `{"pages_scanned", "leaf_pages", "pages_damaged",
+ * "keys_recovered", "keys_unreadable", "bytes_recovered"}`; release it with
+ * [`phoenix_string_free`].
+ *
+ * # Safety
+ * `source` and `destination` must be valid NUL-terminated strings and
+ * `out_json` a writable pointer-sized location.
+ */
+int phoenix_salvage(const char *source, const char *destination, char **out_json);
+
+/**
  * Rebuilds the file with live data only, returning free pages to the
  * filesystem. Blocks other callers for the duration.
  *
