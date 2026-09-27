@@ -53,6 +53,65 @@ class PhoenixOptions {
       'fillFactor: $fillFactor)';
 }
 
+/// What [PhoenixDatabase.salvage] recovered from a damaged file.
+class SalvageReport {
+  /// Pages read from the damaged file.
+  final int pagesScanned;
+
+  /// Leaf pages whose checksum passed.
+  final int leafPages;
+
+  /// Pages whose contents were lost to damage.
+  final int pagesDamaged;
+
+  /// Key/value pairs written to the new database.
+  final int keysRecovered;
+
+  /// Cells that could not be recovered at all.
+  final int keysUnreadable;
+
+  /// Value bytes recovered.
+  final int bytesRecovered;
+
+  /// Creates a report.
+  const SalvageReport({
+    required this.pagesScanned,
+    required this.leafPages,
+    required this.pagesDamaged,
+    required this.keysRecovered,
+    required this.keysUnreadable,
+    required this.bytesRecovered,
+  });
+
+  /// Whether the source turned out to be intact.
+  bool get isClean => pagesDamaged == 0 && keysUnreadable == 0;
+
+  /// Cells encountered, recovered or not.
+  int get keysSeen => keysRecovered + keysUnreadable;
+
+  /// Parses the native JSON report.
+  factory SalvageReport.fromJson(Map<String, Object?> json) {
+    int field(String name) {
+      final value = json[name];
+      return value is num ? value.toInt() : 0;
+    }
+
+    return SalvageReport(
+      pagesScanned: field('pages_scanned'),
+      leafPages: field('leaf_pages'),
+      pagesDamaged: field('pages_damaged'),
+      keysRecovered: field('keys_recovered'),
+      keysUnreadable: field('keys_unreadable'),
+      bytesRecovered: field('bytes_recovered'),
+    );
+  }
+
+  @override
+  String toString() =>
+      'SalvageReport(recovered: $keysRecovered keys, '
+      'damaged: $pagesDamaged pages, unreadable: $keysUnreadable cells)';
+}
+
 /// One key/value pair returned by a scan.
 class PhoenixEntry {
   /// Key bytes.
