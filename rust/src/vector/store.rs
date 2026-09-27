@@ -509,6 +509,31 @@ impl VectorStore {
         })
     }
 
+    /// Writes a byte-exact copy of the live records to `destination`.
+    ///
+    /// The copy is read through *this* handle rather than by opening the file
+    /// again, because the store holds an exclusive lock on it: on Windows that
+    /// lock is mandatory, so a second handle — `std::fs::copy`, say — is
+    /// refused with "another process has locked a portion of the file".
+    pub fn copy_to(&self, destination: &Path) -> Result<()> {
+        let Some(file) = self.file.as_ref() else {
+            return Err(Error::Closed);
+        };
+        let total = HEADER_LEN + self.count * self.stride;
+        let out = File::create(destination)?;
+        let mut at = 0usize;
+        let mut buffer = vec![0u8; 1 << 20];
+        while at < total {
+            let take = buffer.len().min(total - at);
+            crate::fsutil::read_at(file, &mut buffer[..take], at as u64)?;
+            crate::fsutil::write_at(&out, &buffer[..take], at as u64)?;
+            at += take;
+        }
+        out.sync_all()?;
+        crate::fsutil::sync_parent_dir(destination);
+        Ok(())
+    }
+
     /// Forces every buffered write to stable storage.
     pub fn sync(&mut self) -> Result<()> {
         self.file()?.sync_all()?;
