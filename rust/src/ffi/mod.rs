@@ -1234,6 +1234,41 @@ pub unsafe extern "C" fn phoenix_restore(
     })
 }
 
+/// Recovers what is readable from a damaged database at `source` into a new
+/// database at `destination`, which must not exist.
+///
+/// Neither path may be open: salvage reads the file directly. `*out_json`
+/// receives a report `{"pages_scanned", "leaf_pages", "pages_damaged",
+/// "keys_recovered", "keys_unreadable", "bytes_recovered"}`; release it with
+/// [`phoenix_string_free`].
+///
+/// # Safety
+/// `source` and `destination` must be valid NUL-terminated strings and
+/// `out_json` a writable pointer-sized location.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn phoenix_salvage(
+    source: *const c_char,
+    destination: *const c_char,
+    out_json: *mut *mut c_char,
+) -> c_int {
+    guard(|| {
+        if out_json.is_null() {
+            return Err(Error::invalid("out_json is null"));
+        }
+        // SAFETY: checked non-null immediately above.
+        unsafe { *out_json = std::ptr::null_mut() };
+        // SAFETY: caller guarantees NUL-terminated strings.
+        let source = unsafe { path_arg(source, "source") }?;
+        // SAFETY: as above.
+        let destination = unsafe { path_arg(destination, "destination") }?;
+        let report = crate::repair::salvage(source, destination)?;
+        let json = serde_json::to_string(&report)
+            .map_err(|e| Error::invalid(format!("serialising the report: {e}")))?;
+        // SAFETY: `out_json` validated above.
+        unsafe { give_string(out_json, json) }
+    })
+}
+
 /// Rebuilds the file with live data only, returning free pages to the
 /// filesystem. Blocks other callers for the duration.
 ///
