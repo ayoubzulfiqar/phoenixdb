@@ -5,6 +5,96 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 4.1.0 - 2026-09-27
+
+Reactive queries, on-device agents, collection maintenance and salvage
+tooling — plus fixes for everything a full audit of the 4.0 code turned up.
+
+### Added
+
+- **Reactive queries.** `AsyncPhoenixDB.changes()` and
+  `AsyncPhoenixCollection.changes()` stream committed changes (keys, or
+  document ids) as they happen; `PhoenixDatabase.watch()` and
+  `PhoenixCollection.watch()` are the synchronous form. Only committed writes
+  are published, in commit order, after the log is durable; each subscription
+  has a bounded queue and reports how many changes a slow consumer missed; a
+  restore delivers one `reset`. New C entry points `phoenix_watch_*` and
+  `phoenix_collection_watch_open`.
+- **Tool calling and agents** in `package:phoenixdb/ai.dart`: `Tool`,
+  `ToolCallingModel` (implemented by both the Claude and OpenAI-compatible
+  clients) and `Agent`, a bounded, inspectable loop that runs the tools a
+  model asks for. `knowledgeBaseTool` hands the model a search tool over the
+  local collection.
+- **Collection maintenance:** `verify` (documents cross-checked against the
+  vector index, plus a structural report), `compact` (reclaims tombstoned and
+  orphaned vectors and free pages) and `backup` (a consistent, compacted
+  copy), on both clients and over the ABI.
+- **Salvage tooling:** `PhoenixDatabase.salvage`, `phoenix_salvage` and the
+  `phoenixdb_salvage` binary recover every readable pair from a file too
+  damaged to open, newer copies of a key winning. Closes the roadmap's
+  checksum/repair item.
+- **Newest-first paging:** `list(newestFirst: true)` and
+  `documents(newestFirst: true)` on collections, with streaming pagination
+  that costs the page rather than the collection.
+- `CollectionStats.textIndex` reports the layout actually in force.
+
+### Fixed
+
+- **A failed collection upsert no longer destroys the previous embedding.**
+  Replacing a document wrote its new vector before the commit; if the commit
+  then failed, the old embedding was already gone. The previous vectors are
+  now restored (and new ones withdrawn) when a commit fails.
+- **Vectors the documents disown are never reported.** A vector whose document
+  is absent, or whose document says it has none, is dropped by recovery and
+  excluded from search results, so `search` cannot return an id that `get` and
+  `list` both deny. A document whose embedding was lost is recorded as having
+  none, so the three agree.
+- **Corrupt document metadata is an error, not silent `null`** — reading it as
+  `null` left every index entry for that document behind on delete.
+- **`text_documents` no longer grows forever** on a collection created with
+  `text_index: false`, and a text query against such a collection is an error
+  rather than an empty result. Reopening with a different `text_index` is
+  refused instead of silently reinterpreted.
+- **Single-character CJK queries match again:** runs are indexed as unigrams as
+  well as bigrams, so 猫 finds 子猫.
+- **Index keys can no longer exceed the engine's key limit:** metadata field
+  paths are bounded at 256 bytes, and a string's *encoded* length (NUL escapes
+  included) decides whether it is indexable. Metadata walks are depth-bounded,
+  so deeply nested metadata cannot overflow the stack, and a truncated index
+  key reports corruption instead of panicking.
+- `Filter.and([])` matches everything from the index, as the in-memory
+  semantics always did; weighted fusion with one empty retriever falls back to
+  the side that found something instead of zeroing every score; MMR without
+  embeddings is refused.
+- **A second close of a handle is safe again.** Closing freed the handle
+  struct, so a second close read freed memory — and could release a *different*
+  handle that reused the address. Handles now leave a poisoned tombstone.
+- **AI toolkit:** a Claude stream ends at `message_stop` instead of waiting for
+  the connection to close (a gateway that holds it open used to turn a good
+  answer into a timeout); a stream that ends before its terminal event is
+  reported rather than passed off as a short answer; the semantic cache embeds
+  stored prompts and lookups the same way (an asymmetric embedder never hit
+  before), treats a NaN similarity as a miss, and never caches an empty or
+  interrupted answer; conversation memory keys messages by timestamp, so two
+  handles cannot overwrite each other's messages; RAG prunes per document (a
+  repeated id in one batch used to leave a mixture), tolerates any citation a
+  model writes, and reports only the sources that fitted the context budget.
+- **HTTP transport:** one deadline covers a whole call including retries, the
+  response body is read inside the retry loop, a non-JSON 200 and an odd error
+  shape surface as `LlmException` rather than raw Dart errors, and SSE parsing
+  tolerates malformed UTF-8 and split frames.
+- Collection clients validate arguments identically, `documents()` validates at
+  the call site, a failed open no longer leaks the worker isolate or the
+  directory lock, and unexpected JSON is reported as a Phoenix error rather
+  than a `TypeError`.
+
+### Notes
+
+- Native ABI is **5** (collections and change notifications). A v4 library is
+  rejected by the loader, so upgrade the native binaries with the package.
+- `CollectionStats` gained a required field and `DocumentStore.list` a named
+  parameter; both are breaking only for code that constructed them itself.
+
 ## 4.0.0 - 2026-09-22
 
 A hardening release for every engine, plus document collections with hybrid
