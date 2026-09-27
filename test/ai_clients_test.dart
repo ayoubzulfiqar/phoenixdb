@@ -56,6 +56,29 @@ class FakeServer {
     });
   }
 
+  /// Replies with a body that is not JSON at all, behind a 200.
+  void text(String body) {
+    _replies.add((r) async {
+      r.headers.contentType = ContentType.html;
+      r.write(body);
+    });
+  }
+
+  /// Like [sse], but keeps the connection open afterwards, as a proxy does.
+  void sseHold(List<String> frames) {
+    _replies.add((r) async {
+      // Without this the frames sit in the response buffer until close, and
+      // the point of this reply is that close never comes.
+      r.bufferOutput = false;
+      r.headers.contentType = ContentType('text', 'event-stream');
+      for (final f in frames) {
+        r.write(f);
+        await r.flush();
+      }
+      await Future<void>.delayed(const Duration(seconds: 30));
+    });
+  }
+
   void sse(List<String> frames) {
     _replies.add((r) async {
       r.headers.contentType = ContentType('text', 'event-stream');
@@ -91,8 +114,22 @@ void main() {
     expect(events.map((e) => (e.event, e.data)), [
       ('a', 'one\ntwo'),
       ('message', '{"x":1}'),
-      ('message', 'tail'),
-    ]);
+    ], reason: 'the unterminated tail is a truncated frame, not an event');
+  });
+
+  test('SSE parsing survives frames split across chunks', () async {
+    // What a real socket delivers: boundaries anywhere, including inside a
+    // multi-byte character.
+    final whole = utf8.encode('data: {"t":"caf\u00e9"}\n\ndata: [DONE]\n\n');
+    for (final cut in [1, 5, 12, whole.length - 3]) {
+      final events = await parseSse(
+        Stream.fromIterable([whole.sublist(0, cut), whole.sublist(cut)]),
+      ).toList();
+      expect(events.map((e) => e.data), [
+        '{"t":"caf\u00e9"}',
+        '[DONE]',
+      ], reason: 'split at $cut');
+    }
   });
 
   group('AnthropicChatModel', () {
@@ -303,6 +340,8 @@ void main() {
     });
   });
 
+  group('audited stream behaviour', _streamAudit);
+
   group('OpenAI-compatible', () {
     test('chat completes and streams', () async {
       server.json({
@@ -401,5 +440,137 @@ void main() {
       await expectLater(e.embed(['d']), throwsA(isA<LlmException>()));
       e.close();
     });
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Regression tests for the audit findings.
+// ---------------------------------------------------------------------------
+
+void _streamAudit() {
+  late FakeServer server;
+  setUp(() async => server = await FakeServer.start());
+  tearDown(() => server.close());
+
+  AnthropicChatModel claude() => AnthropicChatModel(
+    apiKey: 'sk-test',
+    baseUrl: server.url,
+    maxRetries: 0,
+    timeout: const Duration(seconds: 5),
+  );
+
+  test('a stream ends at message_stop, not when the socket closes', () async {
+    // A gateway that holds the connection open after the final event: the
+    // answer is complete, so the stream must finish immediately rather than
+    // stall until the idle timeout.
+    server.sseHold([
+      event('content_block_delta', {
+        'type': 'content_block_delta',
+        'index': 0,
+        'delta': {'type': 'text_delta', 'text': 'done'},
+      }),
+      event('message_delta', {
+        'type': 'message_delta',
+        'delta': {'stop_reason': 'end_turn'},
+      }),
+      event('message_stop', {'type': 'message_stop'}),
+    ]);
+    final c = claude();
+    final started = DateTime.now();
+    expect(await c.stream(const [ChatMessage.user('hi')]).join(), 'done');
+    expect(
+      DateTime.now().difference(started),
+      lessThan(const Duration(seconds: 3)),
+      reason: 'it did not wait for the connection to close',
+    );
+    c.close();
+  });
+
+  test('a truncated stream is reported, not passed off as complete', () async {
+    // The body ends mid-frame, with no `message_stop`.
+    server.sse([
+      event('content_block_delta', {
+        'type': 'content_block_delta',
+        'index': 0,
+        'delta': {'type': 'text_delta', 'text': 'half an ans'},
+      }),
+      'event: content_block_delta\ndata: {"type":"content_block_del',
+    ]);
+    final c = claude();
+    await expectLater(
+      c.stream(const [ChatMessage.user('hi')]).join(),
+      throwsA(
+        isA<LlmException>().having(
+          (e) => e.message,
+          'message',
+          contains('ended before'),
+        ),
+      ),
+    );
+    c.close();
+  });
+
+  test(
+    'an OpenAI stream may end with finish_reason instead of [DONE]',
+    () async {
+      server.sse([
+        'data: ${jsonEncode({
+          'choices': [
+            {
+              'delta': {'content': 'ok'},
+              'finish_reason': 'stop',
+            },
+          ],
+        })}\n\n',
+      ]);
+      final m = OpenAICompatibleChatModel(baseUrl: server.url, model: 'x');
+      expect(await m.stream(const [ChatMessage.user('hi')]).join(), 'ok');
+      m.close();
+
+      // Neither marker: truncated.
+      server.sse([
+        'data: ${jsonEncode({
+          'choices': [
+            {
+              'delta': {'content': 'partial'},
+            },
+          ],
+        })}\n\n',
+      ]);
+      final n = OpenAICompatibleChatModel(baseUrl: server.url, model: 'x');
+      await expectLater(
+        n.stream(const [ChatMessage.user('hi')]).join(),
+        throwsA(isA<LlmException>()),
+      );
+      n.close();
+    },
+  );
+
+  test('odd provider errors stay Llm exceptions', () async {
+    // A non-string error `type` used to escape as a raw TypeError.
+    server.json({
+      'error': {'type': 429, 'message': 'slow down'},
+    }, status: 400);
+    final c = claude();
+    await expectLater(
+      c.complete(const [ChatMessage.user('hi')]),
+      throwsA(
+        isA<LlmHttpException>().having((e) => e.errorType, 'type', '429'),
+      ),
+    );
+
+    // A proxy's HTML error page behind a 200.
+    server.text('<html>not json</html>');
+    await expectLater(
+      c.complete(const [ChatMessage.user('hi')]),
+      throwsA(
+        isA<LlmException>().having(
+          (e) => e.message,
+          'message',
+          contains('did not return JSON'),
+        ),
+      ),
+    );
+    c.close();
   });
 }
