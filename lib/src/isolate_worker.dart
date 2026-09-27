@@ -16,6 +16,8 @@ import 'dart:typed_data';
 import 'kv.dart';
 import 'phoenixdb_base.dart';
 import 'sql_result.dart';
+import 'watch.dart';
+import 'watch_isolate.dart';
 import 'worker.dart';
 
 /// Operations the worker understands.
@@ -200,8 +202,15 @@ void _workerMain(_Boot boot) => serveWorker<PhoenixDatabase>(
 /// ```
 class AsyncPhoenixDB {
   final WorkerClient _worker;
+  final Set<WatchSession> _watchers = {};
 
-  AsyncPhoenixDB._(this._worker);
+  /// Path this client opened.
+  final String path;
+
+  /// Native library override this client was opened with, if any.
+  final String? libraryPath;
+
+  AsyncPhoenixDB._(this._worker, this.path, this.libraryPath);
 
   /// Spawns the worker isolate and opens the database at [path].
   ///
@@ -218,7 +227,67 @@ class AsyncPhoenixDB {
       debugName: 'phoenixdb-worker',
       what: 'database',
     ),
+    path,
+    libraryPath,
   );
+
+  /// Committed changes to keys starting with [prefix] as they happen; a null
+  /// or empty prefix watches everything.
+  ///
+  /// The subscription runs on its own isolate — the blocking native poll
+  /// cannot share the worker that serves the other calls — and ends when it is
+  /// cancelled or the database closes. Set [values] to receive each written
+  /// value. A consumer that falls behind loses the oldest changes past
+  /// [capacity] and can tell from the gap; re-read if that matters.
+  ///
+  /// ```dart
+  /// final sub = db.changes(prefix: utf8Key('user:')).listen((c) {
+  ///   print('${c.kind} ${c.keyString}');
+  /// });
+  /// // ... later
+  /// await sub.cancel();
+  /// ```
+  Stream<Change> changes({
+    Uint8List? prefix,
+    int capacity = 1024,
+    bool values = false,
+  }) {
+    if (capacity <= 0) {
+      throw ArgumentError.value(capacity, 'capacity', 'must be positive');
+    }
+    final spec = WatchSpec(
+      path: path,
+      libraryPath: libraryPath,
+      prefix: prefix,
+      capacity: capacity,
+      values: values,
+    );
+    late WatchSession session;
+    late StreamController<Change> controller;
+    controller = StreamController<Change>(
+      onListen: () {
+        session = WatchSession.start(spec);
+        _watchers.add(session);
+        session.batches.listen(
+          (batch) {
+            for (final change in batch) {
+              controller.add(change as Change);
+            }
+          },
+          onError: controller.addError,
+          onDone: () {
+            _watchers.remove(session);
+            if (!controller.isClosed) controller.close();
+          },
+        );
+      },
+      onCancel: () async {
+        await session.stop();
+        _watchers.remove(session);
+      },
+    );
+    return controller.stream;
+  }
 
   /// Whether [close] has already run (or the worker died).
   bool get isClosed => _worker.isClosed;
@@ -439,5 +508,13 @@ class AsyncPhoenixDB {
   }
 
   /// Closes the database and shuts the worker isolate down. Idempotent.
-  Future<void> close() => _worker.close(const _Request(_Op.close));
+  /// Closes the database, ends any [changes] streams, and stops the worker.
+  /// Idempotent.
+  Future<void> close() async {
+    for (final session in _watchers.toList()) {
+      await session.stop();
+    }
+    _watchers.clear();
+    await _worker.close(const _Request(_Op.close));
+  }
 }
