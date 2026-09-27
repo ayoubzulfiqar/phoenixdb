@@ -183,12 +183,15 @@ class WatchSession {
         case _Ready(control: final port):
           _control = port;
           // A stop that arrived before the isolate was ready.
-          if (_stopped) port.send(null);
+          if (_stopped) {
+            port.send(null);
+          }
         case List<Object> batch:
           if (!_controller.isClosed) _controller.add(batch);
         case _Failed(message: final m, status: final s):
-          if (!_controller.isClosed)
+          if (!_controller.isClosed) {
             _controller.addError(PhoenixException(s, m));
+          }
           _finish();
         case _Finished():
           _finish();
