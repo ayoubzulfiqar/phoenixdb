@@ -220,6 +220,22 @@ typedef LastErrorNative = Pointer<Utf8> Function();
 /// Dart signature for `LastErrorDart`.
 typedef LastErrorDart = Pointer<Utf8> Function();
 
+/// Native signature for `phoenix_salvage`.
+typedef SalvageNative =
+    Int32 Function(
+      Pointer<Utf8> source,
+      Pointer<Utf8> destination,
+      Pointer<Pointer<Utf8>> outJson,
+    );
+
+/// Dart signature for `phoenix_salvage`.
+typedef SalvageDart =
+    int Function(
+      Pointer<Utf8> source,
+      Pointer<Utf8> destination,
+      Pointer<Pointer<Utf8>> outJson,
+    );
+
 /// Native signature for `MaintenanceNative`.
 typedef MaintenanceNative = Int32 Function(Pointer<PhoenixDB> handle);
 
@@ -869,6 +885,9 @@ class PhoenixBindings {
   /// Rebuilds the file compactly.
   final MaintenanceDart compact;
 
+  /// Recovers what is readable from a damaged file into a new one.
+  final SalvageDart salvage;
+
   /// Runtime statistics.
   final StatsDart stats;
 
@@ -971,6 +990,9 @@ class PhoenixBindings {
       ),
       restore = library.lookupFunction<PathOpNative, PathOpDart>(
         'phoenix_restore',
+      ),
+      salvage = library.lookupFunction<SalvageNative, SalvageDart>(
+        'phoenix_salvage',
       ),
       compact = library.lookupFunction<MaintenanceNative, MaintenanceDart>(
         'phoenix_compact',
